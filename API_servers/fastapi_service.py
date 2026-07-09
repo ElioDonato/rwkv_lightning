@@ -1,15 +1,28 @@
 import logging
+from contextlib import asynccontextmanager
 from threading import Lock
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute
 
-from API_servers.router import openai_router, state_router, v1_router
+from API_servers.router import openai_router, state_router, v1_router, v2_router
 
 
 def create_app(engine, password=None):
-    app = FastAPI()
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        logger = logging.getLogger("uvicorn.error")
+        logger.info("Registered FastAPI routes:")
+        for route in app.routes:
+            if not isinstance(route, APIRoute):
+                continue
+            methods = ",".join(sorted(route.methods - {"HEAD", "OPTIONS"}))
+            logger.info("  %-20s %s", methods, route.path)
+
+        yield
+
+    app = FastAPI(lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -23,17 +36,8 @@ def create_app(engine, password=None):
     app.state.dialogue_idx_counters = {}
 
     app.include_router(v1_router)
+    app.include_router(v2_router)
     app.include_router(state_router)
     app.include_router(openai_router)
-
-    @app.on_event("startup")
-    async def log_registered_routes():
-        logger = logging.getLogger("uvicorn.error")
-        logger.info("Registered FastAPI routes:")
-        for route in app.routes:
-            if not isinstance(route, APIRoute):
-                continue
-            methods = ",".join(sorted(route.methods - {"HEAD", "OPTIONS"}))
-            logger.info("  %-20s %s", methods, route.path)
 
     return app
