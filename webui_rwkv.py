@@ -14,7 +14,7 @@ import requests
 
 DEFAULT_API_URL = "http://127.0.0.1:8000/state/chat/completions"
 DEFAULT_DELETE_URL = "http://127.0.0.1:8000/state/delete"
-DEFAULT_BATCH_API_URL = "http://127.0.0.1:8000/v1/chat/completions"
+DEFAULT_BATCH_API_URL = "http://127.0.0.1:8000/v2/chat/completions"
 DEFAULT_STOP_TOKENS_JSON = json.dumps(["\nUser:"], ensure_ascii=False)
 
 HTML_GEN_LIMIT = 16000

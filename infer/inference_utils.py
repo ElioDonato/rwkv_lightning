@@ -1,8 +1,30 @@
 import gc
 from collections import deque
 
+import torch
+
 from infer import inference_deps
 from infer.cancellation import InferenceCancelled
+
+
+@torch.jit.script
+def sample_logits_batch_cuda(logits, temperature: float, top_p: float, k: int):
+    if top_p <= 0.0 or k == 1:
+        return torch.argmax(logits, dim=-1)
+    vals, ids = torch.topk(logits.float(), k=k, dim=-1, sorted=True)
+    if temperature == 1.0:
+        probs = torch.softmax(vals, dim=-1)
+    else:
+        probs = torch.softmax(vals / temperature, dim=-1)
+    cdf = torch.cumsum(probs, dim=-1)
+    if top_p < 1.0:
+        keep = torch.argmax((cdf >= top_p).to(torch.int32), dim=-1)
+        mass = cdf.gather(1, keep.view(-1, 1)).view(-1)
+    else:
+        mass = cdf[:, -1]
+    r = torch.rand((logits.size(0), 1), device=logits.device) * mass.view(-1, 1)
+    out = torch.searchsorted(cdf, r).view(-1, 1)
+    return ids.gather(1, out).view(-1)
 
 
 class InferenceUtilsMixin:

@@ -4,10 +4,278 @@ import json
 import random
 
 from infer import inference_deps
+from infer.inference_utils import sample_logits_batch_cuda
 
 
 class BatchInferenceMixin:
 ### batch generation for V1 endpoint ###
+
+    def _normalize_v2_sampling_params(self, temperature, top_k, top_p, vocab_size):
+        sample_temperature = float(temperature)
+        sample_top_p = float(top_p)
+        if sample_temperature <= 0:
+            sample_temperature = 1.0
+            sample_top_p = 0.0
+        else:
+            sample_temperature = max(0.2, sample_temperature)
+        return (
+            sample_temperature,
+            sample_top_p,
+            min(max(1, int(top_k)), int(vocab_size)),
+        )
+
+    def _sample_v2_tokens(
+        self,
+        logits,
+        occurrence_count,
+        occurrence_presence,
+        batch_rows,
+        temperature,
+        top_k,
+        top_p,
+        alpha_presence,
+        alpha_frequency,
+        alpha_decay,
+        active_mask=None,
+    ):
+        if alpha_frequency:
+            logits.sub_(occurrence_count, alpha=float(alpha_frequency))
+        if alpha_presence:
+            logits.sub_(occurrence_presence)
+
+        sample_temperature, sample_top_p, sample_top_k = self._normalize_v2_sampling_params(
+            temperature, top_k, top_p, logits.size(-1)
+        )
+        sampled_tensor = sample_logits_batch_cuda(
+            logits,
+            sample_temperature,
+            sample_top_p,
+            sample_top_k,
+        )
+
+        if alpha_decay != 1:
+            occurrence_count.mul_(float(alpha_decay))
+        if active_mask is None:
+            active_rows = batch_rows
+            active_tokens = sampled_tensor
+        else:
+            active_rows = batch_rows[active_mask]
+            active_tokens = sampled_tensor[active_mask]
+
+        occurrence_count[active_rows, active_tokens] += 1
+        if alpha_presence:
+            occurrence_presence[active_rows, active_tokens] = float(alpha_presence)
+
+        return sampled_tensor
+
+    def batch_generate_v2(
+        self,
+        prompts,
+        max_length=512,
+        temperature=1.0,
+        top_k=500,
+        top_p=0.5,
+        alpha_presence=1.0,
+        alpha_frequency=0.1,
+        alpha_decay=0.99,
+        stop_tokens=("\nUser:",),
+        cancel_token=None,
+    ):
+        state = None
+        try:
+            batch_size = len(prompts)
+            state = self.model.generate_zero_state(batch_size)
+            encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+            out = self._forward_batch_prompts_chunked(
+                encoded_prompts, state, cancel_token=cancel_token
+            ).float()
+
+            finished = [False] * batch_size
+            stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
+            generated_text = [""] * batch_size
+            torch = inference_deps.get_torch()
+            occurrence_count = torch.zeros(
+                batch_size, out.size(-1), device=out.device, dtype=out.dtype
+            )
+            occurrence_presence = torch.zeros_like(occurrence_count)
+            batch_rows = torch.arange(batch_size, device=out.device)
+
+            for _ in range(max_length):
+                self._raise_if_cancelled(cancel_token)
+                active_mask = torch.tensor(
+                    [not flag for flag in finished], device=out.device, dtype=torch.bool
+                )
+                new_tokens_tensor = self._sample_v2_tokens(
+                    out,
+                    occurrence_count,
+                    occurrence_presence,
+                    batch_rows,
+                    temperature,
+                    top_k,
+                    top_p,
+                    alpha_presence,
+                    alpha_frequency,
+                    alpha_decay,
+                    active_mask=active_mask,
+                )
+                new_tokens = [[token] for token in new_tokens_tensor.tolist()]
+                for i in range(batch_size):
+                    if finished[i]:
+                        new_tokens[i][0] = 0
+                out = self.model.forward_batch(new_tokens, state).float()
+
+                for i in range(batch_size):
+                    tok = new_tokens[i][0]
+                    if finished[i]:
+                        continue
+
+                    content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
+                    if content:
+                        generated_text[i] += content
+
+                    if should_stop:
+                        finished[i] = True
+
+                if all(finished):
+                    break
+
+            decoded = []
+            for i in range(batch_size):
+                generated_text[i] += self._flush_stop_state(stop_states[i], final=True)
+                decoded.append(generated_text[i])
+            return decoded
+        finally:
+            if state is not None:
+                del state
+            gc.collect()
+            inference_deps.get_torch().cuda.empty_cache()
+
+    async def batch_infer_stream_v2(
+        self,
+        prompts,
+        max_length=512,
+        temperature=1.0,
+        top_k=500,
+        top_p=0.5,
+        alpha_presence=1.0,
+        alpha_frequency=0.1,
+        alpha_decay=0.99,
+        stop_tokens=("\nUser:",),
+        chunk_size=32,
+        cancel_token=None,
+    ):
+        state = None
+
+        try:
+            batch_size = len(prompts)
+            state = self.model.generate_zero_state(batch_size)
+            encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+            out = self._forward_batch_prompts_chunked(
+                encoded_prompts, state, cancel_token=cancel_token
+            ).float()
+
+            finished = [False] * batch_size
+            stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
+            chunk_token_counts = [0] * batch_size
+            text_buffers = [""] * batch_size
+            torch = inference_deps.get_torch()
+            occurrence_count = torch.zeros(
+                batch_size, out.size(-1), device=out.device, dtype=out.dtype
+            )
+            occurrence_presence = torch.zeros_like(occurrence_count)
+            batch_rows = torch.arange(batch_size, device=out.device)
+
+            while not all(finished) and max_length > 0:
+                self._raise_if_cancelled(cancel_token)
+                active_mask = torch.tensor(
+                    [not flag for flag in finished], device=out.device, dtype=torch.bool
+                )
+                new_tokens_tensor = self._sample_v2_tokens(
+                    out,
+                    occurrence_count,
+                    occurrence_presence,
+                    batch_rows,
+                    temperature,
+                    top_k,
+                    top_p,
+                    alpha_presence,
+                    alpha_frequency,
+                    alpha_decay,
+                    active_mask=active_mask,
+                )
+                new_tokens = [[token] for token in new_tokens_tensor.tolist()]
+                for i in range(batch_size):
+                    if finished[i]:
+                        new_tokens[i][0] = 0
+                out = self.model.forward_batch(new_tokens, state).float()
+                max_length -= 1
+
+                contents_to_send = [""] * batch_size
+
+                for i in range(batch_size):
+                    if finished[i]:
+                        continue
+
+                    tok = new_tokens[i][0]
+                    content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
+                    if content:
+                        text_buffers[i] += content
+
+                    if should_stop:
+                        finished[i] = True
+                        flushed = self._flush_stop_state(stop_states[i], final=True)
+                        if flushed:
+                            text_buffers[i] += flushed
+                        if text_buffers[i]:
+                            contents_to_send[i] += text_buffers[i]
+                            text_buffers[i] = ""
+                        continue
+
+                    chunk_token_counts[i] += 1
+                    if chunk_token_counts[i] >= chunk_size and text_buffers[i]:
+                        contents_to_send[i] += text_buffers[i]
+                        text_buffers[i] = ""
+                        chunk_token_counts[i] = 0
+
+                if any(contents_to_send):
+                    chunk = {
+                        "object": "chat.completion.chunk",
+                        "choices": [
+                            {"index": i, "delta": {"content": contents_to_send[i]}}
+                            for i in range(batch_size)
+                            if contents_to_send[i]
+                        ],
+                    }
+                    if chunk["choices"]:
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+                await asyncio.sleep(0)
+
+            remaining_contents = [""] * batch_size
+            for i in range(batch_size):
+                flushed = self._flush_stop_state(stop_states[i], final=True)
+                if flushed:
+                    text_buffers[i] += flushed
+                remaining_contents[i] = text_buffers[i]
+
+            if any(remaining_contents):
+                chunk = {
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {"index": i, "delta": {"content": remaining_contents[i]}}
+                        for i in range(batch_size)
+                        if remaining_contents[i]
+                    ],
+                }
+                if chunk["choices"]:
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        finally:
+            if state is not None:
+                del state
+            inference_deps.get_torch().cuda.empty_cache()
+            gc.collect()
+
+        yield "data: [DONE]\n\n"
 
     def batch_generate(
         self,
