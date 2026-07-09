@@ -30,17 +30,17 @@ HTML_FRAME_HEIGHT = 228
 HTML_RAW_HEIGHT = HTML_BODY_HEIGHT - HTML_FRAME_HEIGHT
 HTML_PROMPT_CHOICES = [
     "生成网页：联想集团是一家成立于中国、业务遍及180个市场的全球化科技公司。联想作为全球领先ICT科技企业，秉承“智能，为每一个可能”的理念，持续研究、设计与制造全球最完备的端到端智能设备与智能基础设施产品组合，为用户与全行业提供整合了应用、服务和最佳体验的智能终端，以及强大的云基础设施与行业智能解决方案。作为全球智能设备的领导厂商，联想每年为全球用户提供数以亿计的智能终端设备，包括电脑、平板、智能手机等。2024年联想PC销售量居全球第一。作为企业数字化和智能化解决方案的全球顶级供应商，联想积极推动全行业“设备+云”和“基础设施+云”的发展，以及智能化解决方案的落地。",
-    "3D animation of cars in forest with animals",
-    "interactive weather map with animated clouds and rain",
-    "retro arcade RPG start screen",
-    "3D animation of a SpaceX rocket landing on Mars",
-    "storybook scene with a dragon flying over a castle",
-    "interactive dashboard for a city traffic system",
-    "animated aquarium with colorful fish and coral",
-    "sci-fi spaceship navigation interface",
-    "cozy cafe menu with animated steam and pastries",
-    "character sheet for a high fantasy RPG",
-    "a fancy hotel homepage",
+    "Write HTML: 3D animation of cars in forest with animals",
+    "Write HTML: interactive weather map with animated clouds and rain",
+    "Write HTML: retro arcade RPG start screen",
+    "Write HTML: 3D animation of a SpaceX rocket landing on Mars",
+    "Write HTML: storybook scene with a dragon flying over a castle",
+    "Write HTML: interactive dashboard for a city traffic system",
+    "Write HTML: animated aquarium with colorful fish and coral",
+    "Write HTML: sci-fi spaceship navigation interface",
+    "Write HTML: cozy cafe menu with animated steam and pastries",
+    "Write HTML: character sheet for a high fantasy RPG",
+    "Write HTML: a fancy hotel homepage",
 ]
 HTML_GRID_CSS = """
 div.main { padding-left: 0 !important; padding-right: 0 !important; }
@@ -90,7 +90,7 @@ def build_prompt(user_text: str, think_mode: bool = False) -> str:
 
 
 def html_prompt_from_choice(choice: str) -> str:
-    return f"User: Write HTML: {choice}\n\nAssistant: <think></think"
+    return f"User: {choice}\n\nAssistant: <think></think"
 
 
 DEFAULT_HTML_PROMPT = html_prompt_from_choice(HTML_PROMPT_CHOICES[0])
@@ -1315,8 +1315,8 @@ with gr.Blocks(title="RWKV State Chat UI") as demo:
                 html_temperature = gr.Slider(0.2, 2.0, label="temperature", step=0.1, value=1.0)
                 html_top_k = gr.Slider(1, 1000, value=500, step=1, label="top_k")
                 html_top_p = gr.Slider(0.0, 0.95, label="top_p", step=0.05, value=0.5)
-                html_presence_penalty = gr.Slider(0.0, 2.0, label="alpha_presence", step=0.1, value=1.5)
-                html_count_penalty = gr.Slider(0.0, 1.0, label="alpha_frequency", step=0.01, value=0.2)
+                html_presence_penalty = gr.Slider(0.0, 2.0, label="alpha_presence", step=0.1, value=1.0)
+                html_count_penalty = gr.Slider(0.0, 1.0, label="alpha_frequency", step=0.01, value=0.1)
                 html_penalty_decay = gr.Slider(0.99, 0.999, label="alpha_decay", step=0.001, value=0.99)
                 html_stop_tokens = gr.Textbox(label="stop_tokens(JSON)", value=DEFAULT_STOP_TOKENS_JSON)
                 html_status = gr.Markdown("待命")
