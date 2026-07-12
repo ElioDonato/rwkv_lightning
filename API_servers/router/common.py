@@ -104,10 +104,11 @@ async def cleanup_disconnect_watcher(task, timeout: float = 1.0, poll_interval: 
     # after cancel() had already been called). Poll with repeated cancel() attempts instead of
     # awaiting the task directly, and give up after `timeout` rather than block the response --
     # an abandoned watcher is harmless, it will exit on its own once the client actually disconnects.
-    deadline = asyncio.get_event_loop().time() + timeout
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
     while not task.done():
         task.cancel()
-        if asyncio.get_event_loop().time() >= deadline:
+        if loop.time() >= deadline:
             return
         await asyncio.sleep(poll_interval)
     with suppress(asyncio.CancelledError, Exception):
