@@ -73,10 +73,12 @@ async def chat_completions(request: Request):
         return prefill_sse_response(request, stream, cancel_token, len(req.contents))
 
     try:
-        async with reserve_prefill_capacity(request, len(req.contents)):
+        cancel_token = CancellationToken()
+        async with reserve_prefill_capacity(request, len(req.contents), cancel_token=cancel_token):
             results = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate,
+                cancel_token=cancel_token,
                 prompts=req.contents,
                 max_length=req.max_tokens,
                 temperature=req.temperature,
@@ -122,10 +124,12 @@ async def batch_translate(request: Request):
     ]
 
     try:
-        async with reserve_prefill_capacity(request, len(prompts)):
+        cancel_token = CancellationToken()
+        async with reserve_prefill_capacity(request, len(prompts), cancel_token=cancel_token):
             translated_texts = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate,
+                cancel_token=cancel_token,
                 prompts=prompts,
                 max_length=2048,
                 temperature=1.0,
@@ -191,10 +195,12 @@ async def fim_completions(request: Request):
         return prefill_sse_response(request, stream, cancel_token, len(prompts))
 
     try:
-        async with reserve_prefill_capacity(request, len(prompts)):
+        cancel_token = CancellationToken()
+        async with reserve_prefill_capacity(request, len(prompts), cancel_token=cancel_token):
             results = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate,
+                cancel_token=cancel_token,
                 prompts=prompts,
                 max_length=req.max_tokens,
                 temperature=req.temperature,

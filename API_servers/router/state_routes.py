@@ -73,10 +73,12 @@ async def state_chat_completions(request: Request):
         return prefill_sse_response(request, stream, cancel_token, 1)
 
     try:
-        async with reserve_prefill_capacity(request, 1):
+        cancel_token = CancellationToken()
+        async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
             results = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate_state,
+                cancel_token=cancel_token,
                 prompts=prompts,
                 state=state,
                 max_length=req.max_tokens,
@@ -210,10 +212,12 @@ async def multi_state_chat_completions(request: Request):
         return prefill_sse_response(request, stream_with_dialogue_idx(), cancel_token, 1)
 
     try:
-        async with reserve_prefill_capacity(request, 1):
+        cancel_token = CancellationToken()
+        async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
             results = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate_state,
+                cancel_token=cancel_token,
                 prompts=prompts,
                 state=state,
                 max_length=req.max_tokens,

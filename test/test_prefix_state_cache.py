@@ -31,33 +31,35 @@ def test_prefix_cache_longest_match_and_disk_reload():
         _reset_manager(db_path)
         manager = state_pool.StateCacheManager()
 
-        state_64 = [
+        bucket_small, bucket_large = state_pool.PREFIX_CACHE_BUCKETS[:2]
+
+        state_small = [
             torch.tensor([1.0]),
             torch.tensor([2.0]),
-            torch.tensor(64, dtype=torch.int32),
+            torch.tensor(bucket_small, dtype=torch.int32),
         ]
-        logits_64 = torch.tensor([0.1, 0.2, 0.3])
-        tokens_64 = list(range(64))
+        logits_small = torch.tensor([0.1, 0.2, 0.3])
+        tokens_small = list(range(bucket_small))
 
-        state_128 = [
+        state_large = [
             torch.tensor([10.0]),
             torch.tensor([20.0]),
-            torch.tensor(128, dtype=torch.int32),
+            torch.tensor(bucket_large, dtype=torch.int32),
         ]
-        logits_128 = torch.tensor([0.5, 0.6, 0.7])
-        tokens_128 = list(range(128))
+        logits_large = torch.tensor([0.5, 0.6, 0.7])
+        tokens_large = list(range(bucket_large))
 
-        assert manager.put_prefix_state(tokens_64, state_64, logits_64) is True
-        assert manager.put_prefix_state(tokens_128, state_128, logits_128) is True
+        assert manager.put_prefix_state(tokens_small, state_small, logits_small) is True
+        assert manager.put_prefix_state(tokens_large, state_large, logits_large) is True
 
-        prompt_tokens = list(range(160))
+        prompt_tokens = list(range(bucket_large + 32))
         match = manager.match_prefix_state(prompt_tokens, device="cpu")
         assert match is not None
-        assert match["matched_tokens"] == 128
+        assert match["matched_tokens"] == bucket_large
         assert match["cache_source"] == "l2_ram"
-        assert torch.equal(match["state"][2], torch.tensor(128, dtype=torch.int32))
+        assert torch.equal(match["state"][2], torch.tensor(bucket_large, dtype=torch.int32))
 
-        entry = manager.prefix_entry_index[state_pool._serialize_token_ids(tokens_128)]
+        entry = manager.prefix_entry_index[state_pool._serialize_token_ids(tokens_large)]
         manager._persist_prefix_task(entry)
 
         with manager.cache_lock:
@@ -70,9 +72,9 @@ def test_prefix_cache_longest_match_and_disk_reload():
 
         disk_match = manager.match_prefix_state(prompt_tokens, device="cpu")
         assert disk_match is not None
-        assert disk_match["matched_tokens"] == 128
+        assert disk_match["matched_tokens"] == bucket_large
         assert disk_match["cache_source"] == "disk"
-        assert torch.equal(disk_match["logits"], logits_128)
+        assert torch.equal(disk_match["logits"], logits_large)
 
         manager.db_conn.close()
         state_pool.StateCacheManager._instance = None
