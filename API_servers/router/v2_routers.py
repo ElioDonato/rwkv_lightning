@@ -53,10 +53,12 @@ async def chat_completions_v2(request: Request):
         return prefill_sse_response(request, stream, cancel_token, len(req.contents))
 
     try:
-        async with reserve_prefill_capacity(request, len(req.contents)):
+        cancel_token = CancellationToken()
+        async with reserve_prefill_capacity(request, len(req.contents), cancel_token=cancel_token):
             results = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate_v2,
+                cancel_token=cancel_token,
                 prompts=req.contents,
                 max_length=req.max_tokens,
                 temperature=req.temperature,

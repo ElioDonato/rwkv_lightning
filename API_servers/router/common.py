@@ -94,10 +94,24 @@ async def watch_disconnect(request: Request, cancel_token: CancellationToken):
         raise
 
 
-async def cleanup_disconnect_watcher(task):
-    task.cancel()
-    with suppress(asyncio.CancelledError):
-        await task
+async def cleanup_disconnect_watcher(task, timeout: float = 1.0, poll_interval: float = 0.05):
+    # watch_disconnect polls request.is_disconnected(), which wraps its receive() call in an
+    # already-cancelled anyio.CancelScope (see Starlette's Request.is_disconnected). If task.cancel()
+    # lands while the watcher is inside that scope, anyio can treat the injected CancelledError as
+    # satisfying its own (already-resolved) cancellation and swallow it, so the task keeps looping
+    # instead of stopping -- an unbounded `await task` after cancel() then hangs forever (confirmed
+    # live via asyncio task-stack introspection: the watcher was still asleep in its polling loop
+    # after cancel() had already been called). Poll with repeated cancel() attempts instead of
+    # awaiting the task directly, and give up after `timeout` rather than block the response --
+    # an abandoned watcher is harmless, it will exit on its own once the client actually disconnects.
+    deadline = asyncio.get_event_loop().time() + timeout
+    while not task.done():
+        task.cancel()
+        if asyncio.get_event_loop().time() >= deadline:
+            return
+        await asyncio.sleep(poll_interval)
+    with suppress(asyncio.CancelledError, Exception):
+        task.result()
 
 
 @asynccontextmanager
@@ -127,16 +141,26 @@ async def reserve_prefill_capacity(
             )
 
 
-async def run_sync_with_disconnect_watch(request: Request, func, **kwargs):
-    cancel_token = CancellationToken()
-    watcher = asyncio.create_task(watch_disconnect(request, cancel_token))
+async def run_sync_with_disconnect_watch(
+    request: Request, func, cancel_token: CancellationToken | None = None, **kwargs
+):
+    # If the caller already has a watcher running against this request (e.g. via
+    # reserve_prefill_capacity(..., cancel_token=cancel_token)), reuse its token instead of
+    # starting a second concurrent watcher: two tasks polling request.is_disconnected() at once
+    # can race inside Starlette's self-cancelling CancelScope and leave one watcher task stuck
+    # forever, which then hangs whoever awaits it in cleanup_disconnect_watcher.
+    owns_watcher = cancel_token is None
+    if cancel_token is None:
+        cancel_token = CancellationToken()
+    watcher = asyncio.create_task(watch_disconnect(request, cancel_token)) if owns_watcher else None
     try:
         result = await run_in_threadpool(func, cancel_token=cancel_token, **kwargs)
         if cancel_token.is_cancelled():
             raise InferenceCancelled("request disconnected")
         return result
     finally:
-        await cleanup_disconnect_watcher(watcher)
+        if watcher is not None:
+            await cleanup_disconnect_watcher(watcher)
 
 
 async def _cleanup_prefill_stream_response(
