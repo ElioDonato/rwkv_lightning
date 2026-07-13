@@ -6,6 +6,11 @@ from pydantic import BaseModel
 class ChatRequest(BaseModel):
     model: str = "rwkv7"
     contents: list[str] = []
+    # Batched alternative to `contents` for /big_batch/completions: each item
+    # is an OpenAI-style {"messages": [...], "system": ...} dict, chat-templated
+    # server-side the same way as /openai/v1/chat/completions (single source of
+    # truth for the prompt format, so it stays correct across model finetunes).
+    chats: list[dict] = []
     messages: list[dict] = []
     system: Optional[str] = None
     prefix: list[str] = []
