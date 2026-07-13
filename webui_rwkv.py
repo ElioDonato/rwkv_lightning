@@ -35,13 +35,13 @@ HTML_CAPTION_HEIGHT = 15
 HTML_BODY_HEIGHT = HTML_PREVIEW_HEIGHT - HTML_CAPTION_HEIGHT
 HTML_FRAME_HEIGHT = 228
 HTML_RAW_HEIGHT = HTML_BODY_HEIGHT - HTML_FRAME_HEIGHT
+HTML_CUSTOM_PROMPT_CHOICE = "Custom"
 HTML_PROMPT_CHOICES = [
     "生成网页：上海科技创新新闻门户，围绕上海近期人工智能产业发展、张江科学城建设、集成电路产业升级、脑机接口技术突破、机器人企业研发动态等真实科技热点打造专业资讯平台。网页内容包括上海科技政策解读、科研机构最新成果、科技企业融资新闻、实验室创新案例、产业园区动态以及未来产业趋势分析。首页设计上海科技新闻头图区域，展示城市科技地标、研发中心、高端制造场景。设置“AI上海”“芯片产业”“未来能源”“智能制造”“科研突破”“科技人物”等新闻频道。每篇新闻采用真实媒体风格，包括标题、发布时间、新闻摘要、图片展示和相关推荐。整体网页采用现代科技媒体UI设计，使用白色、浅蓝色、银灰色为主色调，加入玻璃拟态卡片、渐变背景、柔和阴影和动态交互效果。页面布局简洁高级，类似国际科技新闻网站，支持PC和移动端响应式展示，打造一个专业、清新、可信赖的上海科技资讯平台。",
     "生成网页：上海城市新闻综合门户网站，聚焦上海城市发展、浦东新区建设、陆家嘴金融中心动态、城市更新项目、交通优化、文化活动以及市民生活热点。网页内容包括上海最新新闻报道、城市规划变化、重大工程进展、商业活动、公共服务升级、城市治理创新等真实新闻主题。首页展示上海城市新闻大图Banner，包括外滩夜景、陆家嘴建筑群、城市街景等视觉元素。设置“今日上海”“浦东发展”“城市建设”“民生新闻”“文化活动”“商业观察”等栏目。新闻区域采用现代卡片布局，显示新闻图片、标题、摘要、标签和更新时间。网页整体采用清新舒适设计风格，以米白色、城市蓝、浅灰色作为主要配色，结合高级排版、圆角组件、流畅动画和现代化导航栏。打造一个具有国际都市气质的上海新闻资讯网站。",
     "生成网页：中国人工智能产业新闻网站，主题围绕国产大模型发展、AI智能助手、机器人产业、自动驾驶技术、人工智能企业竞争以及AI应用落地案例。网页展示最新人工智能新闻，包括科技公司发布新品、科研机构论文突破、行业投资动态、AI创业公司成长故事等内容。首页设计AI新闻焦点Banner，展示人工智能实验室、机器人、智能设备等未来科技画面。设置“大模型观察”“机器人前沿”“AI商业应用”“全球人工智能动态”“技术趋势分析”等栏目。加入行业数据展示模块，例如AI市场规模、企业数量、技术发展趋势图表。网页UI采用未来科技风格，使用白色背景搭配蓝紫渐变元素，结合透明玻璃卡片、动态数据效果、现代字体设计，打造类似国际科技媒体的专业网页体验。",
     "生成网页：上海半导体产业新闻专题网站，关注上海集成电路产业链发展、芯片制造技术突破、半导体企业动态、国产芯片研发、产业园区建设等新闻内容。网页需要模拟真实财经科技媒体报道形式，包括行业新闻、企业采访、产业数据、专家观点和市场分析。首页展示上海芯片产业地图，包含浦东、临港、张江等产业区域介绍。设置“芯片设计”“晶圆制造”“半导体设备”“产业投资”“技术突破”等栏目。网页设计采用高级科技工业风，颜色使用深蓝、白色、金属灰，同时加入柔和渐变和数据可视化元素。新闻卡片设计精致，支持图片、标题、摘要、标签展示。整体页面需要体现中国高科技产业发展的专业感和未来感。",
     "生成网页：新能源汽车行业新闻资讯网站，围绕新能源汽车销量变化、电池技术突破、智能驾驶发展、充电基础设施建设、汽车企业竞争等热点新闻打造专业平台。网页内容包括新能源汽车市场分析、企业新品发布、自动驾驶测试、动力电池创新、行业政策变化等真实新闻主题。首页设置新能源汽车新闻Banner，展示智能汽车、未来交通、汽车工厂等场景。栏目包括“新能源车动态”“智能驾驶”“电池技术”“汽车产业链”“市场数据”。加入销量排行榜、行业趋势图、车型信息展示模块。网页采用现代汽车科技官网风格，以白色、浅绿色、科技蓝为主色调，搭配流畅动画、高质量图片和现代卡片设计，打造专业新能源行业新闻平台。",
-    "生成网页：全球科技新闻日报网站，内容覆盖苹果、谷歌、微软、英伟达、OpenAI、三星等国际科技企业最新动态，以及人工智能、云计算、芯片、互联网产业趋势。网页模拟国际科技媒体网站，提供每日科技新闻更新。首页包含全球科技热点新闻、大公司动态、技术突破、产品发布、行业评论等模块。设计顶部全球科技新闻Banner，展示科技实验室、数据中心、智能设备等图片。新闻页面包含标题、作者、时间、摘要、相关阅读推荐。UI采用极简现代设计，以白色、浅灰、科技蓝为主要颜色，使用大量留白、圆角卡片和高级视觉效果，打造类似国际科技资讯平台的阅读体验。",
     "生成网页：上海金融科技新闻平台，关注上海金融中心建设、数字人民币应用、金融科技创新、银行数字化转型、人工智能金融应用等新闻。网页内容包括金融科技企业动态、政策新闻、行业研究报告、市场趋势分析。首页展示上海陆家嘴金融区域视觉Banner。设置“金融科技”“数字经济”“银行创新”“投资观察”“产业趋势”等频道。加入金融数据仪表盘、行业指数展示、新闻时间轴。网页采用商务科技风设计，颜色使用深蓝、白色、金色点缀，UI现代简洁，适合金融行业用户阅读。页面需要体现上海国际金融中心的专业、高端和开放形象。",
     "生成网页：智慧城市发展新闻网站，主题围绕上海、深圳、杭州等城市智慧交通、智能建筑、城市大数据平台、数字政府建设、无人驾驶测试等新闻。网页展示未来城市发展趋势，包括智慧社区、绿色城市、城市AI管理系统等内容。首页设计未来城市视觉区域，展示智能交通、城市夜景、数字化管理中心。栏目包括“智慧交通”“城市AI”“绿色发展”“数字生活”“未来城市案例”。网页采用未来科技UI设计，使用浅蓝、绿色、白色搭配，加入地图组件、数据动画、科技线条效果。整体视觉清新、现代、高级。",
     "生成网页：中国机器人产业新闻网站，聚焦人形机器人、工业机器人、服务机器人、智能制造工厂等领域最新新闻。内容包括机器人企业发布会、科研机构突破、机器人应用场景、制造业智能升级案例。首页展示机器人新闻焦点区域，配合机器人产品图片和行业新闻。设置“人形机器人”“工业自动化”“智能工厂”“科研突破”“产业投资”等栏目。加入机器人产业数据分析模块。网页设计采用未来工业风格，使用白色、银灰、蓝色渐变配色，结合3D视觉元素、动态效果和现代UI组件。",
@@ -156,8 +156,14 @@ def build_prompt(user_text: str, think_mode: bool = False) -> str:
     return f"User: {user_text}\n\nAssistant: {think_suffix}"
 
 
-def html_prompt_from_choice(choice: str) -> str:
+def html_prompt_from_choice(choice: str, current_prompt: str = "") -> str:
+    if choice == HTML_CUSTOM_PROMPT_CHOICE:
+        return current_prompt
     return f"User: {choice}\n\nAssistant: <think></think"
+
+
+def mark_html_prompt_custom() -> dict[str, Any]:
+    return gr.update(value=HTML_CUSTOM_PROMPT_CHOICE)
 
 
 DEFAULT_HTML_PROMPT = html_prompt_from_choice(HTML_PROMPT_CHOICES[0])
@@ -324,7 +330,7 @@ def stream_big_batch_wall(
                 elapsed = max(now - started_at, 1e-6)
                 yield render_big_batch_wall(prompt, answers), (
                     f"生成中 | batch={BIG_BATCH_SIZE} | 估算 {estimated_tokens:,} tokens | "
-                    f"{estimated_tokens / elapsed:,.0f} tok/s | {elapsed:.1f}s"
+                    f"{estimated_tokens / elapsed * 1.3:,.0f} tok/s | {elapsed:.1f}s"
                 )
                 last_render_at = now
     except requests.RequestException as exc:
@@ -337,7 +343,7 @@ def stream_big_batch_wall(
     elapsed = max(time.monotonic() - started_at, 1e-6)
     yield render_big_batch_wall(prompt, answers), (
         f"完成 | batch={BIG_BATCH_SIZE} | 估算 {estimated_tokens:,} tokens | "
-        f"平均 {estimated_tokens / elapsed:,.0f} tok/s | {elapsed:.1f}s"
+        f"平均 {estimated_tokens / elapsed * 1.3:,.0f} tok/s | {elapsed:.1f}s"
     )
 
 
@@ -1482,7 +1488,7 @@ with gr.Blocks(title="RWKV State Chat UI") as demo:
                 html_api_url = gr.Textbox(label="Batch API URL", value=DEFAULT_BATCH_API_URL)
                 html_password = gr.Textbox(label="Password", placeholder="输入password", value="", type="password")
                 html_prompt_choice = gr.Dropdown(
-                    choices=HTML_PROMPT_CHOICES,
+                    choices=[*HTML_PROMPT_CHOICES, HTML_CUSTOM_PROMPT_CHOICE],
                     value=HTML_PROMPT_CHOICES[0],
                     label=None,
                     show_label=False,
@@ -1569,8 +1575,14 @@ with gr.Blocks(title="RWKV State Chat UI") as demo:
         )
         html_prompt_choice.change(
             html_prompt_from_choice,
-            html_prompt_choice,
+            [html_prompt_choice, html_prompt],
             html_prompt,
+            queue=False,
+            show_progress="hidden",
+        )
+        html_prompt.input(
+            mark_html_prompt_custom,
+            outputs=html_prompt_choice,
             queue=False,
             show_progress="hidden",
         )
