@@ -11,6 +11,7 @@ from API_servers.router.common import (
     reserve_prefill_capacity,
     run_sync_with_disconnect_watch,
 )
+from API_servers.router.openai_routes import format_openai_prompt
 from API_servers.router.schemas import ChatRequest, TranslateRequest, TranslateResponse
 
 
@@ -245,13 +246,18 @@ async def big_batch_completions(request: Request):
     if auth_error is not None:
         return auth_error
 
+    if req.chats:
+        prompts = [format_openai_prompt(chat, req.enable_think) for chat in req.chats]
+    else:
+        prompts = req.contents
+
     cancel_token = CancellationToken()
     stream = engine.big_batch_stream(
-        prompts=req.contents,
+        prompts=prompts,
         max_length=req.max_tokens,
         temperature=req.temperature,
         stop_tokens=req.stop_tokens,
         chunk_size=req.chunk_size,
         cancel_token=cancel_token,
     )
-    return prefill_sse_response(request, stream, cancel_token, len(req.contents))
+    return prefill_sse_response(request, stream, cancel_token, len(prompts))
