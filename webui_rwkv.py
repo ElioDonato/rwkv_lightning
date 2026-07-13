@@ -15,7 +15,14 @@ import requests
 DEFAULT_API_URL = "http://127.0.0.1:8000/state/chat/completions"
 DEFAULT_DELETE_URL = "http://127.0.0.1:8000/state/delete"
 DEFAULT_BATCH_API_URL = "http://127.0.0.1:8000/v2/chat/completions"
+DEFAULT_BIG_BATCH_API_URL = "http://127.0.0.1:8000/big_batch/completions"
 DEFAULT_STOP_TOKENS_JSON = json.dumps(["\nUser:"], ensure_ascii=False)
+
+BIG_BATCH_GRID_W = 20
+BIG_BATCH_GRID_H = 16
+BIG_BATCH_SIZE = BIG_BATCH_GRID_W * BIG_BATCH_GRID_H
+BIG_BATCH_RENDER_INTERVAL = 0.2
+BIG_BATCH_CELL_TEXT_LIMIT = 320
 
 HTML_GEN_LIMIT = 16000
 MAX_HTML_PREVIEWS = 15
@@ -29,22 +36,82 @@ HTML_BODY_HEIGHT = HTML_PREVIEW_HEIGHT - HTML_CAPTION_HEIGHT
 HTML_FRAME_HEIGHT = 228
 HTML_RAW_HEIGHT = HTML_BODY_HEIGHT - HTML_FRAME_HEIGHT
 HTML_PROMPT_CHOICES = [
-    "生成网页：联想集团是一家成立于中国、业务遍及180个市场的全球化科技公司。联想作为全球领先ICT科技企业，秉承“智能，为每一个可能”的理念，持续研究、设计与制造全球最完备的端到端智能设备与智能基础设施产品组合，为用户与全行业提供整合了应用、服务和最佳体验的智能终端，以及强大的云基础设施与行业智能解决方案。作为全球智能设备的领导厂商，联想每年为全球用户提供数以亿计的智能终端设备，包括电脑、平板、智能手机等。2024年联想PC销售量居全球第一。作为企业数字化和智能化解决方案的全球顶级供应商，联想积极推动全行业“设备+云”和“基础设施+云”的发展，以及智能化解决方案的落地。",
-    "Write HTML: 3D animation of cars in forest with animals",
-    "Write HTML: interactive weather map with animated clouds and rain",
-    "Write HTML: retro arcade RPG start screen",
-    "Write HTML: 3D animation of a SpaceX rocket landing on Mars",
-    "Write HTML: storybook scene with a dragon flying over a castle",
-    "Write HTML: interactive dashboard for a city traffic system",
-    "Write HTML: animated aquarium with colorful fish and coral",
-    "Write HTML: sci-fi spaceship navigation interface",
-    "Write HTML: cozy cafe menu with animated steam and pastries",
-    "Write HTML: character sheet for a high fantasy RPG",
-    "Write HTML: a fancy hotel homepage",
+    "生成网页：上海科技创新新闻门户，围绕上海近期人工智能产业发展、张江科学城建设、集成电路产业升级、脑机接口技术突破、机器人企业研发动态等真实科技热点打造专业资讯平台。网页内容包括上海科技政策解读、科研机构最新成果、科技企业融资新闻、实验室创新案例、产业园区动态以及未来产业趋势分析。首页设计上海科技新闻头图区域，展示城市科技地标、研发中心、高端制造场景。设置“AI上海”“芯片产业”“未来能源”“智能制造”“科研突破”“科技人物”等新闻频道。每篇新闻采用真实媒体风格，包括标题、发布时间、新闻摘要、图片展示和相关推荐。整体网页采用现代科技媒体UI设计，使用白色、浅蓝色、银灰色为主色调，加入玻璃拟态卡片、渐变背景、柔和阴影和动态交互效果。页面布局简洁高级，类似国际科技新闻网站，支持PC和移动端响应式展示，打造一个专业、清新、可信赖的上海科技资讯平台。",
+    "生成网页：上海城市新闻综合门户网站，聚焦上海城市发展、浦东新区建设、陆家嘴金融中心动态、城市更新项目、交通优化、文化活动以及市民生活热点。网页内容包括上海最新新闻报道、城市规划变化、重大工程进展、商业活动、公共服务升级、城市治理创新等真实新闻主题。首页展示上海城市新闻大图Banner，包括外滩夜景、陆家嘴建筑群、城市街景等视觉元素。设置“今日上海”“浦东发展”“城市建设”“民生新闻”“文化活动”“商业观察”等栏目。新闻区域采用现代卡片布局，显示新闻图片、标题、摘要、标签和更新时间。网页整体采用清新舒适设计风格，以米白色、城市蓝、浅灰色作为主要配色，结合高级排版、圆角组件、流畅动画和现代化导航栏。打造一个具有国际都市气质的上海新闻资讯网站。",
+    "生成网页：中国人工智能产业新闻网站，主题围绕国产大模型发展、AI智能助手、机器人产业、自动驾驶技术、人工智能企业竞争以及AI应用落地案例。网页展示最新人工智能新闻，包括科技公司发布新品、科研机构论文突破、行业投资动态、AI创业公司成长故事等内容。首页设计AI新闻焦点Banner，展示人工智能实验室、机器人、智能设备等未来科技画面。设置“大模型观察”“机器人前沿”“AI商业应用”“全球人工智能动态”“技术趋势分析”等栏目。加入行业数据展示模块，例如AI市场规模、企业数量、技术发展趋势图表。网页UI采用未来科技风格，使用白色背景搭配蓝紫渐变元素，结合透明玻璃卡片、动态数据效果、现代字体设计，打造类似国际科技媒体的专业网页体验。",
+    "生成网页：上海半导体产业新闻专题网站，关注上海集成电路产业链发展、芯片制造技术突破、半导体企业动态、国产芯片研发、产业园区建设等新闻内容。网页需要模拟真实财经科技媒体报道形式，包括行业新闻、企业采访、产业数据、专家观点和市场分析。首页展示上海芯片产业地图，包含浦东、临港、张江等产业区域介绍。设置“芯片设计”“晶圆制造”“半导体设备”“产业投资”“技术突破”等栏目。网页设计采用高级科技工业风，颜色使用深蓝、白色、金属灰，同时加入柔和渐变和数据可视化元素。新闻卡片设计精致，支持图片、标题、摘要、标签展示。整体页面需要体现中国高科技产业发展的专业感和未来感。",
+    "生成网页：新能源汽车行业新闻资讯网站，围绕新能源汽车销量变化、电池技术突破、智能驾驶发展、充电基础设施建设、汽车企业竞争等热点新闻打造专业平台。网页内容包括新能源汽车市场分析、企业新品发布、自动驾驶测试、动力电池创新、行业政策变化等真实新闻主题。首页设置新能源汽车新闻Banner，展示智能汽车、未来交通、汽车工厂等场景。栏目包括“新能源车动态”“智能驾驶”“电池技术”“汽车产业链”“市场数据”。加入销量排行榜、行业趋势图、车型信息展示模块。网页采用现代汽车科技官网风格，以白色、浅绿色、科技蓝为主色调，搭配流畅动画、高质量图片和现代卡片设计，打造专业新能源行业新闻平台。",
+    "生成网页：全球科技新闻日报网站，内容覆盖苹果、谷歌、微软、英伟达、OpenAI、三星等国际科技企业最新动态，以及人工智能、云计算、芯片、互联网产业趋势。网页模拟国际科技媒体网站，提供每日科技新闻更新。首页包含全球科技热点新闻、大公司动态、技术突破、产品发布、行业评论等模块。设计顶部全球科技新闻Banner，展示科技实验室、数据中心、智能设备等图片。新闻页面包含标题、作者、时间、摘要、相关阅读推荐。UI采用极简现代设计，以白色、浅灰、科技蓝为主要颜色，使用大量留白、圆角卡片和高级视觉效果，打造类似国际科技资讯平台的阅读体验。",
+    "生成网页：上海金融科技新闻平台，关注上海金融中心建设、数字人民币应用、金融科技创新、银行数字化转型、人工智能金融应用等新闻。网页内容包括金融科技企业动态、政策新闻、行业研究报告、市场趋势分析。首页展示上海陆家嘴金融区域视觉Banner。设置“金融科技”“数字经济”“银行创新”“投资观察”“产业趋势”等频道。加入金融数据仪表盘、行业指数展示、新闻时间轴。网页采用商务科技风设计，颜色使用深蓝、白色、金色点缀，UI现代简洁，适合金融行业用户阅读。页面需要体现上海国际金融中心的专业、高端和开放形象。",
+    "生成网页：智慧城市发展新闻网站，主题围绕上海、深圳、杭州等城市智慧交通、智能建筑、城市大数据平台、数字政府建设、无人驾驶测试等新闻。网页展示未来城市发展趋势，包括智慧社区、绿色城市、城市AI管理系统等内容。首页设计未来城市视觉区域，展示智能交通、城市夜景、数字化管理中心。栏目包括“智慧交通”“城市AI”“绿色发展”“数字生活”“未来城市案例”。网页采用未来科技UI设计，使用浅蓝、绿色、白色搭配，加入地图组件、数据动画、科技线条效果。整体视觉清新、现代、高级。",
+    "生成网页：中国机器人产业新闻网站，聚焦人形机器人、工业机器人、服务机器人、智能制造工厂等领域最新新闻。内容包括机器人企业发布会、科研机构突破、机器人应用场景、制造业智能升级案例。首页展示机器人新闻焦点区域，配合机器人产品图片和行业新闻。设置“人形机器人”“工业自动化”“智能工厂”“科研突破”“产业投资”等栏目。加入机器人产业数据分析模块。网页设计采用未来工业风格，使用白色、银灰、蓝色渐变配色，结合3D视觉元素、动态效果和现代UI组件。",
+    "生成网页：中国互联网行业新闻网站，关注电商发展、云计算服务、短视频产业、数字经济、互联网企业战略变化等热点新闻。网页内容包括企业动态、市场分析、用户趋势、技术创新、行业评论。首页展示互联网行业热点新闻Banner。设置“企业新闻”“数字经济”“云计算”“互联网趋势”“商业观察”等频道。网页设计参考商业新闻媒体风格，采用白色、深蓝、灰色配色，加入数据图表、新闻卡片、排行榜模块。整体UI专业、大气、信息密度合理。",
+    "生成网页：上海文化科技融合新闻平台，围绕上海博物馆数字化、人工智能赋能文化产业、数字艺术展览、电竞产业发展、城市文化活动等新闻主题设计。网页内容包括文化活动报道、科技展览介绍、数字艺术案例、城市生活资讯。首页展示上海城市文化图片和科技融合场景。栏目包括“数字文化”“城市活动”“艺术科技”“生活方式”“热门资讯”。设计采用年轻化UI风格，使用奶白、浅紫、浅蓝配色，加入图片瀑布流、动态卡片和现代交互效果。",
+    "生成网页：未来科技趋势新闻研究网站，围绕量子计算、空间科技、生物科技、人工智能、新材料、绿色能源等未来产业新闻打造专业平台。网页内容包括全球科研突破、大学实验室成果、科技公司创新项目、未来产业预测报告。首页设置未来科技趋势Banner，展示宇宙探索、智能实验室、高科技设备等视觉内容。栏目包括“未来技术”“科学突破”“产业预测”“研究报告”“全球创新”。网页采用高端未来主义设计，使用白色、深蓝、紫色渐变配色，结合玻璃效果、动态背景、数据可视化和高级动画，打造一个具有未来感的科技研究资讯网站。",
 ]
 HTML_GRID_CSS = """
-div.main { padding-left: 0 !important; padding-right: 0 !important; }
+div.main { padding-left: 0 !important; padding-right: 0 !important; max-width: none !important; }
+body { overflow-x: hidden !important; }
+.big-batch-wall-tab,
+.html-grid-tab {
+  box-sizing: border-box !important;
+  width: 100vw !important;
+  max-width: none !important;
+  margin-left: calc(50% - 50vw) !important;
+  margin-right: calc(50% - 50vw) !important;
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+}
+.big-batch-wall-tab { padding-top: 0 !important; padding-bottom: 0 !important; }
+.big-batch-wall-controls { gap: 4px !important; padding: 4px 8px 0 !important; }
+.big-batch-wall-controls textarea { font-family: ui-monospace, Consolas, monospace !important; }
+.big-batch-wall-status { margin: 0 8px !important; min-height: 22px !important; }
+.big-batch-wall-host,
+.big-batch-wall-host > div { padding: 0 !important; margin: 0 !important; min-width: 0 !important; }
+.big-batch-wall {
+  box-sizing: border-box;
+  width: 100%;
+  height: calc(100dvh - 245px);
+  min-height: 480px;
+  display: grid;
+  grid-template-columns: repeat(20, minmax(0, 1fr));
+  grid-template-rows: repeat(16, minmax(0, 1fr));
+  gap: 0;
+  overflow: hidden;
+  background: #080a0c;
+  border-top: 1px solid #252a2e;
+}
+.big-batch-wall-cell {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  align-items: flex-end;
+  padding: 1px 2px;
+  border-right: 1px solid #15191c;
+  border-bottom: 1px solid #15191c;
+  background: #080a0c;
+}
+.big-batch-wall-cell pre {
+  width: 100%;
+  max-height: 100%;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 9px/1.05 ui-monospace, Consolas, monospace;
+}
+.big-batch-wall-cell.tone-0 pre { color: #ebebeb; }
+.big-batch-wall-cell.tone-1 pre { color: #6edceb; }
+.big-batch-wall-cell.tone-2 pre { color: #78e696; }
+@media (max-width: 900px) {
+  .big-batch-wall { height: calc(100dvh - 285px); min-height: 400px; }
+  .big-batch-wall-cell { padding: 1px; }
+  .big-batch-wall-cell pre { font-size: 7px; }
+}
 .html-grid-tab { padding-top: 0 !important; }
+.html-grid-main { width: 100% !important; max-width: none !important; }
 .html-grid-main { display: grid !important; grid-template-columns: minmax(220px, 17.5%) 1fr !important; grid-template-rows: auto auto !important; gap: 4px !important; margin-top: 0 !important; align-items: start !important; }
 .html-grid-main > div { gap: 4px !important; }
 .html-grid-controls { grid-column: 1 !important; grid-row: 1 !important; gap: 4px !important; min-width: 0 !important; }
@@ -153,6 +220,125 @@ def parse_stop_tokens(stop_tokens_input: Any) -> list[str]:
     if not isinstance(stop_tokens, list):
         raise ValueError("stop_tokens must be a list")
     return [str(token) for token in stop_tokens]
+
+
+def render_big_batch_wall(prompt: str = "", answers: Optional[list[str]] = None) -> str:
+    """Render the demo3-style 20x16 text wall as one lightweight HTML component."""
+    answers = answers or []
+    cells = []
+    for idx in range(BIG_BATCH_SIZE):
+        answer = answers[idx] if idx < len(answers) else ""
+        text = f"{prompt}{answer}" if prompt or answer else ""
+        if len(text) > BIG_BATCH_CELL_TEXT_LIMIT:
+            text = text[-BIG_BATCH_CELL_TEXT_LIMIT:]
+        row, col = divmod(idx, BIG_BATCH_GRID_W)
+        tone = (row + col) % 3
+        cells.append(
+            f'<div class="big-batch-wall-cell tone-{tone}" title="#{idx + 1}">'
+            f"<pre>{html.escape(text)}</pre></div>"
+        )
+    return '<div class="big-batch-wall">' + "".join(cells) + "</div>"
+
+
+def clear_big_batch_wall() -> tuple[str, str]:
+    return render_big_batch_wall(), "已清空"
+
+
+def stream_big_batch_wall(
+    prompt: str,
+    api_url: str,
+    password: str,
+    max_tokens: int,
+    temperature: float,
+    chunk_size: int,
+    stop_tokens_text: str,
+) -> Any:
+    """Stream all 320 indexed choices from /big_batch/completions into the wall."""
+    prompt = prompt or ""
+    if not prompt.strip():
+        yield render_big_batch_wall(), "请输入 prompt"
+        return
+
+    try:
+        stop_tokens = parse_stop_tokens(stop_tokens_text)
+    except Exception:
+        yield render_big_batch_wall(prompt), 'stop_tokens 格式错误，请使用 JSON 数组，例如 ["\\nUser:"]'
+        return
+
+    answers = [""] * BIG_BATCH_SIZE
+    estimated_tokens = 0
+    started_at = time.monotonic()
+    last_render_at = 0.0
+    payload = {
+        "contents": [prompt] * BIG_BATCH_SIZE,
+        "max_tokens": int(max_tokens),
+        "stop_tokens": stop_tokens,
+        "temperature": float(temperature),
+        "chunk_size": int(chunk_size),
+        "stream": True,
+        "password": password,
+    }
+
+    yield render_big_batch_wall(prompt, answers), f"正在连接后端 | batch={BIG_BATCH_SIZE}"
+    resp = None
+    try:
+        resp = requests.post(
+            api_url,
+            json=payload,
+            headers={"Accept": "text/event-stream", "Content-Type": "application/json", "Connection": "close"},
+            stream=True,
+            timeout=900,
+        )
+        resp.encoding = "utf-8"
+        if resp.status_code != 200:
+            yield render_big_batch_wall(prompt, answers), (
+                f"请求失败 HTTP {resp.status_code}: {resp.text[:400]}"
+            )
+            return
+
+        for raw_line in resp.iter_lines(decode_unicode=False):
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8", errors="replace")
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            changed = False
+            for choice in data.get("choices", []):
+                idx = choice.get("index")
+                delta = choice.get("delta", {}).get("content", "")
+                if isinstance(idx, int) and 0 <= idx < BIG_BATCH_SIZE and delta:
+                    answers[idx] += delta
+                    estimated_tokens += int(chunk_size)
+                    changed = True
+
+            now = time.monotonic()
+            if changed and now - last_render_at >= BIG_BATCH_RENDER_INTERVAL:
+                elapsed = max(now - started_at, 1e-6)
+                yield render_big_batch_wall(prompt, answers), (
+                    f"生成中 | batch={BIG_BATCH_SIZE} | 估算 {estimated_tokens:,} tokens | "
+                    f"{estimated_tokens / elapsed:,.0f} tok/s | {elapsed:.1f}s"
+                )
+                last_render_at = now
+    except requests.RequestException as exc:
+        yield render_big_batch_wall(prompt, answers), f"网络异常: {exc}"
+        return
+    finally:
+        if resp is not None:
+            resp.close()
+
+    elapsed = max(time.monotonic() - started_at, 1e-6)
+    yield render_big_batch_wall(prompt, answers), (
+        f"完成 | batch={BIG_BATCH_SIZE} | 估算 {estimated_tokens:,} tokens | "
+        f"平均 {estimated_tokens / elapsed:,.0f} tok/s | {elapsed:.1f}s"
+    )
 
 
 def stream_chat(
@@ -1388,6 +1574,77 @@ with gr.Blocks(title="RWKV State Chat UI") as demo:
             queue=False,
             show_progress="hidden",
         )
+
+    with gr.Tab("🚀 Big Batch 320", elem_classes="big-batch-wall-tab"):
+        with gr.Column(elem_classes="big-batch-wall-controls"):
+            with gr.Row():
+                big_wall_prompt = gr.Textbox(
+                    label="Prompt（修改后点击重新生成）",
+                    value="User: 请解释一下现代序列预测模型架构和传统的马尔科夫链有什么区别？\n\nAssistant: <think></think",
+                    lines=2,
+                    scale=8,
+                )
+                with gr.Column(scale=1, min_width=130):
+                    big_wall_start = gr.Button("开始生成", variant="primary")
+                    big_wall_stop = gr.Button("停止", variant="stop")
+                big_wall_clear = gr.Button("清空", scale=1, min_width=90)
+            with gr.Accordion("请求参数", open=False):
+                with gr.Row():
+                    big_wall_api_url = gr.Textbox(
+                        label="API URL",
+                        value=DEFAULT_BIG_BATCH_API_URL,
+                        scale=3,
+                    )
+                    big_wall_password = gr.Textbox(
+                        label="Password",
+                        value="",
+                        type="password",
+                        scale=1,
+                    )
+                    big_wall_max_tokens = gr.Slider(
+                        1, 8192, value=1000, step=1, label="max_tokens", scale=2
+                    )
+                    big_wall_temperature = gr.Slider(
+                        0.1, 2.0, value=1.0, step=0.1, label="temperature", scale=2
+                    )
+                    big_wall_chunk_size = gr.Slider(
+                        1, 128, value=8, step=1, label="chunk_size", scale=2
+                    )
+                    big_wall_stop_tokens = gr.Textbox(
+                        label="stop_tokens(JSON)", value="[]", scale=2
+                    )
+        big_wall_status = gr.Markdown("待命", elem_classes="big-batch-wall-status")
+        big_wall_grid = gr.HTML(
+            render_big_batch_wall(),
+            elem_classes="big-batch-wall-host",
+        )
+
+        big_wall_event = big_wall_start.click(
+            stream_big_batch_wall,
+            inputs=[
+                big_wall_prompt,
+                big_wall_api_url,
+                big_wall_password,
+                big_wall_max_tokens,
+                big_wall_temperature,
+                big_wall_chunk_size,
+                big_wall_stop_tokens,
+            ],
+            outputs=[big_wall_grid, big_wall_status],
+            show_progress="hidden",
+            stream_every=BIG_BATCH_RENDER_INTERVAL,
+        )
+        big_wall_stop.click(
+            lambda: "已停止",
+            outputs=[big_wall_status],
+            cancels=[big_wall_event],
+        )
+        big_wall_clear.click(
+            clear_big_batch_wall,
+            outputs=[big_wall_grid, big_wall_status],
+            queue=False,
+        )
+
 
 
 if __name__ == "__main__":
