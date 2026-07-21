@@ -118,14 +118,15 @@ class BatchInferenceMixin:
                     alpha_decay,
                     active_mask=active_mask,
                 )
-                new_tokens = [[token] for token in new_tokens_tensor.tolist()]
-                for i in range(batch_size):
-                    if finished[i]:
-                        new_tokens[i][0] = 0
-                out = self.model.forward_batch(new_tokens, state).float()
+                # Single host sync for stop-string detection (needs Python ints). The
+                # sampled tensor is fed straight back into the model as-is, avoiding the
+                # extra host->device torch.tensor(idxs) rebuild the old List[List[int]]
+                # path incurred inside forward_batch.
+                new_tokens = new_tokens_tensor.tolist()
+                out = self.model.forward_batch(new_tokens_tensor, state).float()
 
                 for i in range(batch_size):
-                    tok = new_tokens[i][0]
+                    tok = new_tokens[i]
                     if finished[i]:
                         continue
 
@@ -203,11 +204,12 @@ class BatchInferenceMixin:
                     alpha_decay,
                     active_mask=active_mask,
                 )
-                new_tokens = [[token] for token in new_tokens_tensor.tolist()]
-                for i in range(batch_size):
-                    if finished[i]:
-                        new_tokens[i][0] = 0
-                out = self.model.forward_batch(new_tokens, state).float()
+                # Single host sync for stop-string detection (needs Python ints). The
+                # sampled tensor is fed straight back into the model as-is, avoiding the
+                # extra host->device torch.tensor(idxs) rebuild the old List[List[int]]
+                # path incurred inside forward_batch.
+                new_tokens = new_tokens_tensor.tolist()
+                out = self.model.forward_batch(new_tokens_tensor, state).float()
                 max_length -= 1
 
                 contents_to_send = [""] * batch_size
@@ -216,7 +218,7 @@ class BatchInferenceMixin:
                     if finished[i]:
                         continue
 
-                    tok = new_tokens[i][0]
+                    tok = new_tokens[i]
                     content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
                     if content:
                         text_buffers[i] += content
@@ -311,7 +313,7 @@ class BatchInferenceMixin:
 
             for _ in range(max_length):
                 self._raise_if_cancelled(cancel_token)
-                new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                new_tokens_tensor = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
                     out,
                     penalties,
                     sample_rand_states,
@@ -321,16 +323,15 @@ class BatchInferenceMixin:
                     temperature,
                     top_k,
                     top_p,
-                ).tolist()
-                new_tokens = [[token] for token in new_tokens]
-                out = self.model.forward_batch(new_tokens, state).float()
+                )
+                # Feed the sampled tokens straight back into the model as a GPU tensor (no
+                # host round-trip); the single .tolist() sync below is only for stop-string
+                # detection, which needs plain Python ints.
+                out = self.model.forward_batch(new_tokens_tensor, state).float()
+                new_tokens = new_tokens_tensor.tolist()
 
                 for i in range(batch_size):
-                    tok = (
-                        new_tokens[i][0]
-                        if isinstance(new_tokens[i], list)
-                        else new_tokens[i]
-                    )
+                    tok = new_tokens[i]
                     if finished[i]:
                         continue
 
@@ -393,7 +394,7 @@ class BatchInferenceMixin:
 
             while not all(finished) and max_length > 0:
                 self._raise_if_cancelled(cancel_token)
-                new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                new_tokens_tensor = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
                     out,
                     penalties,
                     sample_rand_states,
@@ -403,9 +404,12 @@ class BatchInferenceMixin:
                     temperature,
                     top_k,
                     top_p,
-                ).tolist()
-                new_tokens = [[token] for token in new_tokens]
-                out = self.model.forward_batch(new_tokens, state).float()
+                )
+                # Feed the sampled tokens straight back into the model as a GPU tensor (no
+                # host round-trip); the single .tolist() sync below is only for stop-string
+                # detection, which needs plain Python ints.
+                out = self.model.forward_batch(new_tokens_tensor, state).float()
+                new_tokens = new_tokens_tensor.tolist()
                 max_length -= 1
 
                 contents_to_send = [""] * batch_size
@@ -414,11 +418,7 @@ class BatchInferenceMixin:
                     if finished[i]:
                         continue
 
-                    tok = (
-                        new_tokens[i][0]
-                        if isinstance(new_tokens[i], list)
-                        else new_tokens[i]
-                    )
+                    tok = new_tokens[i]
 
                     content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
                     if content:
