@@ -6,6 +6,7 @@
 
 from typing import List
 import os
+import time
 current_path = os.path.dirname(os.path.abspath(__file__))
 
 import torch
@@ -198,6 +199,8 @@ class RWKV_x070(MyModule):
         z['blocks.0.att.v2'] = z['blocks.0.att.a2'] # actually ignored
         self.refresh_max_prefill_bsz()
         self.max_prefill_bsz_limit = int(self.max_prefill_bsz)
+        self._prefill_bsz_refresh_interval_s = 2.0
+        self._prefill_bsz_last_refresh = time.monotonic()
         print(
             f"max_prefill_bsz={self.max_prefill_bsz} "
             f"max_prefill_bsz_limit={self.max_prefill_bsz_limit} "
@@ -205,7 +208,18 @@ class RWKV_x070(MyModule):
         )
 
     # Estimate the largest batch size that fits current free VRAM for one chunked prefill.
+    # Throttled: torch.cuda.empty_cache()/mem_get_info() are blocking CUDA syncs, and this
+    # is called on every prefill-queue admit/release from the asyncio event loop, so an
+    # unthrottled refresh stalls all concurrent requests. Reuse the last estimate within
+    # _prefill_bsz_refresh_interval_s instead of resyncing every call.
     def refresh_max_prefill_bsz(self):
+        now = time.monotonic()
+        last = getattr(self, "_prefill_bsz_last_refresh", 0.0)
+        interval = getattr(self, "_prefill_bsz_refresh_interval_s", 2.0)
+        if hasattr(self, "max_prefill_bsz") and (now - last) < interval:
+            return self.max_prefill_bsz
+        self._prefill_bsz_last_refresh = now
+
         torch.cuda.empty_cache()
         free_bytes, total_bytes = torch.cuda.mem_get_info()
         dtype_bytes = torch.empty((), dtype=DTYPE).element_size()
