@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import atexit
 import gc
+import hmac
 import json
 import os
 import queue
@@ -365,7 +366,7 @@ def create_app(
         except Exception as exc:
             return json_response(400, {"error": f"invalid request: {exc}"})
 
-        if password and req.password != password:
+        if password and not hmac.compare_digest(str(req.password or ""), password):
             return json_response(401, {"error": "Unauthorized: invalid or missing password"})
 
         if not req.contents:
