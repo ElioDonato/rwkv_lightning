@@ -266,6 +266,11 @@ class RWKV_x070(MyModule):
         
     # Run batched prompts as equal-length prefill chunks of at most 256 tokens.
     def forward_batch(self, tokens, state, full_output=False): # will modify state in-place
+        # Decode-step fast path: a [B] or [B,1] GPU LongTensor of sampled token ids is fed
+        # straight into the batched sequence path, avoiding the GPU->CPU .tolist() sync plus
+        # the CPU->GPU torch.tensor(idxs) rebuild that the List[List[int]] path incurs.
+        if isinstance(tokens, torch.Tensor):
+            return self.forward_batch_same_length(tokens, state, full_output)
         assert type(tokens) is list
         lengths = [len(x) for x in tokens]
         bsz = len(tokens)
@@ -300,6 +305,8 @@ class RWKV_x070(MyModule):
 
     # Run one equal-length batch chunk through the batched sequence path.
     def forward_batch_same_length(self, tokens, state, full_output=False):
+        if isinstance(tokens, torch.Tensor):
+            return self.forward_seq_batch_tensor(tokens, state, full_output)
         assert type(tokens) is list
         assert len(set([len(x) for x in tokens])) == 1, 'here all sequences must have the same length'
         return self.forward_seq_batch(tokens, state, full_output)
@@ -402,6 +409,45 @@ class RWKV_x070(MyModule):
             x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
             x = F.linear(x, z['head.weight'])
             state[2] += len(idxs[0])
+            return x
+
+    @MyFunction
+    # Decode-step fast path equivalent to forward_seq_batch: accepts a [B] or [B,1] GPU tensor
+    # of token ids directly and embeds it, skipping the host->device torch.tensor(idxs) rebuild
+    # the List[List[int]] path needs. Numerically identical to forward_seq_batch for the same ids.
+    def forward_seq_batch_tensor(self, idxs:torch.Tensor, state:List[torch.Tensor], full_output:bool=False):
+        with torch.no_grad(): 
+            z = self.z
+            if idxs.dim() == 1:
+                idxs = idxs.unsqueeze(1)
+            idxs = idxs.long()
+            x = z['emb.weight'][idxs]
+
+            v_first = torch.empty_like(x)
+            for i in range(self.n_layer):
+                bbb = f'blocks.{i}.'
+                att = f'blocks.{i}.att.'
+                ffn = f'blocks.{i}.ffn.'
+
+                xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln1.weight'], bias=z[bbb+'ln1.bias'])
+
+                xx, v_first = RWKV_x070_TMix_seq_batch(i, self.n_head, self.head_size, xx, state[0][i], v_first, state[1][i],
+                    z[att+'x_r'], z[att+'x_w'], z[att+'x_k'], z[att+'x_v'], z[att+'x_a'], z[att+'x_g'],
+                    z[att+'w0'], z[att+'w1'], z[att+'w2'], z[att+'a0'], z[att+'a1'], z[att+'a2'], z[att+'v0'], z[att+'v1'], z[att+'v2'],
+                    z[att+'g1'], z[att+'g2'], z[att+'k_k'], z[att+'k_a'], z[att+'r_k'],
+                    z[att+'receptance.weight'], z[att+'key.weight'], z[att+'value.weight'], z[att+'output.weight'],
+                    z[att+'ln_x.weight'], z[att+'ln_x.bias'], state[2])
+                x = x + xx
+
+                xx = F.layer_norm(x, (self.n_embd,), weight=z[bbb+'ln2.weight'], bias=z[bbb+'ln2.bias'])
+
+                xx = RWKV_x070_CMix_seq_batch(xx, state[0][i], z[ffn+'x_k'], z[ffn+'key.weight'], z[ffn+'value.weight'])
+                x = x + xx
+            
+            if not full_output: x = x[:,-1,:]
+            x = F.layer_norm(x, (self.n_embd,), weight=z['ln_out.weight'], bias=z['ln_out.bias'])
+            x = F.linear(x, z['head.weight'])
+            state[2] += idxs.size(1)
             return x
 
 ########################################################################################################
