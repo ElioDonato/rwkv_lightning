@@ -45,13 +45,17 @@ class BigBatchMixin:
                     new_tokens_tensor = inference_deps.get_sampler_gumbel_batch()(
                         logits=out, temp=temperature
                     )
+
+                    # Feed the sampled tokens straight back into the model as a GPU tensor
+                    # (no host round-trip); the single .tolist() sync below is only for
+                    # stop-string detection, which needs plain Python ints.
+                    prev_out = out
+                    out = self.model.forward_batch(new_tokens_tensor, state)
+                    del prev_out
+
                     new_tokens = new_tokens_tensor.tolist()
                     del new_tokens_tensor
                     new_tokens_tensor = None
-
-                    prev_out = out
-                    out = self.model.forward_batch(new_tokens, state)
-                    del prev_out
 
                     max_length -= 1
                     step_count += 1
@@ -62,11 +66,7 @@ class BigBatchMixin:
                         if finished[i]:
                             continue
 
-                        tok = (
-                            new_tokens[i][0]
-                            if isinstance(new_tokens[i], list)
-                            else new_tokens[i]
-                        )
+                        tok = new_tokens[i][0]
 
                         content, should_stop = self._ingest_token_with_stop(
                             stop_states[i], tok
