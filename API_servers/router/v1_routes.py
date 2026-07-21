@@ -116,8 +116,13 @@ async def chat_completions(request: Request):
 @router.post("/translate/v1/batch-translate")
 async def batch_translate(request: Request):
     engine = request.app.state.engine
+    password = request.app.state.password
     body = await request.json()
     req = TranslateRequest(**body)
+
+    auth_error = check_password(req.password, password)
+    if auth_error:
+        return auth_error
 
     prompts = [
         create_translation_prompt(req.source_lang, req.target_lang, text)
