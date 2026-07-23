@@ -296,11 +296,18 @@ async def state_status(request: Request):
             )
 
         for session_id in all_states["database"]:
-            manager.db_cursor.execute(
-                "SELECT last_updated FROM sessions WHERE session_id = ?",
-                (session_id,),
-            )
-            row = manager.db_cursor.fetchone()
+            # Must hold db_lock: manager.db_cursor is a single shared SQLite
+            # cursor (opened with check_same_thread=False for cross-coroutine
+            # use), and every other call site that touches it in
+            # state_manager/state_pool.py wraps the access in this same lock.
+            # Without it, a concurrent write (e.g. /state/save) executing on
+            # the same cursor object can interleave with this read.
+            with manager.db_lock:
+                manager.db_cursor.execute(
+                    "SELECT last_updated FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                )
+                row = manager.db_cursor.fetchone()
             if row:
                 timestamp = row[0]
                 readable_time = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
