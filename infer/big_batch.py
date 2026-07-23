@@ -25,7 +25,27 @@ class BigBatchMixin:
         new_tokens = None
 
         try:
-            with inference_deps.get_torch().inference_mode():
+            # NOTE: must be no_grad(), not inference_mode(). inference_mode()'s
+            # guard is thread-local (not coroutine-local), so under concurrent
+            # asyncio requests sharing this event-loop thread, one request's
+            # `with` block can exit while another is still inside its own,
+            # desyncing the ambient mode mid-flight for the still-running one.
+            # Tensors created while the guard *was* active stay permanently
+            # tagged as inference tensors even after the desync, so a later
+            # in-place op on them (e.g. sampler_gumbel_batch's logits.mul_())
+            # raises "Inplace update to inference tensor outside InferenceMode"
+            # -- this fired repeatedly in production before this fix (see
+            # git log for the commit introducing this comment for the full
+            # repro/root-cause writeup). no_grad() only affects autograd-graph
+            # construction, checked live at op-dispatch time, so it has no
+            # such hazard -- the tradeoff is that no_grad() (unlike
+            # inference_mode()) won't loudly reject an in-place mutation of a
+            # decode-loop tensor that somehow got captured by reference and
+            # outlived this scope; not a concern today since every tensor
+            # here is discarded at the end of each streamed response, but
+            # worth knowing if this loop is ever refactored to persist state
+            # across requests.
+            with inference_deps.get_torch().no_grad():
                 state = self.model.generate_zero_state(batch_size)
                 encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
                 out = self._forward_batch_prompts_chunked(

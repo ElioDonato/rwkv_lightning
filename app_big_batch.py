@@ -68,7 +68,13 @@ class BigBatchEngine:
         new_tokens = None
 
         try:
-            with torch.inference_mode():
+            # NOTE: no_grad(), not inference_mode() -- see infer/big_batch.py's
+            # identical fix and its inline comment for why inference_mode()'s
+            # thread-local guard is unsafe here under concurrent asyncio
+            # requests. This file (app_big_batch.py) is not currently used
+            # by the live service (which launches via app.py), but fixed
+            # here too so a future revival doesn't reintroduce the bug.
+            with torch.no_grad():
                 state = self.model.generate_zero_state(batch_size)
                 encoded_prompts = [self.tokenizer.encode(prompt) for prompt in prompts]
                 out = self.model.forward_batch(encoded_prompts, state)
@@ -202,7 +208,13 @@ class BigBatchEngine:
         new_tokens = None
 
         try:
-            with torch.inference_mode():
+            # NOTE: no_grad(), not inference_mode() -- see infer/big_batch.py's
+            # identical fix and its inline comment for why inference_mode()'s
+            # thread-local guard is unsafe here under concurrent asyncio
+            # requests. This file (app_big_batch.py) is not currently used
+            # by the live service (which launches via app.py), but fixed
+            # here too so a future revival doesn't reintroduce the bug.
+            with torch.no_grad():
                 state = self.model.generate_zero_state(batch_size)
                 encoded_prompts = [self.tokenizer.encode(prompt) for prompt in prompts]
                 out = self.model.forward_batch(encoded_prompts, state)

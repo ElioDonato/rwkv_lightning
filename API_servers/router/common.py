@@ -1,5 +1,6 @@
 import asyncio
 import json
+import traceback
 from contextlib import asynccontextmanager
 from contextlib import suppress
 
@@ -239,6 +240,21 @@ def prefill_sse_response(
         except asyncio.CancelledError:
             cancel_token.cancel()
             raise
+        except Exception:
+            # Any other failure (e.g. a bug in the decode loop) would
+            # otherwise propagate past this generator uncaught, which
+            # Starlette/uvicorn logs loudly but delivers to the client as
+            # an abruptly-closed connection: no "data: [DONE]" marker and
+            # no error payload, so a naive SSE consumer that just appends
+            # `delta.content` until EOF can't distinguish a truncated
+            # response from a complete one. Log with the full traceback
+            # (matching how this was previously surfaced, so nothing about
+            # visibility in the server log regresses) and send an explicit
+            # error chunk before terminating, so the stream always ends
+            # with a client-visible signal one way or another.
+            cancel_token.cancel()
+            print(f"[SSE] unhandled exception in stream body:\n{traceback.format_exc()}")
+            yield f"data: {json.dumps({'error': {'message': 'internal error during generation', 'type': 'stream_error'}}, ensure_ascii=False)}\n\n"
         finally:
             _schedule_prefill_stream_cleanup(
                 request,
