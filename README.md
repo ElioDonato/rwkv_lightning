@@ -13,10 +13,105 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6
 pip install fastapi pydantic ninja numpy 
 ```
 
+## Quantized inference backends
+
+Only the large attention, FFN, and output-head matrices are quantized. Small
+RWKV low-rank matrices and embeddings remain FP16 to limit accuracy loss.
+
+### CUDA W8A16
+
+The custom CUDA extension uses CUTLASS headers. Clone CUTLASS into the exact
+path below before the first import (the extension is compiled lazily by
+`torch.utils.cpp_extension`):
+
+```bash
+mkdir -p infer/rwkv_batch/cuda/third_party
+git clone --depth 1 --branch v3.9.2 \
+  https://github.com/NVIDIA/cutlass.git \
+  infer/rwkv_batch/cuda/third_party/cutlass
+```
+
+Export a W8A16 checkpoint:
+
+```bash
+python -m infer.rwkv_batch.quant.export_quant \
+  /path/to/model.pth \
+  /path/to/model-w8a16.pth \
+  --bits 8
+```
+
+Load it for inference (`MODEL_NAME` does not include the `.pth` suffix):
+
+```python
+from infer.rwkv_batch.rwkv7_w8a16 import RWKV_x070
+
+args.MODEL_NAME = "/path/to/model-w8a16"
+model = RWKV_x070(args)
+```
+
+### GemLite A16 weight-only formats
+
+Install [GemLite](https://github.com/dropbox/gemlite), then select one of
+`A16W8_FP8`, `A16W8_INT8`, or `A16W4_HQQ_INT`. Conversion writes already
+packed GemLite tensors, so model loading does not quantize or repack weights.
+The packed metadata schema and optimized loader currently target GemLite 0.6.x.
+
+```bash
+pip install gemlite==0.6.0
+
+# For the virtual environment used by this repository, if pip is unavailable:
+uv pip install \
+  --python /mnt/pc411_data/python_env/nv-py312/bin/python \
+  gemlite==0.6.0
+
+# Recommended accuracy / speed default
+python -m infer.rwkv_batch.quant.export_quant_gemlite \
+  /path/to/model.pth \
+  /path/to/model-gemlite-int8.pth \
+  --format A16W8_INT8
+
+# FP8 weight-only
+python -m infer.rwkv_batch.quant.export_quant_gemlite \
+  /path/to/model.pth \
+  /path/to/model-gemlite-fp8.pth \
+  --format A16W8_FP8
+
+# HQQ-compatible INT4, grouped along the input dimension
+python -m infer.rwkv_batch.quant.export_quant_gemlite \
+  /path/to/model.pth \
+  /path/to/model-gemlite-w4.pth \
+  --format A16W4_HQQ_INT \
+  --group-size 64
+```
+
+GemLite checkpoints must be exported with the current conversion script; old
+checkpoint layouts are not supported by the loader.
+
+GemLite compiles and may autotune Triton kernels when it first sees each matrix
+and batch shape. Warm up every batch size before timing it; the first pass can
+take seconds and is not representative of decode throughput. W4 has a
+substantially larger accuracy cost than W8, so prefer `A16W8_INT8` unless
+memory capacity is the primary constraint. At larger batch sizes these A16
+weight-only kernels still perform FP16 tensor-core work after unpacking or
+dequantization, so INT4 and INT8 can converge to similar compute-bound speed.
+
 ## Usage
 ```bash
-python app.py --model-path <your model path> --port <your port number> --password rwkv7_7.2b
+# FP16 (default)
+python app.py --model-path /path/to/model --inference-engine fp16 \
+  --port 8000 --password rwkv7_7.2b
+
+# GemLite packed checkpoint
+python app.py --model-path /path/to/model-gemlite-int8 \
+  --inference-engine gemlite --port 8000 --password rwkv7_7.2b
+
+# CUTLASS W8A16 checkpoint
+python app.py --model-path /path/to/model-w8a16 \
+  --inference-engine cutlass --port 8000 --password rwkv7_7.2b
 ```
+
+`--backend` is accepted as a shorter alias for `--inference-engine`. GemLite
+and CUTLASS checkpoints use different layouts and cannot be interchanged.
 - if no password, you can do not add ```--password``` flag
 
 

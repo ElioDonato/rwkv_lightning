@@ -13,3 +13,5 @@ models/
 
 # logs and local test artifacts
 *.log
+
+infer/rwkv_batch/cuda/third_party/cutlass/*

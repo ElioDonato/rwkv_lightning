@@ -7,13 +7,21 @@ import uvicorn
 
 from API_servers.fastapi_service import create_app
 from infer.inference import InferenceEngine
-from model_load.model_loader import load_model_and_tokenizer
+from model_load.model_loader import INFERENCE_ENGINES, load_model_and_tokenizer
 from state_manager.state_pool import shutdown_state_manager
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, required=True, help="RWKV model path")
+    parser.add_argument(
+        "--inference-engine",
+        "--backend",
+        dest="inference_engine",
+        choices=INFERENCE_ENGINES,
+        default="fp16",
+        help="model backend: fp16, GemLite packed quantization, or CUTLASS W8A16",
+    )
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--password", type=str, default=None, help="API password for authentication")
     return parser.parse_args()
@@ -21,7 +29,9 @@ def parse_args():
 
 def main():
     args_cli = parse_args()
-    model, tokenizer, args, rocm_flag = load_model_and_tokenizer(args_cli.model_path)
+    model, tokenizer, args, rocm_flag = load_model_and_tokenizer(
+        args_cli.model_path, inference_engine=args_cli.inference_engine
+    )
     engine = InferenceEngine(model=model, tokenizer=tokenizer, args=args, rocm_flag=rocm_flag)
     app = create_app(engine, password=args_cli.password)
 
