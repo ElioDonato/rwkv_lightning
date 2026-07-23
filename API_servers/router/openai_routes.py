@@ -1,3 +1,4 @@
+import hmac
 import json
 import os
 import time
@@ -176,9 +177,9 @@ def extract_bearer_token(request: Request):
 def check_openai_auth(request: Request, body: dict, password):
     if not password:
         return None
-    bearer_token = extract_bearer_token(request)
-    body_password = body.get("password")
-    if bearer_token == password or body_password == password:
+    bearer_token = extract_bearer_token(request) or ""
+    body_password = str(body.get("password") or "")
+    if hmac.compare_digest(bearer_token, password) or hmac.compare_digest(body_password, password):
         return None
     return json_response(401, {"error": "Unauthorized: invalid or missing password"})
 

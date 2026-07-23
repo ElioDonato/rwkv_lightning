@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 from contextlib import asynccontextmanager
 from contextlib import suppress
@@ -39,7 +40,7 @@ def prefill_bsz_limit_response(exc: PrefillBszLimitExceeded):
 
 
 def check_password(body_password, password):
-    if password and body_password != password:
+    if password and not hmac.compare_digest(str(body_password or ""), password):
         return json_response(401, {"error": "Unauthorized: invalid or missing password"})
     return None
 

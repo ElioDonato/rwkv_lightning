@@ -4,3 +4,13 @@ rwkv_sessions.db
 ShareGPT_V3_unfiltered_cleaned_split.json
 .codex
 infer/rwkv_batch/cuda/third_party/cutlass/*
+
+# secrets / local env
+env.sh
+service_run.sh
+
+# model weights (downloaded separately, not for git)
+models/
+
+# logs and local test artifacts
+*.log

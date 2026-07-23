@@ -34,6 +34,7 @@ class TranslateRequest(BaseModel):
     target_lang: str
     text_list: list[str]
     placeholders: Optional[list[str]] = None
+    password: Optional[str] = None
 
 
 class TranslateResponse(BaseModel):
