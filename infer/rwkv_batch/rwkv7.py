@@ -199,7 +199,14 @@ class RWKV_x070(MyModule):
         z['blocks.0.att.v2'] = z['blocks.0.att.a2'] # actually ignored
         self.refresh_max_prefill_bsz()
         self.max_prefill_bsz_limit = int(self.max_prefill_bsz)
-        self._prefill_bsz_refresh_interval_s = 2.0
+        # Default is 2.0s; override with RWKV_PREFILL_BSZ_REFRESH_INTERVAL_S
+        # if your deployment needs a different tradeoff (shorter = notices
+        # VRAM freed by other processes on a shared GPU sooner, at the cost
+        # of more frequent blocking CUDA syncs; longer = fewer syncs, slower
+        # to react to freed VRAM).
+        self._prefill_bsz_refresh_interval_s = float(
+            os.environ.get("RWKV_PREFILL_BSZ_REFRESH_INTERVAL_S", "2.0")
+        )
         self._prefill_bsz_last_refresh = time.monotonic()
         print(
             f"max_prefill_bsz={self.max_prefill_bsz} "
