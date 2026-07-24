@@ -96,6 +96,24 @@ class InferenceUtilsMixin:
         pending_tokens.clear()
         return decoded
 
+    # NOTE (2026-07-24 kernel investigation): this helper is currently dead
+    # code -- grep confirms no caller anywhere in the live code paths (it is
+    # a leftover from the graph_generate/graph_infer_stream endpoints that
+    # were removed in commit 34cc6eb "Use str as stop_tokens"). Do not wire
+    # this back up without further work: a standalone repro
+    # (torch.cuda.CUDAGraph() around model.forward / model.forward_batch)
+    # showed the replayed graph's logits diverge sharply (max abs diff in
+    # the 4-20+ range on ~13-18 magnitude logits, growing across steps) from
+    # an eager reference run with identical inputs and starting state, for
+    # both the forward_one (cuda_forward_one) and forward_seq_batch_tensor
+    # (cuda_forward_seq) decode paths. Root cause not fully isolated, but a
+    # likely contributor: cuda_forward_seq's kernel launch
+    # (kernel_forward_w0_fp16_dither_seq<<<...>>>) does not pass an explicit
+    # CUDA stream (unlike cuda_forward_one, which uses
+    # at::cuda::getCurrentCUDAStream()), so under graph capture that kernel
+    # may execute outside the captured stream and never actually update the
+    # WKV state on replay. See /tmp/rwkv_swarm_reports/kernel-investigation.md
+    # for the full investigation and repro scripts.
     def _init_cuda_graph_state(self, token, state, out):
         x_emb = self.model.z["emb.weight"][token]
 
