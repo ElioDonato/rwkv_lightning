@@ -34,9 +34,8 @@ class BigBatchMixin:
             # tagged as inference tensors even after the desync, so a later
             # in-place op on them (e.g. sampler_gumbel_batch's logits.mul_())
             # raises "Inplace update to inference tensor outside InferenceMode"
-            # -- this fired repeatedly in production before this fix (see
-            # git log for the commit introducing this comment for the full
-            # repro/root-cause writeup). no_grad() only affects autograd-graph
+            # -- this fired repeatedly in production before this fix.
+            # no_grad() only affects autograd-graph
             # construction, checked live at op-dispatch time, so it has no
             # such hazard -- the tradeoff is that no_grad() (unlike
             # inference_mode()) won't loudly reject an in-place mutation of a
