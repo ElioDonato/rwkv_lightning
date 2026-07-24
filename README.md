@@ -114,6 +114,11 @@ python app.py --model-path /path/to/model-w8a16 \
 and CUTLASS checkpoints use different layouts and cannot be interchanged.
 - if no password, you can do not add ```--password``` flag
 
+`max_tokens` per request is capped at `32768` by default (a fairness/DoS
+guard, since a request holds its prefill-admission slot for its entire
+generation) — override with the `RWKV_MAX_ALLOWED_TOKENS` env var if your
+deployment needs a different ceiling.
+
 
 ## Test API quickly
 ```bash
