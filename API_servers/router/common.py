@@ -1,6 +1,7 @@
 import asyncio
 import hmac
 import json
+import os
 import traceback
 from contextlib import asynccontextmanager
 from contextlib import suppress
@@ -117,7 +118,25 @@ async def watch_disconnect(request: Request, cancel_token: CancellationToken):
         raise
 
 
-async def cleanup_disconnect_watcher(task, timeout: float = 1.0, poll_interval: float = 0.05):
+# Defaults for how long cleanup_disconnect_watcher retries cancel() before
+# giving up on a stuck disconnect-watcher (see that function's docstring
+# below for why this retry loop exists at all). Override via env vars if a
+# deployment needs different behavior under heavier event-loop load; an
+# abandoned watcher is harmless either way, it exits on its own once the
+# client actually disconnects.
+DISCONNECT_WATCHER_CLEANUP_TIMEOUT_S = float(
+    os.environ.get("RWKV_DISCONNECT_WATCHER_CLEANUP_TIMEOUT_S", "1.0")
+)
+DISCONNECT_WATCHER_CLEANUP_POLL_INTERVAL_S = float(
+    os.environ.get("RWKV_DISCONNECT_WATCHER_CLEANUP_POLL_INTERVAL_S", "0.05")
+)
+
+
+async def cleanup_disconnect_watcher(
+    task,
+    timeout: float = DISCONNECT_WATCHER_CLEANUP_TIMEOUT_S,
+    poll_interval: float = DISCONNECT_WATCHER_CLEANUP_POLL_INTERVAL_S,
+):
     # watch_disconnect polls request.is_disconnected(), which wraps its receive() call in an
     # already-cancelled anyio.CancelScope (see Starlette's Request.is_disconnected). If task.cancel()
     # lands while the watcher is inside that scope, anyio can treat the injected CancelledError as

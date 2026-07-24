@@ -8,9 +8,8 @@ test_local_state_and_batch.py. Run from the repo root with a model path:
 
     uv run python test/verify_batch_compaction.py models/<model-dir>
 
-Covers exactly the two things an independent controller review flagged as
-essential and non-obvious for this kind of change (hot decode loop, tensor
-index bookkeeping across a shrinking batch):
+Covers two things essential and non-obvious for this kind of change (hot
+decode loop, tensor index bookkeeping across a shrinking batch):
 
 1. No output misattribution across multiple composed compaction waves,
    using distinctive per-prompt expected content so a swapped/off-by-one
@@ -24,11 +23,6 @@ index bookkeeping across a shrinking batch):
    feature introduced -- and that greedy decoding (temperature=0) is
    unaffected, since it doesn't have sampling noise to amplify tiny
    floating-point differences into a different token choice.
-
-See reports/00-implementation-notes.md and reports/01-controller-review.md
-(in the original feature/batch-early-return review worktree, not
-necessarily present in this checkout) for the full investigation this
-distilled from.
 """
 import asyncio
 import json
