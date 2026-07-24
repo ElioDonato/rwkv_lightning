@@ -12,6 +12,7 @@ from API_servers.router.common import (
     client_closed_response,
     json_response,
     normalize_state_prompts,
+    parse_request_model,
     prefill_bsz_limit_response,
     prefill_sse_response,
     reserve_prefill_capacity,
@@ -28,7 +29,9 @@ async def state_chat_completions(request: Request):
     engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
-    req = ChatRequest(**body)
+    req, parse_error = parse_request_model(ChatRequest, body)
+    if parse_error is not None:
+        return parse_error
     session_id = req.session_id
 
     if len(req.contents) > 1:
@@ -123,7 +126,9 @@ async def multi_state_chat_completions(request: Request):
     engine = app_state.engine
     password = app_state.password
     body = await request.json()
-    req = ChatRequest(**body)
+    req, parse_error = parse_request_model(ChatRequest, body)
+    if parse_error is not None:
+        return parse_error
 
     auth_error = check_password(req.password, password)
     if auth_error is not None:

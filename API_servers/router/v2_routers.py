@@ -5,6 +5,7 @@ from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBsz
 from API_servers.router.common import (
     check_password,
     client_closed_response,
+    parse_request_model,
     prefill_bsz_limit_response,
     prefill_sse_response,
     reserve_prefill_capacity,
@@ -29,7 +30,9 @@ async def chat_completions_v2(request: Request):
     engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
-    req = V2ChatRequest(**body)
+    req, parse_error = parse_request_model(V2ChatRequest, body)
+    if parse_error is not None:
+        return parse_error
 
     auth_error = check_password(req.password, password)
     if auth_error is not None:

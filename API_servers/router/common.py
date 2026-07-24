@@ -5,6 +5,7 @@ from contextlib import suppress
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import ValidationError
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
@@ -42,6 +43,22 @@ def check_password(body_password, password):
     if password and body_password != password:
         return json_response(401, {"error": "Unauthorized: invalid or missing password"})
     return None
+
+
+def parse_request_model(model_cls, body: dict):
+    """Build a pydantic request model from a parsed JSON body, converting
+    ValidationError (e.g. our max_tokens ceiling, or any other field
+    constraint) into a clean 400 response instead of letting it propagate
+    as an uncaught exception (which FastAPI turns into an opaque 500 with no
+    indication of what was wrong with the request).
+
+    Returns (model_instance, None) on success, or (None, error_response) on
+    failure -- callers should check the second element and return it as-is.
+    """
+    try:
+        return model_cls(**body), None
+    except ValidationError as exc:
+        return None, json_response(400, {"error": f"invalid request: {exc}"})
 
 
 def normalize_state_prompts(prompts: list[str], reuse_existing_state: bool) -> list[str]:
