@@ -2,11 +2,13 @@ import ast
 import html
 import inspect
 import json
+import os
 import re
 import threading
 import time
 from datetime import datetime
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import gradio as gr
 import requests
@@ -17,6 +19,70 @@ DEFAULT_DELETE_URL = "http://127.0.0.1:8000/state/delete"
 DEFAULT_BATCH_API_URL = "http://127.0.0.1:8000/v2/chat/completions"
 DEFAULT_BIG_BATCH_API_URL = "http://127.0.0.1:8000/big_batch/completions"
 DEFAULT_STOP_TOKENS_JSON = json.dumps(["\nUser:"], ensure_ascii=False)
+
+# --- Backend URL allowlist (SSRF hardening) -------------------------------
+#
+# The "API URL" / "Delete URL" fields in the UI are used verbatim as the
+# target of outbound `requests.post(...)` calls made by this (trusted,
+# server-side) webui process. With no restriction, anyone who can reach the
+# webui can repoint those fields at an arbitrary host and make the webui
+# process issue requests on their behalf (SSRF / open relay), which is
+# especially dangerous if the webui itself has no login (see RWKV_WEBUI_AUTH
+# below) and is reachable beyond a fully trusted network.
+#
+# By default we only allow the hosts already baked into the DEFAULT_*_URL
+# constants above (i.e. the local rwkv_lightning backend on 127.0.0.1),
+# plus localhost/::1. Set RWKV_WEBUI_ALLOWED_HOSTS to a comma-separated list
+# of additional hostnames/IPs to allow (e.g. when the backend runs on
+# another trusted LAN host). Set RWKV_WEBUI_ALLOW_ANY_BACKEND=1 to disable
+# this check entirely — only do this if you understand the SSRF risk above.
+
+
+def _default_allowed_backend_hosts() -> set[str]:
+    hosts = {"127.0.0.1", "localhost", "::1"}
+    for url in (DEFAULT_API_URL, DEFAULT_DELETE_URL, DEFAULT_BATCH_API_URL, DEFAULT_BIG_BATCH_API_URL):
+        hostname = urlparse(url).hostname
+        if hostname:
+            hosts.add(hostname.lower())
+    return hosts
+
+
+ALLOW_ANY_BACKEND = os.environ.get("RWKV_WEBUI_ALLOW_ANY_BACKEND", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+ALLOWED_BACKEND_HOSTS = _default_allowed_backend_hosts()
+_extra_hosts_env = os.environ.get("RWKV_WEBUI_ALLOWED_HOSTS", "")
+if _extra_hosts_env.strip():
+    ALLOWED_BACKEND_HOSTS |= {h.strip().lower() for h in _extra_hosts_env.split(",") if h.strip()}
+
+
+def backend_url_error(url: str) -> Optional[str]:
+    """Return a user-facing error string if `url` is not an allowed backend target, else None."""
+    url = (url or "").strip()
+    if not url:
+        return "后端 URL 为空"
+    if ALLOW_ANY_BACKEND:
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return f"无效的后端 URL: {url!r}"
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return f"无效的后端 URL: {url!r}"
+    if parsed.hostname.lower() in ALLOWED_BACKEND_HOSTS:
+        return None
+    allowed = ", ".join(sorted(ALLOWED_BACKEND_HOSTS)) or "(none)"
+    return (
+        f"拒绝请求：后端 URL 主机不在允许列表中: {parsed.hostname!r}\n"
+        f"允许的主机: {allowed}\n"
+        "如需连接其他后端，请设置环境变量 RWKV_WEBUI_ALLOWED_HOSTS "
+        "（逗号分隔的主机名/IP列表）后重启 webui，"
+        "或设置 RWKV_WEBUI_ALLOW_ANY_BACKEND=1 完全关闭此限制"
+        "（不建议在 webui 对不受信任用户开放时这样做，这会让该字段变成可被"
+        "任意利用的 SSRF 出口）。"
+    )
 
 BIG_BATCH_GRID_W = 20
 BIG_BATCH_GRID_H = 16
@@ -265,6 +331,11 @@ def stream_big_batch_wall(
         yield render_big_batch_wall(), "请输入 prompt"
         return
 
+    url_err = backend_url_error(api_url)
+    if url_err:
+        yield render_big_batch_wall(prompt), url_err
+        return
+
     try:
         stop_tokens = parse_stop_tokens(stop_tokens_text)
     except Exception:
@@ -368,6 +439,10 @@ def stream_chat(
     if not user_input:
         yield history, "请输入内容后再发送。"
         return
+    url_err = backend_url_error(api_url)
+    if url_err:
+        yield history, url_err
+        return
     try:
         stop_tokens = parse_stop_tokens(stop_tokens_text)
     except Exception:
@@ -464,6 +539,9 @@ def stream_chat(
 
 
 def clear_session_state(delete_url: str, password: str, session_id: str) -> str:
+    url_err = backend_url_error(delete_url)
+    if url_err:
+        return url_err
     payload = {"session_id": session_id, "password": password}
     try:
         resp = requests.post(delete_url, json=payload, timeout=20)
@@ -541,6 +619,11 @@ def run_batch_file_stream(
 ) -> Any:
     slots = ["等待填充..."] * 32
     yield tuple(["准备开始..."] + slots + [None, None])
+
+    url_err = backend_url_error(api_url)
+    if url_err:
+        yield tuple([url_err] + slots + [None, None])
+        return
 
     try:
         stop_tokens = parse_stop_tokens(stop_tokens_text)
@@ -689,6 +772,11 @@ def run_prompt_32_stream(
     if not prompt_text:
         slots = ["请输入 prompt"] + [""] * (active - 1)
         yield tuple(["请输入 prompt 后再生成"] + slots + [None, None])
+        return
+    url_err = backend_url_error(api_url)
+    if url_err:
+        slots = [url_err] + [""] * (active - 1)
+        yield tuple([url_err] + slots + [None, None])
         return
     try:
         stop_tokens = parse_stop_tokens(stop_tokens_text)
@@ -1007,6 +1095,11 @@ def stream_html_grid_api(
     prompt = (prompt or "").strip()
     if not prompt:
         yield "", "请输入 prompt", {"done": True, "token_counts": [0 for _ in range(page_count)]}
+        return
+
+    url_err = backend_url_error(api_url)
+    if url_err:
+        yield "", url_err, {"done": True, "token_counts": [0 for _ in range(page_count)]}
         return
 
     try:
@@ -1660,4 +1753,59 @@ with gr.Blocks(title="RWKV State Chat UI") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, css=HTML_GRID_CSS, theme="ocean")
+    # --- Optional Gradio login (auth hardening) ----------------------------
+    #
+    # By default this webui binds 0.0.0.0:7860 with no login, matching prior
+    # behavior for people already relying on it being open on a trusted LAN.
+    # That is fine on a network you fully trust, but this process also holds
+    # a "password" used to authenticate to the rwkv_lightning backend and
+    # (see backend_url_error above) makes outbound HTTP requests on behalf
+    # of whoever is using the UI, so anyone who can reach it can use the
+    # backend and consume GPU capacity.
+    #
+    # Set RWKV_WEBUI_AUTH="username:password" to require a login before the
+    # UI is served (Gradio's built-in HTTP basic-auth-style login screen).
+    # Multiple accounts can be supplied as "user1:pass1,user2:pass2".
+    # Set RWKV_WEBUI_HOST to override the bind address (e.g. "127.0.0.1" to
+    # restrict access to localhost only, which is the strongest option if
+    # you don't need LAN access at all) and RWKV_WEBUI_PORT to override the
+    # port. These all default to the previous behavior so existing
+    # deployments are not silently broken.
+    auth = None
+    auth_env = os.environ.get("RWKV_WEBUI_AUTH", "").strip()
+    if auth_env:
+        pairs = []
+        for entry in auth_env.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if ":" not in entry:
+                raise SystemExit(
+                    f"RWKV_WEBUI_AUTH entry {entry!r} is not in 'user:password' form"
+                )
+            user, _, pw = entry.partition(":")
+            pairs.append((user, pw))
+        if pairs:
+            auth = pairs[0] if len(pairs) == 1 else pairs
+
+    host = os.environ.get("RWKV_WEBUI_HOST", "0.0.0.0")
+    port = int(os.environ.get("RWKV_WEBUI_PORT", "7860"))
+
+    if auth is None:
+        print(
+            "[webui_rwkv] WARNING: starting with NO login (RWKV_WEBUI_AUTH is unset). "
+            f"Listening on {host}:{port}. Anyone who can reach this address can use the "
+            "backend and change the backend URL fields. Set RWKV_WEBUI_AUTH=user:password "
+            "to require a login, and/or RWKV_WEBUI_HOST=127.0.0.1 to restrict to localhost.",
+            flush=True,
+        )
+
+    demo.launch(
+        server_name=host,
+        server_port=port,
+        share=False,
+        css=HTML_GRID_CSS,
+        theme="ocean",
+        auth=auth,
+        auth_message="RWKV WebUI 登录 / RWKV WebUI Login" if auth else None,
+    )
