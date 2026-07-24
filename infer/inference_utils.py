@@ -96,6 +96,36 @@ class InferenceUtilsMixin:
         pending_tokens.clear()
         return decoded
 
+    # NOTE (2026-07-24 kernel investigation, independently re-verified by a
+    # controller review same day): this helper is currently dead code --
+    # grep confirms no caller anywhere in the live code paths (it is a
+    # leftover from the graph_generate/graph_infer_stream endpoints that
+    # were removed in commit 34cc6eb "Use str as stop_tokens"). Do not wire
+    # this back up without further work: a standalone repro
+    # (torch.cuda.CUDAGraph() around model.forward_batch /
+    # forward_seq_batch_tensor) showed the replayed graph's logits diverge
+    # sharply (max abs diff ~15-26 on ~4-13 magnitude logits, vs. an exact
+    # 0.0 eager-vs-eager control) from an eager reference run with identical
+    # inputs and starting state. Root cause: cuda_forward_seq's kernel
+    # launch (kernel_forward_w0_fp16_dither_seq<<<...>>>) does not pass an
+    # explicit CUDA stream (unlike cuda_forward_one and cuda_spmv_forward,
+    # both of which use at::cuda::getCurrentCUDAStream()), so under graph
+    # capture that kernel executes outside the captured stream and the WKV
+    # state never actually advances on replay. Note: the single-sequence
+    # forward_one (cuda_forward_one) decode path does NOT have this problem
+    # -- an earlier draft of this investigation reported forward_one also
+    # diverging, but that was a state-cloning/staleness bug in the test
+    # harness, not a real issue; forward_one graph-replay was independently
+    # re-verified to be numerically fine (diff indistinguishable from
+    # forward_one's own eager-mode noise floor, which is nonzero for an
+    # unrelated reason: CMix's SPMV_OP/cuda_spmv_forward kernel uses
+    # atomicAdd and isn't bit-deterministic run-to-run). This is consistent
+    # with, and strengthens, the stream-argument theory: the one kernel
+    # launch without an explicit stream is the one that diverges; the ones
+    # with an explicit stream do not. See
+    # /tmp/rwkv_swarm_reports/kernel-investigation.md and
+    # /tmp/rwkv_swarm_reports/controller-kernel-investigation.md for the
+    # full investigation, independent re-verification, and repro scripts.
     def _init_cuda_graph_state(self, token, state, out):
         x_emb = self.model.z["emb.weight"][token]
 
