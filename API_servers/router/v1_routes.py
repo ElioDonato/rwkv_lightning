@@ -6,6 +6,7 @@ from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBsz
 from API_servers.router.common import (
     check_password,
     client_closed_response,
+    parse_request_model,
     prefill_bsz_limit_response,
     prefill_sse_response,
     reserve_prefill_capacity,
@@ -50,7 +51,9 @@ async def chat_completions(request: Request):
     engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
-    req = ChatRequest(**body)
+    req, parse_error = parse_request_model(ChatRequest, body)
+    if parse_error is not None:
+        return parse_error
 
     auth_error = check_password(req.password, password)
     if auth_error is not None:
@@ -118,7 +121,9 @@ async def batch_translate(request: Request):
     engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
-    req = TranslateRequest(**body)
+    req, parse_error = parse_request_model(TranslateRequest, body)
+    if parse_error is not None:
+        return parse_error
 
     auth_error = check_password(req.password, password)
     if auth_error:
@@ -173,7 +178,9 @@ async def fim_completions(request: Request):
     engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
-    req = ChatRequest(**body)
+    req, parse_error = parse_request_model(ChatRequest, body)
+    if parse_error is not None:
+        return parse_error
 
     auth_error = check_password(req.password, password)
     if auth_error is not None:
@@ -245,7 +252,9 @@ async def big_batch_completions(request: Request):
     engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
-    req = ChatRequest(**body)
+    req, parse_error = parse_request_model(ChatRequest, body)
+    if parse_error is not None:
+        return parse_error
 
     auth_error = check_password(req.password, password)
     if auth_error is not None:
