@@ -214,7 +214,54 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 
 ___
-### **3. ```state/chat/completions``` [Support state cache manager] 😜**
+### **3. ```/v2/chat/completions``` [GPU-native sampler, used by the webui]**
+
+Same request/response shape as `/v1/chat/completions` (`contents` list in,
+one `chat.completion`-style choice out per prompt, `session_id`/`stop_tokens`/
+`chunk_size` all supported the same way), but decoding runs through a
+different, GPU-native top-k/top-p sampling kernel (`sample_logits_batch_cuda`
+in `infer/inference_utils.py`) instead of the `/v1` sampler, and the default
+decode parameters differ: `top_k=500`, `top_p=0.5`, `alpha_presence=1.0`,
+`alpha_frequency=0.1`, `alpha_decay=0.99` (vs. `/v1`'s `top_k=50`, `top_p=0.6`,
+`alpha_presence=2`, `alpha_frequency=0.2`, `alpha_decay=0.996`). Auth,
+back-pressure (`bsz overflow` 400 response), and disconnect handling are the
+same as `/v1/chat/completions`.
+
+This is the endpoint `webui_rwkv.py` uses by default for its batch-generation
+tabs (`DEFAULT_BATCH_API_URL`).
+
+<details>
+<summary><strong><em>curl examples</em></strong></summary>
+
+- Streaming synchronous batch processing
+```bash
+curl -X POST http://localhost:8000/v2/chat/completions \
+  -H "Content-Type: application/json" \
+  -N \
+  -d '{
+    "contents": ["Hi there!", "Tell me a joke."],
+    "max_tokens": 1024,
+    "chunk_size": 128,
+    "stream": true,
+    "password": "rwkv7_7.2b"
+  }'
+```
+- Non-streaming synchronous batch processing
+```bash
+curl -X POST http://localhost:8000/v2/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": ["Hi there!", "Tell me a joke."],
+    "max_tokens": 1024,
+    "stream": false,
+    "password": "rwkv7_7.2b"
+  }'
+```
+
+</details>
+
+___
+### **4. ```state/chat/completions``` [Support state cache manager] 😜**
 
 #### Have 3 Levels Cache design 🤓
 - **L1 cache(VRAM) 16**
@@ -278,7 +325,7 @@ curl -X POST http://localhost:8000/state/chat/completions \
 </details>
 
 ___
-### **4. State Management API [Support state cache manager] 😜**
+### **5. State Management API [Support state cache manager] 😜**
 
 #### Use ```state/status```  Interface to check the state pool status of a session
 
@@ -297,6 +344,10 @@ curl -X POST http://localhost:8000/state/status \
 
 #### Use ```state/delete```  Interface to delete the state of a session
 
+Set ```"delete_prefix": true``` to also delete every ```/multi_state``` branch
+whose session id starts with ```"<session_id>:"``` (see below), not just the
+```/state``` session itself.
+
 <details>
 <summary><strong><em>curl examples</em></strong></summary>
 
@@ -306,6 +357,7 @@ curl -X POST http://localhost:8000/state/delete \
   -H "Content-Type: application/json" \
   -d '{
     "session_id": "your_session_id_to_delete",
+    "delete_prefix": true,
     "password": "rwkv7_7.2b"
   }'
 ```
@@ -313,7 +365,39 @@ curl -X POST http://localhost:8000/state/delete \
 </details>
 
 ___
-### **5. ```/openai/v1/chat/completions``` [Open AI format support]**
+### **6. ```/multi_state/chat/completions``` [Branching state sessions]**
+
+Like ```/state/chat/completions```, but instead of one mutable session it
+keeps a tree of numbered dialogue turns: give it ```session_id``` +
+```dialogue_idx``` (the turn you're continuing from, ```0``` for a fresh
+tree), and it stores the result under the *next* free ```dialogue_idx``` for
+that session as ```"<session_id>:<new_dialogue_idx>"```, returned in the
+response body (and, for streaming, as an extra
+```{"object": "multi_state.dialogue_idx", ...}``` SSE event before the token
+chunks). This lets a client branch/replay conversation history by requesting
+the same ```dialogue_idx``` again instead of always continuing linearly.
+Only supports single-session (bsz=1) requests, same as ```/state```.
+
+<details>
+<summary><strong><em>curl examples</em></strong></summary>
+
+```bash
+curl -X POST http://localhost:8000/multi_state/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "session_one",
+    "dialogue_idx": 0,
+    "contents": ["User: What should we eat for dinner?\n\nAssistant:"],
+    "max_tokens": 1024,
+    "stream": false,
+    "password": "rwkv7_7.2b"
+  }'
+```
+
+</details>
+
+___
+### **7. ```/openai/v1/chat/completions``` [Open AI format support]**
 
 <details>
 <summary><strong><em>curl examples</em></strong></summary>
@@ -372,8 +456,13 @@ curl -X POST 'http://localhost:8000/openai/v1/chat/completions' \
 
 </details>
 
+Also exposes ```GET /v1/models``` and ```GET /openai/v1/models``` (the
+latter honoring the same `Authorization: Bearer` password check), both
+returning an OpenAI-style `{"object": "list", "data": [{"id": <model name>, ...}]}`
+body for client auto-discovery.
+
 ___
-### **6. ```/big_batch/completions```  [Only Support temperature decode parameters]**
+### **8. ```/big_batch/completions```  [Only Support temperature decode parameters]**
 
 <details>
 <summary><strong><em>curl examples</em></strong></summary>
@@ -399,7 +488,7 @@ curl -X POST 'http://localhost:8000/big_batch/completions' \
 </details>
 
 ___
-### **7. FIM ( For RWKV7_G1c series model )**
+### **9. FIM ( For RWKV7_G1c series model )**
 
 <details>
 <summary><strong><em>curl examples</em></strong></summary>
@@ -461,3 +550,5 @@ curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
     "password": "rwkv7_7.2b"
   }'
 ```
+
+</details>
