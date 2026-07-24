@@ -1,7 +1,5 @@
 import asyncio
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
 
 from infer import inference_deps
 from infer.batch_inference import BatchInferenceMixin
@@ -20,10 +18,6 @@ class InferenceEngine(
         self.tokenizer = tokenizer
         self.args = args
         self.rocm_flag = rocm_flag
-        self.model_lock = Lock()
-        self.executor = ThreadPoolExecutor(
-            max_workers=128, thread_name_prefix="model_inference"
-        )
         self._prefill_queue = deque()
         self._prefill_reserved_bsz = 0
         self._prefill_next_ticket = 0
@@ -140,4 +134,6 @@ class InferenceEngine(
             condition.notify_all()
 
     def shutdown(self):
-        self.executor.shutdown(wait=False)
+        # No engine-owned resources currently require explicit teardown.
+        # Kept as a stable hook since app.py calls engine.shutdown() on exit.
+        pass
