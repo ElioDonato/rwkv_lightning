@@ -55,6 +55,10 @@ def parse_request_model(model_cls, body: dict):
     Returns (model_instance, None) on success, or (None, error_response) on
     failure -- callers should check the second element and return it as-is.
     """
+    if not isinstance(body, dict):
+        return None, json_response(
+            400, {"error": "invalid request: expected a JSON object"}
+        )
     try:
         return model_cls(**body), None
     except ValidationError as exc:
