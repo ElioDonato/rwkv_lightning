@@ -107,6 +107,16 @@ Launch: `uv run python app.py --model-path models/<name-without-.pth> --port <p>
 
 - `uv run pytest test/test_prefix_state_cache.py` — CPU-only, no model
   needed. Passes (see bug #1 above).
+- `uv run pytest test/test_state_pool_l1_l2_cache.py` (added 2026-07-24) —
+  CPU-only except one CUDA-skipped case, no model needed. Covers
+  `state_manager/state_pool.py`'s in-memory L1 (VRAM)/L2 (RAM) session
+  cache — `put_state`/`get_state` round-trip, LRU (not FIFO) eviction
+  order (`move_to_end` on L1 hit matters), overwrite-of-existing-session
+  not double-evicting, L2-hit promotion back to L1 (including the cascade
+  eviction that can trigger), and L2-overflow persisting to disk. This was
+  previously untested — only the prefix-cache's L2/disk paths had
+  coverage via `test_prefix_state_cache.py`. Passes (5/5, run against
+  this checkout 2026-07-24).
 - `bash test/test_curl.sh` (env vars `BASE_URL`, `PASSWORD`,
   `STATE_MEMORY_ROUNDS`, etc. — see the script header) — full HTTP smoke
   suite: batch translate, `/v1/chat/completions` batch (stream + non-stream),
@@ -117,18 +127,39 @@ Launch: `uv run python app.py --model-path models/<name-without-.pth> --port <p>
   the `use_prefix_cache:true` non-stream call that used to intermittently
   hang (bug #2 above, now fixed) — no need to pass `RUN_OPENAI=0` anymore.
 - `test/test_state_reuse.py` / `test/test_batch_state_reuse.py` (shipped)
-  hardcode another machine's absolute model path and have inconsistent
-  import assumptions (one expects cwd=repo root, the other cwd=`infer/`) —
-  don't run as-is. `test/test_local_state_and_batch.py` (added here)
-  is an adapted equivalent that takes a model path as `argv[1]` and runs
-  from the repo root; validates state token-count advances correctly
-  across turns for both single-sequence and batched (bsz=2) generation.
+  hardcoded another machine's absolute model path
+  (`/mnt/3f7ab3b2-.../rwkv7-g1b-1.5b-...`) and had inconsistent import
+  assumptions (one expected cwd=repo root, the other cwd=`infer/`) — both
+  confirmed to fail at runtime (`ModuleNotFoundError` and then
+  `FileNotFoundError` on the hardcoded path once the import is worked
+  around) on 2026-07-24. **Deleted** rather than "fixed", since
+  `test/test_local_state_and_batch.py` (added 2026-07-11, kept) is a
+  strict superset — same single-sequence + batched (bsz=2) state-reuse
+  coverage, argv-driven model path, runs from the repo root. Verified
+  passing against the local 2.9b model 2026-07-24 (`state[2]` token count
+  advances correctly across turns for both the single-sequence and
+  bsz=2 cases).
   Note its generated *text* isn't as clean as the HTTP endpoints' — it
   doesn't replicate the `<think>\n</think>` formatting cue or stop-token
   handling the production routes use, so don't read too much into
   turn-2 content quality from that script specifically; the HTTP-level
   `test_curl.sh` state-memory-recall round is the stronger proof of
   correctness.
+- `uv run python test/verify_batch_v2_decode.py models/<model-dir>`
+  (added 2026-07-24) — needs a real model + GPU. Covers
+  `infer/batch_inference.py`'s V2 batch decode loop
+  (`batch_generate_v2` and `batch_infer_stream_v2`), which previously had
+  zero test coverage (distinct code path from `infer/big_batch.py`, which
+  `test/verify_batch_compaction.py` already covers). Follows that script's
+  misattribution-testing convention: 8 concurrent prompts each required to
+  repeat a distinctive unique number, so any per-row indexing bug in the
+  occurrence-penalty tensors / `active_mask` / per-index stop-state lists
+  would show up as one prompt's output containing a *different* prompt's
+  number — categorically distinguishable from ordinary sampling variation.
+  Verified passing against the local 2.9b model 2026-07-24 (all 3 checks:
+  blocking `batch_generate_v2`, streaming `batch_infer_stream_v2`, and a
+  staggered-finish-length variant of the streaming case — zero
+  cross-contamination in all 8×3 outputs).
 
 Only one server process/model can run at a time on this GPU realistically
 (2.9b + 7.2b weights alone would be ~20GB, no headroom left for state/batch
