@@ -5,6 +5,7 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Request
+from pydantic import ValidationError
 
 from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBszLimitExceeded
 from state_manager.state_pool import get_state_manager
@@ -357,6 +358,8 @@ async def openai_chat_completions(request: Request):
         return client_closed_response()
     except PrefillBszLimitExceeded as exc:
         return prefill_bsz_limit_response(exc)
+    except ValidationError as exc:
+        return json_response(400, {"error": f"invalid request: {exc}"})
     except json.JSONDecodeError as exc:
         return json_response(400, {"error": f"Invalid JSON: {str(exc)}"})
     except Exception as exc:
