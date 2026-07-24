@@ -96,9 +96,8 @@ class InferenceUtilsMixin:
         pending_tokens.clear()
         return decoded
 
-    # NOTE (2026-07-24 kernel investigation, independently re-verified by a
-    # controller review same day): this helper is currently dead code --
-    # grep confirms no caller anywhere in the live code paths (it is a
+    # NOTE (2026-07-24): this helper is currently dead code -- grep confirms
+    # no caller anywhere in the live code paths (it is a
     # leftover from the graph_generate/graph_infer_stream endpoints that
     # were removed in commit 34cc6eb "Use str as stop_tokens"). Do not wire
     # this back up without further work: a standalone repro
@@ -113,11 +112,9 @@ class InferenceUtilsMixin:
     # capture that kernel executes outside the captured stream and the WKV
     # state never actually advances on replay. Note: the single-sequence
     # forward_one (cuda_forward_one) decode path does NOT have this problem
-    # -- an earlier draft of this investigation reported forward_one also
-    # diverging, but that was a state-cloning/staleness bug in the test
-    # harness, not a real issue; forward_one graph-replay was independently
-    # re-verified to be numerically fine (diff indistinguishable from
-    # forward_one's own eager-mode noise floor, which is nonzero for an
+    # -- it was independently re-verified to be numerically fine under
+    # graph capture (diff indistinguishable from forward_one's own
+    # eager-mode noise floor, which is nonzero for an
     # unrelated reason: CMix's SPMV_OP/cuda_spmv_forward kernel uses
     # atomicAdd and isn't bit-deterministic run-to-run). This is consistent
     # with, and strengthens, the stream-argument theory: the one kernel
