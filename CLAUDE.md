@@ -302,3 +302,52 @@ All 6 opened as separate upstream PRs against `RWKV-Vibe/rwkv_lightning`
 (#20-25) in addition to the direct `main`/`fork` commits described in the
 git-workflow section above — upstream contribution is the one case where
 this repo does go through real PRs (see that section's last line).
+
+## Critical follow-up (2026-07-24): hardcoded constants -> configurable env vars
+
+A later review of all 13 open upstream PRs found a real pattern worth
+remembering: several "fixes" for genuine bugs shipped their remedy as an
+unconditional hardcoded constant instead of an operator-configurable
+default. The underlying bug/vulnerability was real in each case, but the
+specific number picked is a deployment-specific policy choice, not a
+universal constant, and this codebase already has a precedent
+(`RWKV_WEBUI_*` env vars in `webui_rwkv.py`) for exposing tuning knobs this
+way instead of baking them into source.
+
+Fixed three instances, all keeping the previous value as the default (pure
+additive, non-breaking):
+
+- `MAX_ALLOWED_TOKENS` (`API_servers/router/schemas.py`, was a bare
+  `32768`) -> `RWKV_MAX_ALLOWED_TOKENS` env var.
+- `_prefill_bsz_refresh_interval_s` (`infer/rwkv_batch/rwkv7.py`, was a
+  bare `2.0`) -> `RWKV_PREFILL_BSZ_REFRESH_INTERVAL_S` env var.
+- `cleanup_disconnect_watcher`'s `timeout`/`poll_interval` defaults
+  (`API_servers/router/common.py`, were bare `1.0`/`0.05`) ->
+  `RWKV_DISCONNECT_WATCHER_CLEANUP_TIMEOUT_S` /
+  `RWKV_DISCONNECT_WATCHER_CLEANUP_POLL_INTERVAL_S` env vars.
+
+Documented in README.md's new "Server tuning env vars" section. Applied to
+`main`/`fork` and propagated to the 6 affected upstream PR branches
+(#13, #16, #18, #19, #23, #24) as follow-up commits, plus updated each of
+those PRs' descriptions.
+
+**Lesson for future work in this repo**: when a fix for a DoS/fairness/
+performance issue involves picking a specific numeric threshold or
+interval, default to making it an env-var-overridable module constant from
+the start, following the `RWKV_WEBUI_*` / `RWKV_MAX_ALLOWED_TOKENS` /
+`RWKV_PREFILL_BSZ_REFRESH_INTERVAL_S` naming convention (`RWKV_` prefix,
+`_S` suffix for seconds), rather than a bare hardcoded value that later
+needs a follow-up PR to fix.
+
+The same review pass also found and removed several dangling references in
+code comments and PR bodies to internal-only investigation files/process
+names (a private report file path, an internal review-process worktree
+path, generic "controller review"/"second reviewer session" phrasing) that
+meant nothing to an outside reader of the public repo/PRs. None of these
+were security-sensitive (no secrets, no private machine paths beyond a
+`/tmp` report location and one stray Claude Code session URL in a PR body,
+both removed), but they were dead references that should never have been
+in code meant to be read by anyone outside this dev machine. Lesson: before
+writing "see X for details" in a comment or PR body, check that X is
+actually reachable by whoever will read it.
+
