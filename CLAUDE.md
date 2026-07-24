@@ -252,3 +252,53 @@ touching `format_openai_prompt()` here, not any client repo.
 `~/search/backend/batching.py::_send_batch` was updated correspondingly to
 send `chats` (full `messages`, system included) instead of an extracted
 `contents` string.
+
+## Second swarm review round (2026-07-24): dead code, webui auth, DoS fix, CUDA graph investigation
+
+Six parallel workstreams, each independently controller-reviewed before
+merge (see `/tmp/rwkv_swarm_reports/*.md` on this dev machine for the full
+write-ups and independent re-verification transcripts — not part of the
+repo, dev-machine-local only).
+
+- **Dead code removed**: `app_big_batch.py` (superseded standalone entry
+  point, zero references anywhere), `sample_logits`/`sampler_simple_batch`
+  in `infer/rwkv_batch/utils.py`, and an unwired `self.model_lock`/
+  `self.executor` in `infer/inference.py` (assigned, never used).
+- **`webui_rwkv.py` hardening**: opt-in Gradio login via `RWKV_WEBUI_AUTH`
+  (unset = prior no-auth behavior, unchanged) and a default-on backend-URL
+  SSRF allowlist (`backend_url_error()`, extend via
+  `RWKV_WEBUI_ALLOWED_HOSTS`, escape hatch `RWKV_WEBUI_ALLOW_ANY_BACKEND=1`).
+  Adversarially re-tested (cloud metadata IP, userinfo/fragment tricks,
+  IP-literal encodings) with no bypass found.
+- **Real DoS fix**: `max_tokens` had no upper bound — a few concurrent
+  huge-`max_tokens` requests could hold prefill-queue slots indefinitely,
+  starving other clients. Fixed with `MAX_ALLOWED_TOKENS = 32768` on
+  `ChatRequest` plus a `parse_request_model()` helper (`common.py`) that
+  turns an uncaught `pydantic.ValidationError` into a clean 400 across
+  `v1_routes.py`/`v2_routers.py`/`state_routes.py`
+  (`openai_routes.py` already had equivalent handling). Also guards against
+  a non-dict top-level JSON body (list/string), which independent review
+  found still 500'd via an uncaught `TypeError` before that guard was added.
+- **CUDA graph investigation** (comment-only change, no functional impact):
+  `_init_cuda_graph_state` in `infer/inference_utils.py` is confirmed dead
+  code, but a naive graph-capture repro found it would also be numerically
+  **unsafe** to revive as-is: `forward_seq_batch_tensor`/`cuda_forward_seq`
+  diverges under CUDA graph replay (root cause: its kernel launch omits an
+  explicit CUDA stream, unlike `cuda_forward_one`/`cuda_spmv_forward`,
+  which both correctly pass `getCurrentCUDAStream()`). The single-sequence
+  `forward_one`/`cuda_forward_one` decode path, once correctly tested, is
+  numerically fine under graph capture — an earlier draft of this
+  investigation's finding that it also diverged was traced (by independent
+  controller review) to a state-cloning bug in the test harness, not a real
+  issue. See the code comment above `_init_cuda_graph_state` for the
+  self-contained summary and suggested fix if anyone revives this later.
+- **Test coverage**: added `test/test_state_pool_l1_l2_cache.py` and
+  `test/verify_batch_v2_decode.py` (see Testing section above), deleted
+  the two broken `test_*_state_reuse.py` files.
+- **Docs**: removed stale `README.md.bak`, documented
+  `/v2/chat/completions` and `/multi_state/chat/completions`.
+
+All 6 opened as separate upstream PRs against `RWKV-Vibe/rwkv_lightning`
+(#20-25) in addition to the direct `main`/`fork` commits described in the
+git-workflow section above — upstream contribution is the one case where
+this repo does go through real PRs (see that section's last line).
