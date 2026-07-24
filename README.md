@@ -114,6 +114,31 @@ python app.py --model-path /path/to/model-w8a16 \
 and CUTLASS checkpoints use different layouts and cannot be interchanged.
 - if no password, you can do not add ```--password``` flag
 
+### Server tuning env vars
+
+A few internal server limits/timeouts have sane defaults but can be
+overridden per-deployment without editing source:
+
+- `RWKV_MAX_ALLOWED_TOKENS` (default `32768`): hard ceiling on `max_tokens`
+  per request. This is a fairness/DoS guard, not a GPU-memory limit (RWKV's
+  recurrent state is O(1) in sequence length) — it exists because a request
+  holds its prefill-admission slot for its entire generation, so an
+  unbounded `max_tokens` lets a handful of concurrent requests starve every
+  other client indefinitely. Lower it for a smaller/more defensive
+  deployment, or raise it if you legitimately need longer generations.
+- `RWKV_PREFILL_BSZ_REFRESH_INTERVAL_S` (default `2.0`): how often the
+  server re-measures free VRAM to estimate the max safe prefill batch size.
+  Lower values react faster to VRAM freed by other processes on a shared
+  GPU, at the cost of more frequent blocking CUDA syncs (`torch.cuda.
+  empty_cache()` + `mem_get_info()`) on the request-handling path.
+- `RWKV_DISCONNECT_WATCHER_CLEANUP_TIMEOUT_S` (default `1.0`) /
+  `RWKV_DISCONNECT_WATCHER_CLEANUP_POLL_INTERVAL_S` (default `0.05`): how
+  long/how often the server retries cancelling a per-request
+  disconnect-watcher task during cleanup before giving up (an abandoned
+  watcher is harmless — it exits on its own once the client actually
+  disconnects). Rarely needs tuning; exposed mainly for deployments running
+  under unusually heavy event-loop load.
+
 
 ## Test API quickly
 ```bash
