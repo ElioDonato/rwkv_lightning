@@ -120,6 +120,50 @@ and CUTLASS checkpoints use different layouts and cannot be interchanged.
 bash ./test/test_curl.sh
 ```
 
+## WebUI (`webui_rwkv.py`)
+
+A Gradio-based demo/ops UI for talking to a running `rwkv_lightning` backend
+(chat, batch generation, HTML-wall demos, etc). Start it with:
+
+```bash
+python webui_rwkv.py
+```
+
+By default it binds `0.0.0.0:7860` **with no login**, matching prior
+behavior. This is intended for a trusted LAN / single-user setup only. The
+webui process makes outbound HTTP requests to whatever "API URL" / "Delete
+URL" is configured in the UI, so anyone who can reach it can use your GPU
+backend and (if unrestricted) point it at other internal hosts. Two
+independent hardening controls are available, both **opt-in / off by
+default** to avoid breaking existing deployments:
+
+- **Login (`RWKV_WEBUI_AUTH`)**: set to `"user:password"` (or a
+  comma-separated list, `"user1:pass1,user2:pass2"`) to require a login
+  screen before the UI is usable. If unset, the webui starts open (as
+  before) and prints a startup warning to the console.
+  ```bash
+  RWKV_WEBUI_AUTH="admin:change-me" python webui_rwkv.py
+  ```
+- **Bind address / port**: `RWKV_WEBUI_HOST` (default `0.0.0.0`) and
+  `RWKV_WEBUI_PORT` (default `7860`). Set `RWKV_WEBUI_HOST=127.0.0.1` to
+  restrict access to localhost only.
+- **Backend URL allowlist**: the "API URL" / "Delete URL" textboxes in the
+  UI are restricted by default to `127.0.0.1` / `localhost` / `::1` (the
+  hosts baked into the `DEFAULT_*_URL` constants at the top of
+  `webui_rwkv.py`), to prevent the webui being used as an open SSRF relay
+  toward arbitrary hosts if it's reachable by untrusted users. To point the
+  webui at a backend on another trusted host, set
+  `RWKV_WEBUI_ALLOWED_HOSTS` to a comma-separated allowlist of extra
+  hostnames/IPs. To disable this restriction entirely (not recommended if
+  the webui itself is reachable by anyone you don't fully trust), set
+  `RWKV_WEBUI_ALLOW_ANY_BACKEND=1`.
+
+Recommended for anything beyond a fully trusted, single-user LAN:
+
+```bash
+RWKV_WEBUI_AUTH="admin:change-me" RWKV_WEBUI_HOST=127.0.0.1 python webui_rwkv.py
+```
+
 ## API Docs 
 
 
