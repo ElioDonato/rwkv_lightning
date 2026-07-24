@@ -122,10 +122,12 @@ class InferenceUtilsMixin:
     # atomicAdd and isn't bit-deterministic run-to-run). This is consistent
     # with, and strengthens, the stream-argument theory: the one kernel
     # launch without an explicit stream is the one that diverges; the ones
-    # with an explicit stream do not. See
-    # /tmp/rwkv_swarm_reports/kernel-investigation.md and
-    # /tmp/rwkv_swarm_reports/controller-kernel-investigation.md for the
-    # full investigation, independent re-verification, and repro scripts.
+    # with an explicit stream do not. Fix (untested): pass an explicit
+    # capture-aware stream (at::cuda::getCurrentCUDAStream()) into
+    # kernel_forward_w0_fp16_dither_seq's launch in
+    # infer/rwkv_batch/cuda/rwkv7_state_fwd_fp16.cu, matching
+    # cuda_forward_one/cuda_spmv_forward, then re-verify graph-vs-eager
+    # numerical parity before relying on this in production.
     def _init_cuda_graph_state(self, token, state, out):
         x_emb = self.model.z["emb.weight"][token]
 
