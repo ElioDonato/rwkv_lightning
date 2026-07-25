@@ -13,7 +13,21 @@ class BigBatchMixin:
         stop_tokens=("\nUser:",),
         chunk_size=32,
         cancel_token=None,
+        permit_box=None,
     ):
+        # permit_box, if given, is a single-element mutable list populated by the
+        # caller (see API_servers.router.common.prefill_sse_response's on_permit
+        # callback) with this request's admission permit once it's been granted
+        # -- the permit doesn't exist yet when this generator object is first
+        # created (admission happens lazily on first iteration), so it can't be
+        # passed in directly as a plain argument. When present, each row that
+        # finishes and gets compacted out of the GPU batch below immediately
+        # releases its one slot of reserved prefill-admission capacity back to
+        # the shared pool via engine.release_prefill_capacity(), instead of
+        # this whole request holding its *original* full-batch reservation
+        # until every row finishes. This lets other queued requests get
+        # admitted into the freed capacity as soon as it's actually free,
+        # rather than only once this request's slowest row also completes.
         batch_size = len(prompts)
         state = None
         encoded_prompts = None
@@ -177,9 +191,24 @@ class BigBatchMixin:
                             slot for slot, i in enumerate(active_indices) if not finished[i]
                         ]
                         if len(still_active_slots) < len(active_indices):
+                            newly_freed = len(active_indices) - len(still_active_slots)
                             state, out, active_indices = self._compact_active_rows(
                                 state, out, active_indices, still_active_slots
                             )
+                            if permit_box and permit_box[0] is not None:
+                                # Give the freed row(s) back to the shared
+                                # prefill-admission budget right now, not at
+                                # this whole request's eventual end -- see
+                                # this method's docstring-style comment above
+                                # for why. permit_box[0] is only set once
+                                # acquire_prefill_permit has actually
+                                # succeeded (see prefill_sse_response's
+                                # on_permit callback), so this is always a
+                                # real, already-admitted permit by the time
+                                # any row can finish.
+                                await self.release_prefill_capacity(
+                                    newly_freed, permit_box[0], request_label="/big_batch/completions"
+                                )
 
                     if step_count % cleanup_interval == 0:
                         self._cleanup_cuda_memory()
