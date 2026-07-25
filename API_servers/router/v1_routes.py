@@ -266,6 +266,13 @@ async def big_batch_completions(request: Request):
         prompts = req.contents
 
     cancel_token = CancellationToken()
+    # permit_box is populated with this request's admission permit once
+    # prefill_sse_response actually acquires it (see that function's
+    # on_permit callback) -- big_batch_stream's decode-time row compaction
+    # uses it to release freed prefill-admission capacity incrementally as
+    # individual prompts finish, instead of only at the very end of the
+    # whole batch request.
+    permit_box = [None]
     stream = engine.big_batch_stream(
         prompts=prompts,
         max_length=req.max_tokens,
@@ -273,5 +280,9 @@ async def big_batch_completions(request: Request):
         stop_tokens=req.stop_tokens,
         chunk_size=req.chunk_size,
         cancel_token=cancel_token,
+        permit_box=permit_box,
     )
-    return prefill_sse_response(request, stream, cancel_token, len(prompts))
+    return prefill_sse_response(
+        request, stream, cancel_token, len(prompts),
+        on_permit=lambda permit: permit_box.__setitem__(0, permit),
+    )
