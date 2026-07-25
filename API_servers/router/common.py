@@ -181,6 +181,7 @@ async def reserve_prefill_capacity(
                 request_bsz=request_bsz,
                 request_label=str(request.url.path),
                 ticket=permit["ticket"],
+                permit=permit,
             )
 
 
@@ -241,6 +242,7 @@ async def _cleanup_prefill_stream_response(
                 request_bsz=request_bsz,
                 request_label=str(request.url.path),
                 ticket=permit["ticket"],
+                permit=permit,
             )
             stream_state["permit"] = None
         stream_state["cleanup_done"] = True
@@ -270,6 +272,7 @@ def prefill_sse_response(
     stream,
     cancel_token: CancellationToken,
     request_bsz: int,
+    on_permit=None,
 ):
     engine = request.app.state.engine
     stream_state = {
@@ -289,6 +292,16 @@ def prefill_sse_response(
                 request_label=str(request.url.path),
                 cancel_token=cancel_token,
             )
+            if on_permit is not None:
+                # Lets a caller that pre-created the streaming generator (before
+                # admission was possible -- the generator itself doesn't start
+                # executing until iterated below) hand the now-acquired permit
+                # into that generator's own closure, e.g. so
+                # big_batch_stream's decode-time row compaction can call
+                # engine.release_prefill_capacity() against this exact permit
+                # as individual rows finish, instead of only releasing the
+                # full reservation at the very end of the whole request.
+                on_permit(stream_state["permit"])
             if cancel_token.is_cancelled():
                 raise InferenceCancelled("request disconnected while queued")
 
