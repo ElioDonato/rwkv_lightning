@@ -179,6 +179,20 @@ the "strix halo" box) with:
   chunks — this exactly matches this server's `/big_batch/completions`
   contract, confirming it's the same backend software.
 
+  **Per-item `finish_reason` consumption (2026-07-25):** since commit
+  `7e2e315` this server emits a per-item `finish_reason` (`"stop"`/
+  `"length"`) in each item's terminal SSE chunk and compacts finished rows
+  out of the GPU batch. `RWKVInlineBatcher._send_batch` was updated
+  (`~/search` commit `0f756ec`) to resolve each request's future as soon as
+  its own `finish_reason` chunk arrives — rather than buffering the whole
+  stream to `[DONE]` — and to drop the stream once every slot is released.
+  This closes the "zero perceived latency benefit" caveat noted in that
+  commit's message: early-finishing requests are now handed back to callers
+  immediately (measured ~25s earlier on a staggered short/long batch against
+  the live 2.9b service). A `[DONE]`-time fallback still resolves any slot
+  that never received a `finish_reason`, so older servers without the signal
+  keep working.
+
 **Nuance on bug #2 (now fixed, see above) and `lm.small`'s actual traffic:**
 `batching.py::install_hooks()` monkey-patches `httpx.AsyncClient.send`
 globally; while `create_batch_context(config)` is active (true for
