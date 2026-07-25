@@ -362,6 +362,60 @@ were security-sensitive (no secrets, no private machine paths beyond a
 `/tmp` report location and one stray Claude Code session URL in a PR body,
 both removed), but they were dead references that should never have been
 in code meant to be read by anyone outside this dev machine. Lesson: before
-writing "see X for details" in a comment or PR body, check that X is
+writing "see X for details" in a code comment or PR body, check that X is
 actually reachable by whoever will read it.
+
+## Incremental prefill-admission release (2026-07-25)
+
+Follow-up to the `/big_batch/completions` finish_reason/compaction feature
+(see the earlier entry above), which left "freeing a finished row's
+capacity back into the prefill-queue's admission accounting" as explicit
+future work. That gap is now closed: `infer/inference.py`'s
+`acquire_prefill_permit` returns a permit carrying a mutable
+`outstanding_bsz` box, and a new `release_prefill_capacity(amount, permit)`
+lets `big_batch_stream`'s existing decode-time row compaction
+(`infer/big_batch.py`) give back freed admission slots to the shared queue
+*as each row finishes*, instead of only at the very end of the whole
+batch request. A bsz=100 batch where 90 rows finish almost immediately no
+longer blocks other queued requests from that freed capacity until the
+last 10 slow rows also finish.
+
+Wiring: `prefill_sse_response` (`API_servers/router/common.py`) gained an
+`on_permit` callback so a route can hand the lazily-acquired permit into a
+generator's closure (`permit_box`, a `[None]` list populated post-admission)
+before the generator itself starts running. `release_prefill_permit` gained
+an optional `permit=` param so the final end-of-request release only gives
+back whatever's left outstanding, not the original full amount (avoiding
+double-release if compaction already released some of it). Every route
+except `/big_batch/completions` is unaffected — none of them pass
+`permit_box`/`on_permit`, so their behavior is byte-identical to before.
+
+Verified live: a bsz=8 batch (7 fast rows, 1 slow), admission-capped at 8,
+admits a concurrent bsz=4 second batch ~0.6-1.1s before the first batch's
+slow row finishes (reproducible across reruns, real 2.9b model on GPU) --
+without this change the second batch would have to wait for the *entire*
+first request to complete. Independently controller-reviewed: traced the
+shared-lock concurrency safety (including the specific "late release call
+after the permit's outstanding_bsz was already zeroed" race), an
+independently-designed A/B (feature on vs off) reproduction confirming the
+effect is real, a from-scratch adversarial test suite (concurrent
+`asyncio.gather` races, negative amounts, malformed state), and 10
+consecutive leak-check iterations with zero drift. Verdict: APPROVE.
+
+Opened as PR #26 upstream, stacked on #19 (the compaction feature it
+depends on) — same stacking pattern as #19 on #18.
+
+**Not yet done**: `/v2/chat/completions`'s streaming path
+(`batch_infer_stream_v2` in `infer/batch_inference.py`) has neither
+per-item `finish_reason` nor decode-time row compaction at all, even
+though the README describes `/v2` as "used by the webui" and it's
+structurally very similar to `/big_batch/completions` (both are
+multi-prompt streaming batch endpoints). Porting the same
+finish_reason + compaction + incremental-release pattern there would be a
+natural next optimization, but wasn't done in this pass -- V2's
+`active_mask`-based sampling (`_sample_v2_tokens`) already tracks a
+per-row finished state differently from `/big_batch/completions`'s
+`active_indices` remapping, so it isn't a drop-in copy of the same code;
+would need its own design pass.
+
 
