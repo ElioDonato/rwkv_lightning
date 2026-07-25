@@ -556,6 +556,33 @@ curl -X POST 'http://localhost:8000/big_batch/completions' \
 ```
 </details>
 
+**SSE response format:** the endpoint streams `data: {...}\n\n` chunks
+followed by a final `data: [DONE]\n\n`. Each chunk is an OpenAI-style
+`chat.completion.chunk` whose `choices` carry per-item deltas keyed by
+`index` (the original prompt position in the request's `contents`/`chats`
+array):
+
+```json
+{"object": "chat.completion.chunk",
+ "choices": [{"index": 0, "delta": {"content": "partial text"}}]}
+```
+
+When an item finishes, its terminal chunk includes a per-item
+`finish_reason` — `"stop"` (hit a stop token) or `"length"` (exhausted
+`max_tokens`) — and that index receives no further deltas:
+
+```json
+{"object": "chat.completion.chunk",
+ "choices": [{"index": 0, "delta": {"content": "final text"},
+              "finish_reason": "stop"}]}
+```
+
+Every index gets exactly one `finish_reason`. Clients can resolve an
+individual request as soon as its `finish_reason` arrives rather than
+waiting for `[DONE]` (which only fires once the whole batch completes).
+Finished rows are also compacted out of the GPU batch mid-decode, so
+early-finishing items free compute for the still-active ones.
+
 ___
 ### **9. FIM ( For RWKV7_G1c series model )**
 
