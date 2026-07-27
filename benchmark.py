@@ -29,11 +29,11 @@ args.head_size = 64
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1a-0.4b-20250905-ctx4096"
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-1.5b-20250429-ctx4096"
 # args.MODEL_NAME = "/mnt/e/RWKV-Runner/models/rwkv7-g1-2.9b-20250519-ctx4096"
-args.MODEL_NAME = "/mnt/pc411_data/rwkv_translate/rwkv7-g1e-2.9b-20260312-ctx8192_A16W8_FP8"
+args.MODEL_NAME = "/mnt/sda1/rwkv_weights/rwkv7-g1i_preview3260-7.2b-20260716-ctx12288"
 
 print(f'\nUsing CUDA fp16. Loading {args.MODEL_NAME} ...\n')
 
-from infer.rwkv_batch.quant.rwkv7_quant_gemlite import RWKV_x070
+from infer.rwkv_batch.rwkv7 import RWKV_x070
 model = RWKV_x070(args)
 
 PARAM_BYTES = 2
@@ -212,7 +212,7 @@ print(f'\n\nToken/s = {round(1/times,2)} (forward), {round(1/all_times,2)} (full
 xprint("Decode (batch)")
 
 # for BSZ in [2**n for n in range(1,8)] + [128 + n for n in range(8, 512+8, 8)]:
-for BSZ in [8, 16, 16, 16, 32, 32, 32, 64, 64, 64]:
+for BSZ in [8, 16, 16, 16, 32, 32, 32, 64, 64, 64, 128, 128, 128, 256, 256, 256, 320, 320, 320, 512, 512, 512]:
     torch.cuda.empty_cache()
     gc.collect()
     torch.cuda.empty_cache()

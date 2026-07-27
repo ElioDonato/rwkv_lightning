@@ -4,12 +4,12 @@ RWKV Batch infer backend Base on [Albatross](https://github.com/BlinkDL/Albatros
 ## Install requirements
 **For Nvidia CUDA**
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu132
 pip install fastapi pydantic ninja numpy 
 ```
 **For AMD ROCm**
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.4
+pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2
 pip install fastapi pydantic ninja numpy 
 ```
 
@@ -119,16 +119,6 @@ and CUTLASS checkpoints use different layouts and cannot be interchanged.
 ```bash
 bash ./test/test_curl.sh
 ```
-
-## Tips
-If you want to the max performance optimization, you can use the ```torch.compile(mode='max-autotune-no-cudagraphs')```  
-
-you can modify the code in the ```rwkv_batch/rwkv7.py``` line 30, 31
-```python
-MyFunction = torch.compile(mode='max-autotune-no-cudagraphs')
-MyStatic = torch.compile(mode='max-autotune-no-cudagraphs')
-```
-**But it will be slow in first inference request, Because it needs to compile the Triton kernel firstly.**
 
 ## API Docs 
 
