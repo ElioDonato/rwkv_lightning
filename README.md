@@ -138,6 +138,11 @@ overridden per-deployment without editing source:
   watcher is harmless — it exits on its own once the client actually
   disconnects). Rarely needs tuning; exposed mainly for deployments running
   under unusually heavy event-loop load.
+- `RWKV_CORS_ORIGINS` (default `*`): comma-separated list of allowed CORS
+  origins, e.g. `http://localhost:3000,https://app.example.com`. The
+  default `*` allows any origin (suitable for trusted-LAN deployments).
+  Set a specific allowlist if the server is reachable from untrusted
+  networks.
 
 
 ## Test API quickly

@@ -151,103 +151,108 @@ async def multi_state_chat_completions(request: Request):
     if len(prompts) != 1:
         return json_response(400, {"error": "Request must be a single prompt (contents list of length 1)"})
 
-    dialogue_idx = int(req.dialogue_idx or 0)
+    try:
+        dialogue_idx = int(req.dialogue_idx or 0)
+    except (ValueError, TypeError):
+        return json_response(400, {"error": "dialogue_idx must be an integer"})
     state_key = f"{session_index}:{dialogue_idx}"
     state_manager = get_state_manager()
-    state = state_manager.get_state(state_key)
-    had_existing_state = state is not None
 
-    if state is None:
-        if dialogue_idx != 0:
-            return json_response(404, {"error": f"State not found for dialogue_idx={dialogue_idx}"})
-        state = engine.model.generate_zero_state(0)
-        print(f"[INIT] Created new root state for session: {session_index}")
-    else:
-        print(f"[REUSE] Reusing state for session: {state_key}")
+    async with session_lock(session_index):
+        state = state_manager.get_state(state_key)
+        had_existing_state = state is not None
 
-    prompts = normalize_state_prompts(prompts, reuse_existing_state=had_existing_state)
+        if state is None:
+            if dialogue_idx != 0:
+                return json_response(404, {"error": f"State not found for dialogue_idx={dialogue_idx}"})
+            state = engine.model.generate_zero_state(0)
+            print(f"[INIT] Created new root state for session: {session_index}")
+        else:
+            print(f"[REUSE] Reusing state for session: {state_key}")
 
-    if req.stream:
-        cancel_token = CancellationToken()
+        prompts = normalize_state_prompts(prompts, reuse_existing_state=had_existing_state)
 
-        async def stream_with_dialogue_idx():
-            inner_stream = engine.batch_infer_stream_state(
-                prompts=prompts,
-                state=state,
-                max_length=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-                alpha_presence=req.alpha_presence,
-                alpha_frequency=req.alpha_frequency,
-                alpha_decay=req.alpha_decay,
-                stop_tokens=req.stop_tokens,
-                chunk_size=req.chunk_size,
-                session_id=None,
-                state_manager=None,
-                cancel_token=cancel_token,
-            )
-            stored = False
-            try:
-                async for chunk in inner_stream:
-                    if chunk == "data: [DONE]\n\n" and not stored and not cancel_token.is_cancelled():
+        if req.stream:
+            cancel_token = CancellationToken()
+
+            async def stream_with_dialogue_idx():
+                inner_stream = engine.batch_infer_stream_state(
+                    prompts=prompts,
+                    state=state,
+                    max_length=req.max_tokens,
+                    temperature=req.temperature,
+                    top_k=req.top_k,
+                    top_p=req.top_p,
+                    alpha_presence=req.alpha_presence,
+                    alpha_frequency=req.alpha_frequency,
+                    alpha_decay=req.alpha_decay,
+                    stop_tokens=req.stop_tokens,
+                    chunk_size=req.chunk_size,
+                    session_id=None,
+                    state_manager=None,
+                    cancel_token=cancel_token,
+                )
+                stored = False
+                try:
+                    async for chunk in inner_stream:
+                        if chunk == "data: [DONE]\n\n" and not stored and not cancel_token.is_cancelled():
+                            new_dialogue_idx = allocate_next_dialogue_idx(
+                                app_state, state_manager, session_index
+                            )
+                            new_session_id = f"{session_index}:{new_dialogue_idx}"
+                            state_manager.put_state(new_session_id, state)
+                            stored = True
+                            meta = {
+                                "object": "multi_state.dialogue_idx",
+                                "session_id": new_session_id,
+                                "dialogue_idx": new_dialogue_idx,
+                            }
+                            yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
+                        yield chunk
+                finally:
+                    await inner_stream.aclose()
+                    if not stored and not cancel_token.is_cancelled():
                         new_dialogue_idx = allocate_next_dialogue_idx(
                             app_state, state_manager, session_index
                         )
                         new_session_id = f"{session_index}:{new_dialogue_idx}"
                         state_manager.put_state(new_session_id, state)
-                        stored = True
-                        meta = {
-                            "object": "multi_state.dialogue_idx",
-                            "session_id": new_session_id,
-                            "dialogue_idx": new_dialogue_idx,
-                        }
-                        yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
-                    yield chunk
-            finally:
-                await inner_stream.aclose()
-                if not stored and not cancel_token.is_cancelled():
-                    new_dialogue_idx = allocate_next_dialogue_idx(
-                        app_state, state_manager, session_index
-                    )
-                    new_session_id = f"{session_index}:{new_dialogue_idx}"
-                    state_manager.put_state(new_session_id, state)
-                    print(
-                        "[RESPONSE] /multi_state/chat/completions state[2]: ",
-                        state[2],
-                        "\n",
-                    )
+                        print(
+                            "[RESPONSE] /multi_state/chat/completions state[2]: ",
+                            state[2],
+                            "\n",
+                        )
 
-        return prefill_sse_response(request, stream_with_dialogue_idx(), cancel_token, 1)
+            return prefill_sse_response(request, stream_with_dialogue_idx(), cancel_token, 1)
 
-    try:
-        cancel_token = CancellationToken()
-        async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
-            results = await run_sync_with_disconnect_watch(
-                request,
-                engine.batch_generate_state,
-                cancel_token=cancel_token,
-                prompts=prompts,
-                state=state,
-                max_length=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-                alpha_presence=req.alpha_presence,
-                alpha_frequency=req.alpha_frequency,
-                alpha_decay=req.alpha_decay,
-                stop_tokens=req.stop_tokens,
-            )
-    except InferenceCancelled:
-        del state
-        return client_closed_response()
-    except PrefillBszLimitExceeded as exc:
-        del state
-        return prefill_bsz_limit_response(exc)
+        try:
+            cancel_token = CancellationToken()
+            async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
+                results = await run_sync_with_disconnect_watch(
+                    request,
+                    engine.batch_generate_state,
+                    cancel_token=cancel_token,
+                    prompts=prompts,
+                    state=state,
+                    max_length=req.max_tokens,
+                    temperature=req.temperature,
+                    top_k=req.top_k,
+                    top_p=req.top_p,
+                    alpha_presence=req.alpha_presence,
+                    alpha_frequency=req.alpha_frequency,
+                    alpha_decay=req.alpha_decay,
+                    stop_tokens=req.stop_tokens,
+                )
+        except InferenceCancelled:
+            del state
+            return client_closed_response()
+        except PrefillBszLimitExceeded as exc:
+            del state
+            return prefill_bsz_limit_response(exc)
 
-    new_dialogue_idx = allocate_next_dialogue_idx(app_state, state_manager, session_index)
-    new_session_id = f"{session_index}:{new_dialogue_idx}"
-    state_manager.put_state(new_session_id, state)
+        new_dialogue_idx = allocate_next_dialogue_idx(app_state, state_manager, session_index)
+        new_session_id = f"{session_index}:{new_dialogue_idx}"
+        state_manager.put_state(new_session_id, state)
 
     choices = []
     for i, text in enumerate(results):
