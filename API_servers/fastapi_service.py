@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 from threading import Lock
 
@@ -23,9 +24,13 @@ def create_app(engine, password=None):
         yield
 
     app = FastAPI(lifespan=lifespan)
+    # RWKV_CORS_ORIGINS: comma-separated allowlist, e.g. "http://localhost:3000,https://app.example.com"
+    # Default "*" preserves prior behavior for trusted-LAN deployments.
+    cors_origins_env = os.environ.get("RWKV_CORS_ORIGINS", "*").strip()
+    cors_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()] or ["*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )

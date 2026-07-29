@@ -3,6 +3,7 @@ import hmac
 import json
 import os
 import traceback
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from contextlib import suppress
 
@@ -20,6 +21,23 @@ SSE_HEADERS = {
     "Connection": "close",
     "X-Accel-Buffering": "no",
 }
+
+# Per-session locks to prevent concurrent state corruption when two requests
+# target the same session_id simultaneously (read-modify-write race on the
+# state pool). Keyed by session_id string; locks are created on demand and
+# never removed (bounded by the number of distinct session_ids seen).
+_session_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+@asynccontextmanager
+async def session_lock(session_id: str):
+    """Serialize access to a single session's state across concurrent requests."""
+    lock = _session_locks[session_id]
+    await lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def json_response(status_code: int, payload: dict):
