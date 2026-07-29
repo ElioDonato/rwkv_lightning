@@ -263,3 +263,26 @@ class QuantizedRWKV7(torch.nn.Module):
         x = F.layer_norm(x, (self.n_embd,), self.z["ln_out.weight"], self.z["ln_out.bias"])
         state[2] += len(idxs[0])
         return self._linear(x, "head.weight")
+
+    @torch.no_grad()
+    def forward_seq_batch_tensor(self, idxs: torch.Tensor, state, full_output=False):
+        """Decode-step fast path: accepts a [B] or [B,1] GPU tensor of token ids directly,
+        skipping the host->device torch.tensor(idxs) rebuild the List[List[int]] path needs.
+        Numerically identical to forward_seq_batch for the same ids."""
+        if idxs.dim() == 1:
+            idxs = idxs.unsqueeze(1)
+        idxs = idxs.long()
+        x = self.z["emb.weight"][idxs]
+        v_first = torch.empty_like(x)
+        for i in range(self.n_layer):
+            block = f"blocks.{i}."
+            xx = F.layer_norm(x, (self.n_embd,), self.z[block + "ln1.weight"], self.z[block + "ln1.bias"])
+            xx, v_first = self._tmix_batch(i, xx, state[0][i], v_first, state[1][i], state[2])
+            x = x + xx
+            xx = F.layer_norm(x, (self.n_embd,), self.z[block + "ln2.weight"], self.z[block + "ln2.bias"])
+            x = x + self._cmix(i, xx, state[0][i], "batch")
+        if not full_output:
+            x = x[:, -1]
+        x = F.layer_norm(x, (self.n_embd,), self.z["ln_out.weight"], self.z["ln_out.bias"])
+        state[2] += idxs.size(1)
+        return self._linear(x, "head.weight")

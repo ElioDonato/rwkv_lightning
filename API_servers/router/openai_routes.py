@@ -46,10 +46,10 @@ def sanitize_text_block(content) -> str:
     normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
     lines = []
     for line in normalized.split("\n"):
-        stripped = line.strip()
-        if stripped:
-            lines.append(stripped)
-    return "\n".join(lines)
+        lines.append(line.rstrip())
+    # Strip leading/trailing blank lines but preserve interior blanks and indentation
+    text = "\n".join(lines)
+    return text.strip("\n")
 
 
 def collect_openai_prompt_parts(body: dict) -> tuple[str, list[str]]:

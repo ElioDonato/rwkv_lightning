@@ -17,6 +17,7 @@ from API_servers.router.common import (
     prefill_sse_response,
     reserve_prefill_capacity,
     run_sync_with_disconnect_watch,
+    session_lock,
 )
 from API_servers.router.schemas import ChatRequest
 
@@ -35,7 +36,7 @@ async def state_chat_completions(request: Request):
     session_id = req.session_id
 
     if len(req.contents) > 1:
-        return json_response(500, {"error": "Server Error: Requst must be single prompt !"})
+        return json_response(400, {"error": "Request must be a single prompt (contents list of length 1)"})
 
     auth_error = check_password(req.password, password)
     if auth_error is not None:
@@ -43,45 +44,23 @@ async def state_chat_completions(request: Request):
 
     prompts = req.contents
     state_manager = get_state_manager()
-    state = state_manager.get_state(session_id)
-    had_existing_state = state is not None
 
-    if state is None:
-        state = engine.model.generate_zero_state(0)
-        state_manager.put_state(session_id, state)
-        print(f"[INIT] Created new state for session: {session_id}")
-    else:
-        print(f"[REUSE] Reusing existing state for session: {session_id}")
+    async with session_lock(session_id):
+        state = state_manager.get_state(session_id)
+        had_existing_state = state is not None
 
-    prompts = normalize_state_prompts(prompts, reuse_existing_state=had_existing_state)
+        if state is None:
+            state = engine.model.generate_zero_state(0)
+            state_manager.put_state(session_id, state)
+            print(f"[INIT] Created new state for session: {session_id}")
+        else:
+            print(f"[REUSE] Reusing existing state for session: {session_id}")
 
-    if req.stream:
-        cancel_token = CancellationToken()
-        stream = engine.batch_infer_stream_state(
-            prompts=prompts,
-            state=state,
-            max_length=req.max_tokens,
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            alpha_presence=req.alpha_presence,
-            alpha_frequency=req.alpha_frequency,
-            alpha_decay=req.alpha_decay,
-            stop_tokens=req.stop_tokens,
-            chunk_size=req.chunk_size,
-            session_id=session_id,
-            state_manager=state_manager,
-            cancel_token=cancel_token,
-        )
-        return prefill_sse_response(request, stream, cancel_token, 1)
+        prompts = normalize_state_prompts(prompts, reuse_existing_state=had_existing_state)
 
-    try:
-        cancel_token = CancellationToken()
-        async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
-            results = await run_sync_with_disconnect_watch(
-                request,
-                engine.batch_generate_state,
-                cancel_token=cancel_token,
+        if req.stream:
+            cancel_token = CancellationToken()
+            stream = engine.batch_infer_stream_state(
                 prompts=prompts,
                 state=state,
                 max_length=req.max_tokens,
@@ -92,15 +71,40 @@ async def state_chat_completions(request: Request):
                 alpha_frequency=req.alpha_frequency,
                 alpha_decay=req.alpha_decay,
                 stop_tokens=req.stop_tokens,
+                chunk_size=req.chunk_size,
+                session_id=session_id,
+                state_manager=state_manager,
+                cancel_token=cancel_token,
             )
-    except InferenceCancelled:
-        del state
-        return client_closed_response()
-    except PrefillBszLimitExceeded as exc:
-        del state
-        return prefill_bsz_limit_response(exc)
+            return prefill_sse_response(request, stream, cancel_token, 1)
 
-    state_manager.put_state(session_id, state)
+        try:
+            cancel_token = CancellationToken()
+            async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
+                results = await run_sync_with_disconnect_watch(
+                    request,
+                    engine.batch_generate_state,
+                    cancel_token=cancel_token,
+                    prompts=prompts,
+                    state=state,
+                    max_length=req.max_tokens,
+                    temperature=req.temperature,
+                    top_k=req.top_k,
+                    top_p=req.top_p,
+                    alpha_presence=req.alpha_presence,
+                    alpha_frequency=req.alpha_frequency,
+                    alpha_decay=req.alpha_decay,
+                    stop_tokens=req.stop_tokens,
+                )
+        except InferenceCancelled:
+            del state
+            return client_closed_response()
+        except PrefillBszLimitExceeded as exc:
+            del state
+            return prefill_bsz_limit_response(exc)
+
+        state_manager.put_state(session_id, state)
+
     choices = []
     for i, text in enumerate(results):
         choices.append(
@@ -145,7 +149,7 @@ async def multi_state_chat_completions(request: Request):
 
     prompts = req.contents
     if len(prompts) != 1:
-        return json_response(500, {"error": "Server Error: Request must be single prompt!"})
+        return json_response(400, {"error": "Request must be a single prompt (contents list of length 1)"})
 
     dialogue_idx = int(req.dialogue_idx or 0)
     state_key = f"{session_index}:{dialogue_idx}"
