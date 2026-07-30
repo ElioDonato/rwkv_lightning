@@ -1,5 +1,9 @@
+import logging
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+
+logger = logging.getLogger("api.v1")
 
 from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBszLimitExceeded
 
@@ -155,10 +159,11 @@ async def batch_translate(request: Request):
         return client_closed_response()
     except PrefillBszLimitExceeded as exc:
         return prefill_bsz_limit_response(exc)
-    except Exception:
+    except Exception as exc:
+        logger.error(f"[ERROR] /translate/v1/batch-translate: {exc}")
         return JSONResponse(
             status_code=500,
-            content=TranslateResponse(translations=[]).model_dump(),
+            content={"error": f"Translation failed: {exc}"},
         )
 
     translations_result = []
