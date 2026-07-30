@@ -10,9 +10,12 @@ object exposing just the attributes InferenceEngine's admission logic reads
 anyio's pytest plugin (already a dependency via FastAPI/Starlette) for the
 async test functions rather than adding a new pytest-asyncio dependency.
 
-Run with: uv run pytest test/test_prefill_admission_queue.py -v
+Run with: source env.sh && uv run pytest test/test_prefill_admission_queue.py -v
+(The import chain pulls in torch/CUDA; CUDA_HOME must be set even though
+no GPU computation actually runs.)
 """
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -22,8 +25,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from infer.inference import InferenceEngine
-from infer.cancellation import PrefillBszLimitExceeded
+pytest.importorskip("torch", reason="torch not installed (source env.sh first)")
+
+try:
+    from infer.inference import InferenceEngine
+    from infer.cancellation import PrefillBszLimitExceeded
+except OSError as exc:
+    pytest.skip(f"CUDA environment not configured: {exc}", allow_module_level=True)
 
 
 @pytest.fixture
