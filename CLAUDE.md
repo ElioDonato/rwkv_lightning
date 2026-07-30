@@ -405,17 +405,22 @@ consecutive leak-check iterations with zero drift. Verdict: APPROVE.
 Opened as PR #26 upstream, stacked on #19 (the compaction feature it
 depends on) — same stacking pattern as #19 on #18.
 
-**Not yet done**: `/v2/chat/completions`'s streaming path
-(`batch_infer_stream_v2` in `infer/batch_inference.py`) has neither
-per-item `finish_reason` nor decode-time row compaction at all, even
-though the README describes `/v2` as "used by the webui" and it's
-structurally very similar to `/big_batch/completions` (both are
-multi-prompt streaming batch endpoints). Porting the same
-finish_reason + compaction + incremental-release pattern there would be a
-natural next optimization, but wasn't done in this pass -- V2's
-`active_mask`-based sampling (`_sample_v2_tokens`) already tracks a
-per-row finished state differently from `/big_batch/completions`'s
-`active_indices` remapping, so it isn't a drop-in copy of the same code;
-would need its own design pass.
+**Done (2026-07-30)**: `/v2/chat/completions` now has both per-item
+`finish_reason` and decode-time row compaction (commit `32c1206`). The V2
+streaming path (`batch_infer_stream_v2`) uses `active_indices` remapping
+(same pattern as `/big_batch/completions`): finished rows are removed from
+state/logits/occurrence tensors via index_select, and `active_indices` maps
+compacted positions back to original prompt indices for correct SSE `index`
+fields. Non-streaming `batch_generate_v2` returns `(decoded_texts,
+finish_reasons)` tuple. `/v1/chat/completions` also has per-item
+`finish_reason` in both streaming and non-streaming paths (commit `c2ccda7`),
+but V1 streaming does NOT have batch compaction yet (V1's sampler uses
+`sample_rand_states` and `penalties` tensors that need GPU-validated
+compaction logic).
+
+GPU-validated against 2.9B model (RTX 3090 Ti): `verify_batch_v2_decode.py`
+(3/3 checks, zero cross-contamination across 8×3 outputs with compaction
+active), `verify_batch_compaction.py` (2/2), `test_local_state_and_batch.py`
+(2/2). Production service restarted and serving with new code.
 
 
