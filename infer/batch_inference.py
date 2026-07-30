@@ -370,10 +370,12 @@ class BatchInferenceMixin:
                     break
 
             decoded = []
+            reasons = []
             for i in range(batch_size):
                 generated_text[i] += self._flush_stop_state(stop_states[i], final=True)
                 decoded.append(generated_text[i])
-            return decoded
+                reasons.append("stop" if finished[i] else "length")
+            return decoded, reasons
         finally:
             if state is not None:
                 del state
@@ -405,6 +407,7 @@ class BatchInferenceMixin:
             ).float()
 
             finished = [False] * batch_size
+            finish_reasons = [None] * batch_size
             stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
             chunk_token_counts = [0] * batch_size
             text_buffers = [""] * batch_size
@@ -436,6 +439,7 @@ class BatchInferenceMixin:
                 max_length -= 1
 
                 contents_to_send = [""] * batch_size
+                terminal_chunks = []  # (index, finish_reason)
 
                 for i in range(batch_size):
                     if finished[i]:
@@ -449,12 +453,14 @@ class BatchInferenceMixin:
 
                     if should_stop:
                         finished[i] = True
+                        finish_reasons[i] = "stop"
                         flushed = self._flush_stop_state(stop_states[i], final=True)
                         if flushed:
                             text_buffers[i] += flushed
                         if text_buffers[i]:
                             contents_to_send[i] += text_buffers[i]
                             text_buffers[i] = ""
+                        terminal_chunks.append((i, "stop"))
                         continue
 
                     chunk_token_counts[i] += 1
@@ -463,38 +469,35 @@ class BatchInferenceMixin:
                         text_buffers[i] = ""
                         chunk_token_counts[i] = 0
 
-                if any(contents_to_send):
-                    chunk = {
-                        "object": "chat.completion.chunk",
-                        "choices": [
-                            {"index": i, "delta": {"content": contents_to_send[i]}}
-                            for i in range(batch_size)
-                            if contents_to_send[i]
-                        ],
-                    }
-                    if chunk["choices"]:
+                if any(contents_to_send) or terminal_chunks:
+                    choices = [
+                        {"index": i, "delta": {"content": contents_to_send[i]}}
+                        for i in range(batch_size)
+                        if contents_to_send[i]
+                    ]
+                    for idx, reason in terminal_chunks:
+                        choices.append({"index": idx, "delta": {}, "finish_reason": reason})
+                    if choices:
+                        chunk = {"object": "chat.completion.chunk", "choices": choices}
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
                 await asyncio.sleep(0)
 
-            remaining_contents = [""] * batch_size
+            remaining_choices = []
             for i in range(batch_size):
+                if finish_reasons[i] is None:
+                    finish_reasons[i] = "length"
                 flushed = self._flush_stop_state(stop_states[i], final=True)
                 if flushed:
                     text_buffers[i] += flushed
-                remaining_contents[i] = text_buffers[i]
+                if text_buffers[i]:
+                    remaining_choices.append({"index": i, "delta": {"content": text_buffers[i]}})
+                if finish_reasons[i] == "length":
+                    remaining_choices.append({"index": i, "delta": {}, "finish_reason": "length"})
 
-            if any(remaining_contents):
-                chunk = {
-                    "object": "chat.completion.chunk",
-                    "choices": [
-                        {"index": i, "delta": {"content": remaining_contents[i]}}
-                        for i in range(batch_size)
-                        if remaining_contents[i]
-                    ],
-                }
-                if chunk["choices"]:
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            if remaining_choices:
+                chunk = {"object": "chat.completion.chunk", "choices": remaining_choices}
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         finally:
             if state is not None:
                 del state
