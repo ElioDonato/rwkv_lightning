@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger("api.state")
+
 import json
 from datetime import datetime
 
@@ -54,9 +58,9 @@ async def state_chat_completions(request: Request):
         if state is None:
             state = engine.model.generate_zero_state(0)
             state_manager.put_state(session_id, state)
-            print(f"[INIT] Created new state for session: {session_id}")
+            logger.info(f"[INIT] Created new state for session: {session_id}")
         else:
-            print(f"[REUSE] Reusing existing state for session: {session_id}")
+            logger.info(f"[REUSE] Reusing existing state for session: {session_id}")
 
         prompts = normalize_state_prompts(prompts, reuse_existing_state=had_existing_state)
 
@@ -123,7 +127,7 @@ async def state_chat_completions(request: Request):
         "model": req.model,
         "choices": choices,
     }
-    print("[RESPONSE] /state/chat/completions state[2]: ", state[2], "\n")
+    logger.info("[RESPONSE] /state/chat/completions state[2]: ", state[2], "\n")
     del state
     return response
 
@@ -168,9 +172,9 @@ async def multi_state_chat_completions(request: Request):
             if dialogue_idx != 0:
                 return json_response(404, {"error": f"State not found for dialogue_idx={dialogue_idx}"})
             state = engine.model.generate_zero_state(0)
-            print(f"[INIT] Created new root state for session: {session_index}")
+            logger.info(f"[INIT] Created new root state for session: {session_index}")
         else:
-            print(f"[REUSE] Reusing state for session: {state_key}")
+            logger.info(f"[REUSE] Reusing state for session: {state_key}")
 
         prompts = normalize_state_prompts(prompts, reuse_existing_state=had_existing_state)
 
@@ -219,11 +223,9 @@ async def multi_state_chat_completions(request: Request):
                         )
                         new_session_id = f"{session_index}:{new_dialogue_idx}"
                         state_manager.put_state(new_session_id, state)
-                        print(
-                            "[RESPONSE] /multi_state/chat/completions state[2]: ",
+                        logger.info("[RESPONSE] /multi_state/chat/completions state[2]: ",
                             state[2],
-                            "\n",
-                        )
+                            "\n",)
 
             return prefill_sse_response(request, stream_with_dialogue_idx(), cancel_token, 1)
 
@@ -273,7 +275,7 @@ async def multi_state_chat_completions(request: Request):
         "choices": choices,
         "dialogue_idx": new_dialogue_idx,
     }
-    print("[RESPONSE] /multi_state/chat/completions state[2]: ", state[2], "\n")
+    logger.info("[RESPONSE] /multi_state/chat/completions state[2]: ", state[2], "\n")
     del state
     return response
 
@@ -345,15 +347,13 @@ async def state_status(request: Request):
             "sessions": detailed_states,
         }
 
-        print(
-            f"[StatePool] Status requested. Total sessions: {all_states['total_count']}, "
+        logger.info(f"[StatePool] Status requested. Total sessions: {all_states['total_count']}, "
             f"L1: {len(all_states['l1_cache'])}, L2: {len(all_states['l2_cache'])}, "
-            f"DB: {len(all_states['database'])}"
-        )
+            f"DB: {len(all_states['database'])}")
 
         return response_data
     except Exception as exc:
-        print(f"[ERROR] /state/status: {exc}")
+        logger.error(f"[ERROR] /state/status: {exc}")
         return json_response(500, {"error": str(exc)})
 
 
@@ -398,11 +398,9 @@ async def state_delete(request: Request):
             }
             status_code = 404
 
-        print(
-            f"[StatePool] Delete session {session_id}: {'Success' if success else 'Not Found'}"
-        )
+        logger.info(f"[StatePool] Delete session {session_id}: {'Success' if success else 'Not Found'}")
 
         return json_response(status_code, response_data)
     except Exception as exc:
-        print(f"[ERROR] /state/delete: {exc}")
+        logger.error(f"[ERROR] /state/delete: {exc}")
         return json_response(500, {"error": str(exc)})

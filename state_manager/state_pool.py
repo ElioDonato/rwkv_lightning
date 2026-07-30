@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger("state.pool")
+
 ### State Pool Manager for RWKV-7 Inference
 ### Manages three-level session caching plus RAM+disk prefix-state cache
 import hashlib
@@ -176,10 +180,8 @@ class StateCacheManager:
         self.io_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db_writer")
         
         self._initialized = True
-        print(
-            f"[StatePool] Initialized. L1: {L1_CAPACITY}, L2: {L2_CAPACITY}, "
-            f"Prefix L2: {len(PREFIX_CACHE_BUCKETS)}x{PREFIX_CACHE_BUCKET_CAPACITY}, DB: {DB_PATH}"
-        )
+        logger.info(f"[StatePool] Initialized. L1: {L1_CAPACITY}, L2: {L2_CAPACITY}, "
+            f"Prefix L2: {len(PREFIX_CACHE_BUCKETS)}x{PREFIX_CACHE_BUCKET_CAPACITY}, DB: {DB_PATH}")
 
     def _init_db(self):
         """初始化数据库表"""
@@ -257,7 +259,7 @@ class StateCacheManager:
             del state_cpu
             del blob
         except Exception as e:
-            print(f"[StatePool] Error persisting session {session_id}: {e}")
+            logger.error(f"[StatePool] Error persisting session {session_id}: {e}")
 
     def _persist_prefix_task(self, entry: PrefixCacheEntry):
         try:
@@ -282,7 +284,7 @@ class StateCacheManager:
                 )
                 self.db_conn.commit()
         except Exception as e:
-            print(f"[StatePool] Error persisting prefix cache {entry.state_id[:96]}...: {e}")
+            logger.error(f"[StatePool] Error persisting prefix cache {entry.state_id[:96]}...: {e}")
 
     def _rebuild_prefix_trie(self):
         trie = _CompressedTrie()
@@ -352,20 +354,16 @@ class StateCacheManager:
                 self.l1_cache.move_to_end(session_id) # 标记为最近使用
                 state = self.l1_cache[session_id]
                 token_pos = state[2].item() if len(state) > 2 and hasattr(state[2], "item") else "unknown"
-                print(
-                    f"[StatePool][SESSION HIT][L1] session_id={session_id} "
-                    f"token_pos={token_pos}"
-                )
+                logger.info(f"[StatePool][SESSION HIT][L1] session_id={session_id} "
+                    f"token_pos={token_pos}")
                 return self._clone_state(self.l1_cache[session_id])
             
             # Case 2: L2 Hit (RAM)
             if session_id in self.l2_cache:
                 state_cpu = self.l2_cache.pop(session_id)
                 token_pos = state_cpu[2].item() if len(state_cpu) > 2 and hasattr(state_cpu[2], "item") else "unknown"
-                print(
-                    f"[StatePool][SESSION HIT][L2] session_id={session_id} "
-                    f"token_pos={token_pos} -> promote_to_l1"
-                )
+                logger.info(f"[StatePool][SESSION HIT][L2] session_id={session_id} "
+                    f"token_pos={token_pos} -> promote_to_l1")
                 state_gpu = [t.to('cuda', non_blocking=True) for t in state_cpu]
                 
                 self.put_state(session_id, state_gpu)
@@ -382,15 +380,13 @@ class StateCacheManager:
             try:
                 state_cpu = self._deserialize(blob)
                 token_pos = state_cpu[2].item() if len(state_cpu) > 2 and hasattr(state_cpu[2], "item") else "unknown"
-                print(
-                    f"[StatePool][SESSION HIT][DISK] session_id={session_id} "
-                    f"token_pos={token_pos} -> load_to_l1"
-                )
+                logger.info(f"[StatePool][SESSION HIT][DISK] session_id={session_id} "
+                    f"token_pos={token_pos} -> load_to_l1")
                 state_gpu = [t.to('cuda') for t in state_cpu]
                 self.put_state(session_id, state_gpu)
                 return self._clone_state(state_gpu)
             except Exception as e:
-                print(f"[StatePool] Failed to deserialize session {session_id}: {e}")
+                logger.info(f"[StatePool] Failed to deserialize session {session_id}: {e}")
                 return None
 
         return None
@@ -462,7 +458,7 @@ class StateCacheManager:
             state_cpu = self._deserialize(row[0])
             logits_cpu = self._deserialize(row[1]) if row[1] is not None else None
         except Exception as e:
-            print(f"[StatePool] Failed to deserialize prefix cache {state_id[:96]}...: {e}")
+            logger.info(f"[StatePool] Failed to deserialize prefix cache {state_id[:96]}...: {e}")
             return None
 
         entry = PrefixCacheEntry(
@@ -496,14 +492,12 @@ class StateCacheManager:
                     if state_id in bucket_cache:
                         bucket_cache.move_to_end(state_id)
                     prompt_prefix_hashes = _build_prefix_hashes(token_tuple)
-                    print(
-                        "[StatePool][PREFIX HIT][L2] "
+                    logger.info("[StatePool][PREFIX HIT][L2] "
                         f"matched_tokens={matched_len} "
                         f"bucket_len={entry.bucket_len} "
                         f"prompt_len={len(token_tuple)} "
                         f"state_id={entry.state_id[:160]} "
-                        f"hash_{entry.bucket_len}={prompt_prefix_hashes.get(entry.bucket_len)}"
-                    )
+                        f"hash_{entry.bucket_len}={prompt_prefix_hashes.get(entry.bucket_len)}")
                     return {
                         "state_id": entry.state_id,
                         "matched_tokens": matched_len,
@@ -520,15 +514,13 @@ class StateCacheManager:
                 entry = self._load_prefix_entry_from_db_locked(token_tuple, bucket)
                 if entry is not None:
                     prompt_prefix_hashes = _build_prefix_hashes(token_tuple)
-                    print(
-                        "[StatePool][PREFIX HIT][DISK] "
+                    logger.info("[StatePool][PREFIX HIT][DISK] "
                         f"matched_tokens={bucket} "
                         f"bucket_len={entry.bucket_len} "
                         f"prompt_len={len(token_tuple)} "
                         f"state_id={entry.state_id[:160]} "
                         f"hash_{entry.bucket_len}={prompt_prefix_hashes.get(entry.bucket_len)} "
-                        "-> load_to_l2"
-                    )
+                        "-> load_to_l2")
                     return {
                         "state_id": entry.state_id,
                         "matched_tokens": bucket,
@@ -553,11 +545,11 @@ class StateCacheManager:
         if state_to_save:
             self._persist_task(session_id, state_to_save)
         
-        print(f"[StatePool] Session {session_id} closed and persisted.")
+        logger.info(f"[StatePool] Session {session_id} closed and persisted.")
 
     def flush_all(self):
 
-        print("[StatePool] Flushing all states to disk...")
+        logger.info("[StatePool] Flushing all states to disk...")
         
         self.io_executor.shutdown(wait=True)
         
@@ -609,12 +601,10 @@ class StateCacheManager:
                     )
 
                 self.db_conn.commit()
-                print(
-                    f"[StatePool] Successfully saved {len(items_to_save)} sessions "
-                    f"and {len(prefix_entries_to_save)} prefix states."
-                )
+                logger.info(f"[StatePool] Successfully saved {len(items_to_save)} sessions "
+                    f"and {len(prefix_entries_to_save)} prefix states.")
             except Exception as e:
-                print(f"[StatePool] Error during flush: {e}")
+                logger.error(f"[StatePool] Error during flush: {e}")
                 self.db_conn.rollback()
             finally:
                 self.db_conn.close()
@@ -664,35 +654,35 @@ class StateCacheManager:
 
         all_states = self.list_all_states()
 
-        print(f"[StatePool] All States Status - Total {all_states['total_count']} sessions:")
-        print("=" * 80)
+        logger.info(f"[StatePool] All States Status - Total {all_states['total_count']} sessions:")
+        logger.info("=" * 80)
 
-        print(f"L1 Cache (VRAM) - Count: {len(all_states['l1_cache'])}")
-        print("-" * 40)
+        logger.info(f"L1 Cache (VRAM) - Count: {len(all_states['l1_cache'])}")
+        logger.info("-" * 40)
         for session_id in all_states["l1_cache"]:
-            print(f"  {session_id}")
+            logger.info(f"  {session_id}")
 
-        print(f"\nL2 Cache (RAM) - Count: {len(all_states['l2_cache'])}")
-        print("-" * 40)
+        logger.info(f"\nL2 Cache (RAM) - Count: {len(all_states['l2_cache'])}")
+        logger.info("-" * 40)
         for session_id in all_states["l2_cache"]:
-            print(f"  {session_id}")
+            logger.info(f"  {session_id}")
 
-        print(f"\nDatabase (Disk) - Count: {len(all_states['database'])}")
-        print("-" * 40)
+        logger.info(f"\nDatabase (Disk) - Count: {len(all_states['database'])}")
+        logger.info("-" * 40)
         for session_id in all_states["database"]:
-            print(f"  {session_id}")
+            logger.info(f"  {session_id}")
 
-        print("\nPrefix Cache (RAM / L2)")
-        print("-" * 40)
+        logger.info("\nPrefix Cache (RAM / L2)")
+        logger.info("-" * 40)
         for bucket in PREFIX_CACHE_BUCKETS:
             count = all_states["prefix_l2_counts"][str(bucket)]
-            print(f"  bucket={bucket}: {count}/{PREFIX_CACHE_BUCKET_CAPACITY}")
+            logger.info(f"  bucket={bucket}: {count}/{PREFIX_CACHE_BUCKET_CAPACITY}")
 
-        print(f"\nPrefix Cache (Disk) - Count: {all_states['prefix_database_count']}")
+        logger.info(f"\nPrefix Cache (Disk) - Count: {all_states['prefix_database_count']}")
 
         if all_states["total_count"] == 0 and all_states["prefix_database_count"] == 0:
-            print("No sessions found in any cache level.")
-        print("=" * 80)
+            logger.info("No sessions found in any cache level.")
+        logger.info("=" * 80)
 
     def delete_state_from_any_level(self, session_id: str) -> bool:
 
@@ -703,13 +693,13 @@ class StateCacheManager:
             if session_id in self.l1_cache:
                 del self.l1_cache[session_id]
                 deleted_from_cache = True
-                print(f"[StatePool] Session {session_id} removed from L1 cache (VRAM).")
+                logger.info(f"[StatePool] Session {session_id} removed from L1 cache (VRAM).")
 
             # 从L2缓存删除
             if session_id in self.l2_cache:
                 del self.l2_cache[session_id]
                 deleted_from_cache = True
-                print(f"[StatePool] Session {session_id} removed from L2 cache (RAM).")
+                logger.info(f"[StatePool] Session {session_id} removed from L2 cache (RAM).")
 
         # 从数据库删除
         with self.db_lock:
@@ -719,14 +709,14 @@ class StateCacheManager:
 
                 affected_rows = self.db_cursor.rowcount
                 if affected_rows > 0:
-                    print(f"[StatePool] Session {session_id} removed from database (Disk).")
+                    logger.info(f"[StatePool] Session {session_id} removed from database (Disk).")
                     return True
                 if deleted_from_cache:
                     return True
-                print(f"[StatePool] Session {session_id} not found in any cache level.")
+                logger.info(f"[StatePool] Session {session_id} not found in any cache level.")
                 return False
             except Exception as e:
-                print(f"[StatePool] Error deleting session {session_id} from database: {e}")
+                logger.error(f"[StatePool] Error deleting session {session_id} from database: {e}")
                 return False
 
 def show_all_states_status():

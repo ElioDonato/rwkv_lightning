@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger("api.common")
+
 import asyncio
 import hmac
 import json
@@ -350,7 +354,7 @@ def prefill_sse_response(
             # error chunk before terminating, so the stream always ends
             # with a client-visible signal one way or another.
             cancel_token.cancel()
-            print(f"[SSE] unhandled exception in stream body:\n{traceback.format_exc()}")
+            logger.error(f"[SSE] unhandled exception in stream body:\n{traceback.format_exc()}")
             yield f"data: {json.dumps({'error': {'message': 'internal error during generation', 'type': 'stream_error'}}, ensure_ascii=False)}\n\n"
         finally:
             _schedule_prefill_stream_cleanup(

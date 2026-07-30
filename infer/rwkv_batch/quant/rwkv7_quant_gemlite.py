@@ -1,5 +1,9 @@
 """RWKV-7 inference backed by pre-packed GemLite linear projections."""
 
+import logging
+
+logger = logging.getLogger("infer.quant_gemlite")
+
 from dataclasses import dataclass
 
 import torch
@@ -169,8 +173,8 @@ class RWKV_x070(QuantizedRWKV7):
 
         self.refresh_max_prefill_bsz()
         self.max_prefill_bsz_limit = int(self.max_prefill_bsz)
-        print(args)
-        print(
+        logger.info(args)
+        logger.info(
             f"loaded {self.quant_name}; max_prefill_bsz={self.max_prefill_bsz} "
             f"for prefill_chunk_size={self.prefill_chunk_size}"
         )

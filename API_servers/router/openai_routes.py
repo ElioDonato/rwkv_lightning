@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger("api.openai")
+
 import hmac
 import json
 import os
@@ -363,5 +367,5 @@ async def openai_chat_completions(request: Request):
     except json.JSONDecodeError as exc:
         return json_response(400, {"error": f"Invalid JSON: {str(exc)}"})
     except Exception as exc:
-        print(f"[ERROR] /openai/v1/chat/completions: {exc}")
+        logger.error(f"[ERROR] /openai/v1/chat/completions: {exc}")
         return json_response(500, {"error": str(exc)})

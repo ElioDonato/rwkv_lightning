@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger("infer.batch")
+
 import asyncio
 import gc
 import json
@@ -523,7 +527,7 @@ class BatchInferenceMixin:
 
             if state_manager and session_id and should_store_state:
                 state_manager.put_state(session_id, state)
-                print("[RESPONSE] /state/chat/completions state[2]: ", state[2], "\n")
+                logger.info("[RESPONSE] /state/chat/completions state[2]: ", state[2], "\n")
 
             del state
             inference_deps.get_torch().cuda.empty_cache()

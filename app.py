@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger("app")
+
 import argparse
 import atexit
 import signal
@@ -36,14 +40,14 @@ def main():
     app = create_app(engine, password=args_cli.password)
 
     def cleanup_handler(signum, frame):
-        print("\nShutting down server...")
+        logger.info("\nShutting down server...")
         sys.exit(0)
 
     def cleanup_at_exit():
-        print("Persisting all states to database...")
+        logger.info("Persisting all states to database...")
         shutdown_state_manager()
         engine.shutdown()
-        print("All states persisted to database.")
+        logger.info("All states persisted to database.")
 
     signal.signal(signal.SIGINT, cleanup_handler)
     signal.signal(signal.SIGTERM, cleanup_handler)
