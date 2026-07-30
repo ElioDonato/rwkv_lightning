@@ -150,6 +150,7 @@ class BatchInferenceMixin:
                         sampler.compact(idx_t)
                         state[0] = state[0][:, :, idx_t]
                         state[1] = state[1][:, idx_t]
+                        state[2] = state[2][idx_t]
                         active_indices = [active_indices[p] for p in still_active]
                     else:
                         active_indices = []
@@ -241,6 +242,7 @@ class BatchInferenceMixin:
                         sampler.compact(idx_t)
                         state[0] = state[0][:, :, idx_t]
                         state[1] = state[1][:, idx_t]
+                        state[2] = state[2][idx_t]
                         active_indices = [active_indices[p] for p in still_active]
                     else:
                         active_indices = []
@@ -527,7 +529,7 @@ class BatchInferenceMixin:
 
             if state_manager and session_id and should_store_state:
                 state_manager.put_state(session_id, state)
-                logger.info("[RESPONSE] /state/chat/completions state[2]: ", state[2], "\n")
+                logger.info(f"[RESPONSE] /state/chat/completions state[2]: {state[2]}")
 
             del state
             inference_deps.get_torch().cuda.empty_cache()

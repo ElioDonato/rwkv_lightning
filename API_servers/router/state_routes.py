@@ -51,6 +51,7 @@ async def state_chat_completions(request: Request):
     prompts = req.contents
     state_manager = get_state_manager()
 
+    # Setup phase: read/create state under lock
     async with session_lock(session_id):
         state = state_manager.get_state(session_id)
         had_existing_state = state is not None
@@ -64,26 +65,36 @@ async def state_chat_completions(request: Request):
 
         prompts = normalize_state_prompts(prompts, reuse_existing_state=had_existing_state)
 
-        if req.stream:
-            cancel_token = CancellationToken()
-            stream = engine.batch_infer_stream_state(
-                prompts=prompts,
-                state=state,
-                max_length=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-                alpha_presence=req.alpha_presence,
-                alpha_frequency=req.alpha_frequency,
-                alpha_decay=req.alpha_decay,
-                stop_tokens=req.stop_tokens,
-                chunk_size=req.chunk_size,
-                session_id=session_id,
-                state_manager=state_manager,
-                cancel_token=cancel_token,
-            )
-            return prefill_sse_response(request, stream, cancel_token, 1)
+    if req.stream:
+        cancel_token = CancellationToken()
+        inner_stream = engine.batch_infer_stream_state(
+            prompts=prompts,
+            state=state,
+            max_length=req.max_tokens,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            top_p=req.top_p,
+            alpha_presence=req.alpha_presence,
+            alpha_frequency=req.alpha_frequency,
+            alpha_decay=req.alpha_decay,
+            stop_tokens=req.stop_tokens,
+            chunk_size=req.chunk_size,
+            session_id=session_id,
+            state_manager=state_manager,
+            cancel_token=cancel_token,
+        )
 
+        async def locked_stream():
+            """Hold session_lock for the entire stream duration to prevent
+            concurrent requests from mutating the same session state."""
+            async with session_lock(session_id):
+                async for chunk in inner_stream:
+                    yield chunk
+
+        return prefill_sse_response(request, locked_stream(), cancel_token, 1)
+
+    # Non-streaming: hold lock for the entire inference
+    async with session_lock(session_id):
         try:
             cancel_token = CancellationToken()
             async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
@@ -127,7 +138,7 @@ async def state_chat_completions(request: Request):
         "model": req.model,
         "choices": choices,
     }
-    logger.info("[RESPONSE] /state/chat/completions state[2]: ", state[2], "\n")
+    logger.info(f"[RESPONSE] /state/chat/completions state[2]: {state[2]}")
     del state
     return response
 
@@ -164,6 +175,7 @@ async def multi_state_chat_completions(request: Request):
     state_key = f"{session_index}:{dialogue_idx}"
     state_manager = get_state_manager()
 
+    # Setup phase: read/create state under lock
     async with session_lock(session_index):
         state = state_manager.get_state(state_key)
         had_existing_state = state is not None
@@ -178,10 +190,12 @@ async def multi_state_chat_completions(request: Request):
 
         prompts = normalize_state_prompts(prompts, reuse_existing_state=had_existing_state)
 
-        if req.stream:
-            cancel_token = CancellationToken()
+    if req.stream:
+        cancel_token = CancellationToken()
 
-            async def stream_with_dialogue_idx():
+        async def stream_with_dialogue_idx():
+            """Hold session_lock for the entire stream duration."""
+            async with session_lock(session_index):
                 inner_stream = engine.batch_infer_stream_state(
                     prompts=prompts,
                     state=state,
@@ -223,12 +237,12 @@ async def multi_state_chat_completions(request: Request):
                         )
                         new_session_id = f"{session_index}:{new_dialogue_idx}"
                         state_manager.put_state(new_session_id, state)
-                        logger.info("[RESPONSE] /multi_state/chat/completions state[2]: ",
-                            state[2],
-                            "\n",)
+                        logger.info(f"[RESPONSE] /multi_state/chat/completions state[2]: {state[2]}")
 
-            return prefill_sse_response(request, stream_with_dialogue_idx(), cancel_token, 1)
+        return prefill_sse_response(request, stream_with_dialogue_idx(), cancel_token, 1)
 
+    # Non-streaming: hold lock for the entire inference
+    async with session_lock(session_index):
         try:
             cancel_token = CancellationToken()
             async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
@@ -275,7 +289,7 @@ async def multi_state_chat_completions(request: Request):
         "choices": choices,
         "dialogue_idx": new_dialogue_idx,
     }
-    logger.info("[RESPONSE] /multi_state/chat/completions state[2]: ", state[2], "\n")
+    logger.info(f"[RESPONSE] /multi_state/chat/completions state[2]: {state[2]}")
     del state
     return response
 
