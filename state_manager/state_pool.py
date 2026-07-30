@@ -386,7 +386,7 @@ class StateCacheManager:
                 self.put_state(session_id, state_gpu)
                 return self._clone_state(state_gpu)
             except Exception as e:
-                logger.info(f"[StatePool] Failed to deserialize session {session_id}: {e}")
+                logger.warning(f"[StatePool] Failed to deserialize session {session_id}: {e}")
                 return None
 
         return None
@@ -458,7 +458,7 @@ class StateCacheManager:
             state_cpu = self._deserialize(row[0])
             logits_cpu = self._deserialize(row[1]) if row[1] is not None else None
         except Exception as e:
-            logger.info(f"[StatePool] Failed to deserialize prefix cache {state_id[:96]}...: {e}")
+            logger.warning(f"[StatePool] Failed to deserialize prefix cache {state_id[:96]}...: {e}")
             return None
 
         entry = PrefixCacheEntry(
