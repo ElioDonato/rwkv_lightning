@@ -1,10 +1,12 @@
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
 from threading import Lock
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
 from API_servers.router import openai_router, state_router, v1_router, v2_router
@@ -39,6 +41,13 @@ def create_app(engine, password=None):
     app.state.password = password
     app.state.dialogue_idx_lock = Lock()
     app.state.dialogue_idx_counters = {}
+
+    @app.exception_handler(json.JSONDecodeError)
+    async def _json_decode_handler(request: Request, exc: json.JSONDecodeError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid JSON in request body"},
+        )
 
     app.include_router(v1_router)
     app.include_router(v2_router)

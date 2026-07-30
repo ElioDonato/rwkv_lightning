@@ -34,6 +34,8 @@ async def state_chat_completions(request: Request):
     if parse_error is not None:
         return parse_error
     session_id = req.session_id
+    if not session_id:
+        return json_response(400, {"error": "Missing session_id parameter"})
 
     if len(req.contents) > 1:
         return json_response(400, {"error": "Request must be a single prompt (contents list of length 1)"})
