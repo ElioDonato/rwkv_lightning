@@ -58,7 +58,7 @@ async def chat_completions_v2(request: Request):
     try:
         cancel_token = CancellationToken()
         async with reserve_prefill_capacity(request, len(req.contents), cancel_token=cancel_token):
-            results = await run_sync_with_disconnect_watch(
+            results, finish_reasons = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate_v2,
                 cancel_token=cancel_token,
@@ -83,7 +83,7 @@ async def chat_completions_v2(request: Request):
             {
                 "index": i,
                 "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "finish_reason": finish_reasons[i],
             }
         )
 
