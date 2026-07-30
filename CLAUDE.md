@@ -413,14 +413,49 @@ state/logits/occurrence tensors via index_select, and `active_indices` maps
 compacted positions back to original prompt indices for correct SSE `index`
 fields. Non-streaming `batch_generate_v2` returns `(decoded_texts,
 finish_reasons)` tuple. `/v1/chat/completions` also has per-item
-`finish_reason` in both streaming and non-streaming paths (commit `c2ccda7`),
-but V1 streaming does NOT have batch compaction yet (V1's sampler uses
-`sample_rand_states` and `penalties` tensors that need GPU-validated
-compaction logic).
+`finish_reason` in both streaming and non-streaming paths (commit `c2ccda7`).
 
 GPU-validated against 2.9B model (RTX 3090 Ti): `verify_batch_v2_decode.py`
 (3/3 checks, zero cross-contamination across 8×3 outputs with compaction
 active), `verify_batch_compaction.py` (2/2), `test_local_state_and_batch.py`
 (2/2). Production service restarted and serving with new code.
+
+## Decode loop consolidation + logging refactor (2026-07-30)
+
+**Decode loop consolidation** (commit `6c28263`): `infer/batch_inference.py`
+reduced from 839→699 lines by extracting 2 shared decode cores
+(`_batch_decode_blocking`, `_batch_decode_streaming`) parameterized by a
+sampler protocol (`_V1BatchSampler`, `_V2BatchSampler`). Both samplers
+expose `.sample(logits) -> [B] tensor` and `.compact(idx_t)` for row removal.
+This also added non-streaming compaction to `batch_generate` (V1 blocking),
+which previously skipped finished rows in Python but still ran forward_batch
+for all B rows every step. State/openai bsz=1 paths unchanged.
+
+**Logging refactor** (commit `a7b004c`): 61 `print()` calls converted to
+Python `logging` across 11 files. Each module gets a named logger
+(`api.state`, `api.openai`, `infer.engine`, `state.pool`, etc.) enabling
+log-level filtering. Remaining prints are intentionally in CLI export tools
+and `__main__` test blocks.
+
+**Bug fixes** (commit `5f1a3ff`):
+1. `state[2]` (token counter) not compacted after row removal in shared
+   decode cores — latent correctness bug, fixed by adding
+   `state[2] = state[2][idx_t]`.
+2. `session_lock` released before stream runs in `/state/chat/completions`
+   and `/multi_state/chat/completions` — concurrent streaming requests on
+   same session_id could corrupt shared state. Fixed by wrapping stream in
+   a `locked_stream()` generator that holds the lock for full duration.
+3. Logger calls with print-style comma args silently dropped values (4 sites).
+4. Deserialization failures logged at INFO instead of WARNING (2 sites).
+
+**Translate route fix** (commit `754074f`): broad `except Exception` no longer
+silently returns empty translations; now logs error and returns `{"error": ...}`.
+
+**New tests**: `test/test_sanitize.py` (7 CPU-only tests guarding the
+indentation-preserving fix), `test/verify_batch_v1_stream_compaction.py`
+(3 GPU checks for V1 streaming misattribution after compaction).
+
+All 21 CPU tests pass. All GPU verification scripts pass (V1 3/3, V2 3/3,
+big_batch 2/2, state 2/2).
 
 
