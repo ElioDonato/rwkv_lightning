@@ -78,11 +78,11 @@ def _check_attribution(contents, label):
 
 
 def check_batch_generate_v2(engine):
-    """batch_generate_v2 is synchronous/blocking and returns list[str]
-    directly -- exercises the finished[]/stop_states[]/occurrence tensor
-    bookkeeping in the non-streaming code path (batch_inference.py:71-152)."""
+    """batch_generate_v2 is synchronous/blocking and returns (list[str], list[str])
+    -- (decoded_texts, finish_reasons). Exercises the finished[]/stop_states[]/
+    occurrence tensor bookkeeping in the non-streaming code path."""
     prompts = _make_prompts()
-    decoded = engine.batch_generate_v2(
+    decoded, reasons = engine.batch_generate_v2(
         prompts,
         max_length=80,
         temperature=0.01,
@@ -91,8 +91,9 @@ def check_batch_generate_v2(engine):
         stop_tokens=("DONE",),
     )
     assert len(decoded) == len(prompts), f"expected {len(prompts)} outputs, got {len(decoded)}"
-    for i, text in enumerate(decoded):
-        print(f"  [batch_generate_v2][{i}] {text!r}")
+    assert len(reasons) == len(prompts), f"expected {len(prompts)} reasons, got {len(reasons)}"
+    for i, (text, reason) in enumerate(zip(decoded, reasons)):
+        print(f"  [batch_generate_v2][{i}] finish_reason={reason} {text!r}")
     return _check_attribution({i: t for i, t in enumerate(decoded)}, "batch_generate_v2")
 
 
