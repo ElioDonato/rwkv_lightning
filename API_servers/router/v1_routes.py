@@ -7,6 +7,8 @@ logger = logging.getLogger("api.v1")
 
 from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBszLimitExceeded
 
+from state_manager.state_pool import get_state_manager
+
 from API_servers.router.common import (
     check_password,
     client_closed_response,
@@ -63,6 +65,8 @@ async def chat_completions(request: Request):
     if auth_error is not None:
         return auth_error
 
+    prefix_cache_manager = get_state_manager() if req.use_prefix_cache else None
+
     if req.stream:
         cancel_token = CancellationToken()
         stream = engine.batch_infer_stream(
@@ -77,6 +81,7 @@ async def chat_completions(request: Request):
             stop_tokens=req.stop_tokens,
             chunk_size=req.chunk_size,
             cancel_token=cancel_token,
+            prefix_cache_manager=prefix_cache_manager,
         )
         return prefill_sse_response(request, stream, cancel_token, len(req.contents))
 
@@ -96,6 +101,7 @@ async def chat_completions(request: Request):
                 alpha_frequency=req.alpha_frequency,
                 alpha_decay=req.alpha_decay,
                 stop_tokens=req.stop_tokens,
+                prefix_cache_manager=prefix_cache_manager,
             )
     except InferenceCancelled:
         return client_closed_response()
