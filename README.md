@@ -291,6 +291,14 @@ decode parameters differ: `top_k=500`, `top_p=0.5`, `alpha_presence=1.0`,
 back-pressure (`bsz overflow` 400 response), and disconnect handling are the
 same as `/v1/chat/completions`.
 
+**Per-item `finish_reason` and batch compaction:** like `/big_batch/completions`,
+the streaming path emits a per-item `finish_reason` (`"stop"` or `"length"`) in
+each row's terminal SSE chunk, and compacts finished rows out of the GPU batch
+mid-decode so remaining active rows get faster per-step compute. Non-streaming
+responses include a per-choice `finish_reason` field. Clients can resolve an
+individual request as soon as its `finish_reason` arrives rather than waiting
+for `[DONE]`.
+
 This is the endpoint `webui_rwkv.py` uses by default for its batch-generation
 tabs (`DEFAULT_BATCH_API_URL`).
 
