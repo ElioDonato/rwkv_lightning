@@ -1,5 +1,9 @@
 """RWKV-7 implementation for pre-exported W8A16 checkpoints."""
 
+import logging
+
+logger = logging.getLogger("infer.quant")
+
 from typing import Callable
 
 import torch
@@ -85,8 +89,8 @@ class QuantizedRWKV7(torch.nn.Module):
 
         self.refresh_max_prefill_bsz()
         self.max_prefill_bsz_limit = int(self.max_prefill_bsz)
-        print(args)
-        print(
+        logger.info(args)
+        logger.info(
             f"loaded {self.quant_name}; max_prefill_bsz={self.max_prefill_bsz} "
             f"for prefill_chunk_size={self.prefill_chunk_size}"
         )

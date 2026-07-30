@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger("infer.engine")
+
 import asyncio
 from collections import deque
 
@@ -40,10 +44,8 @@ class InferenceEngine(
             )
         )
         if request_bsz > max_prefill_bsz_limit:
-            print(
-                f"[PrefillQueue] rejected path={request_label} "
-                f"request_bsz={request_bsz} max_prefill_bsz_limit={max_prefill_bsz_limit}"
-            )
+            logger.debug(f"[PrefillQueue] rejected path={request_label} "
+                f"request_bsz={request_bsz} max_prefill_bsz_limit={max_prefill_bsz_limit}")
             raise PrefillBszLimitExceeded(request_bsz, max_prefill_bsz_limit)
 
         condition = self._get_prefill_condition()
@@ -71,11 +73,9 @@ class InferenceEngine(
                         self._prefill_reserved_bsz += request_bsz
                         self._prefill_queue.popleft()
                         condition.notify_all()
-                        print(
-                            f"[PrefillQueue] admitted ticket={ticket} path={request_label} "
+                        logger.debug(f"[PrefillQueue] admitted ticket={ticket} path={request_label} "
                             f"request_bsz={request_bsz} reserved_bsz={self._prefill_reserved_bsz} "
-                            f"max_prefill_bsz={current_limit}"
-                        )
+                            f"max_prefill_bsz={current_limit}")
                         # `outstanding_bsz` is a single-element mutable box (not a bare
                         # int) so release_prefill_permit and release_prefill_capacity
                         # (below) can both read/update "how much of this permit's
@@ -96,11 +96,9 @@ class InferenceEngine(
 
                     if not queued_logged:
                         ahead = sum(1 for queued_ticket in self._prefill_queue if queued_ticket < ticket)
-                        print(
-                            f"[PrefillQueue] queued ticket={ticket} path={request_label} "
+                        logger.debug(f"[PrefillQueue] queued ticket={ticket} path={request_label} "
                             f"request_bsz={request_bsz} requests_ahead={ahead} "
-                            f"reserved_bsz={self._prefill_reserved_bsz} max_prefill_bsz={current_limit}"
-                        )
+                            f"reserved_bsz={self._prefill_reserved_bsz} max_prefill_bsz={current_limit}")
                         queued_logged = True
 
                     try:
@@ -111,10 +109,8 @@ class InferenceEngine(
                 if ticket in self._prefill_queue:
                     self._prefill_queue.remove(ticket)
                     condition.notify_all()
-                    print(
-                        f"[PrefillQueue] removed ticket={ticket} path={request_label} "
-                        f"request_bsz={request_bsz}"
-                    )
+                    logger.debug(f"[PrefillQueue] removed ticket={ticket} path={request_label} "
+                        f"request_bsz={request_bsz}")
                 raise
 
     async def release_prefill_capacity(
@@ -149,11 +145,9 @@ class InferenceEngine(
                 return
             outstanding[0] -= actual
             self._prefill_reserved_bsz = max(0, self._prefill_reserved_bsz - actual)
-            print(
-                f"[PrefillQueue] partial-released ticket={permit.get('ticket')} "
+            logger.debug(f"[PrefillQueue] partial-released ticket={permit.get('ticket')} "
                 f"path={request_label} amount={actual} "
-                f"outstanding_bsz={outstanding[0]} reserved_bsz={self._prefill_reserved_bsz}"
-            )
+                f"outstanding_bsz={outstanding[0]} reserved_bsz={self._prefill_reserved_bsz}")
             condition.notify_all()
 
     async def release_prefill_permit(
@@ -195,11 +189,9 @@ class InferenceEngine(
                 )
             )
             current_limit = min(int(current_limit), max_prefill_bsz_limit)
-            print(
-                f"[PrefillQueue] released ticket={ticket} path={request_label} "
+            logger.debug(f"[PrefillQueue] released ticket={ticket} path={request_label} "
                 f"request_bsz={request_bsz} reserved_bsz={self._prefill_reserved_bsz} "
-                f"max_prefill_bsz={current_limit}"
-            )
+                f"max_prefill_bsz={current_limit}")
             condition.notify_all()
 
     def shutdown(self):

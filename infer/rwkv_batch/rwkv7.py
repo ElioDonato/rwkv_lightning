@@ -4,6 +4,10 @@
 #
 ########################################################################################################
 
+import logging
+
+logger = logging.getLogger("infer.rwkv7")
+
 from typing import List
 import os
 import time
@@ -65,7 +69,7 @@ if ROCm_flag == False:
         # import torch.ops.flag_gems.rwkv_mm_sparsity as rwkv_mm_sparsity # type: ignore
         rwkv_mm_sparsity = SPMV_OP
     except:
-        print("flag_gems is not installed. Using triton kernel directly instead.")
+        logger.info("flag_gems is not installed. Using triton kernel directly instead.")
         from .rwkv_mm_op_triton import rwkv_mm_sparsity
 else:
     from .rwkv_mm_op_triton import rwkv_mm_sparsity
@@ -189,7 +193,7 @@ class RWKV_x070(MyModule):
         args.n_layer = max_layer + 1
         if not hasattr(args, 'vocab_size'):
             args.vocab_size = z['head.weight'].shape[0]
-        print(args)
+        logger.info(args)
         self.n_layer, self.n_embd = args.n_layer, args.n_embd
         self.prefill_chunk_size = 256
 
@@ -208,7 +212,7 @@ class RWKV_x070(MyModule):
             os.environ.get("RWKV_PREFILL_BSZ_REFRESH_INTERVAL_S", "2.0")
         )
         self._prefill_bsz_last_refresh = time.monotonic()
-        print(
+        logger.info(
             f"max_prefill_bsz={self.max_prefill_bsz} "
             f"max_prefill_bsz_limit={self.max_prefill_bsz_limit} "
             f"for prefill_chunk_size={self.prefill_chunk_size}"

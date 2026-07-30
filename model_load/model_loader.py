@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger("model.loader")
+
 import re
 import types
 import torch
@@ -33,10 +37,8 @@ def load_model_and_tokenizer(model_path: str, inference_engine: str = "fp16"):
     if rocm_flag and inference_engine == "cutlass":
         raise RuntimeError("the CUTLASS inference engine requires NVIDIA CUDA")
 
-    print(
-        f"\n[INFO] Loading RWKV-7 model from {model_path} "
-        f"with inference engine {inference_engine}\n"
-    )
+    logger.info(f"\n[INFO] Loading RWKV-7 model from {model_path} "
+        f"with inference engine {inference_engine}\n")
 
     args = types.SimpleNamespace()
     args.vocab_size = 65536
@@ -51,6 +53,6 @@ def load_model_and_tokenizer(model_path: str, inference_engine: str = "fp16"):
     model = model_class(args)
     tokenizer = TRIE_TOKENIZER("infer/rwkv_batch/rwkv_vocab_v20230424.txt")
 
-    print("[INFO] Model loaded successfully.\n")
+    logger.info("[INFO] Model loaded successfully.\n")
 
     return model, tokenizer, args, rocm_flag
