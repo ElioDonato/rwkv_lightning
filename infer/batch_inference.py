@@ -107,16 +107,55 @@ class BatchInferenceMixin:
 
     # -- Shared blocking decode core (with compaction) ----------------------
 
-    def _batch_decode_blocking(self, prompts, sampler, max_length, stop_tokens, cancel_token):
-        """Shared blocking decode loop for V1/V2. Returns (decoded_texts, finish_reasons)."""
-        state = None
-        try:
-            batch_size = len(prompts)
+    def _batch_prefill(self, prompts, prefix_cache_manager=None, cancel_token=None):
+        """Prefill a batch of prompts, optionally using prefix cache.
+        Returns (state, out) ready for the decode loop."""
+        batch_size = len(prompts)
+        torch = inference_deps.get_torch()
+
+        if prefix_cache_manager is None:
+            # Fast path: no cache, batched prefill from zero state
             state = self.model.generate_zero_state(batch_size)
             encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
             out = self._forward_batch_prompts_chunked(
                 encoded_prompts, state, cancel_token=cancel_token
             ).float()
+            return state, out
+
+        # Cache path: prefill each prompt individually (reuses proven bsz=1 logic)
+        states = []
+        logits = []
+        for prompt in prompts:
+            self._raise_if_cancelled(cancel_token)
+            _, s, o, _, _ = self._prefill_prompt_with_prefix_cache(
+                prompt,
+                prefix_cache_manager=prefix_cache_manager,
+                cancel_token=cancel_token,
+            )
+            states.append(s)
+            logits.append(o)
+
+        # Stack individual bsz=1 states into a batch state
+        state = [
+            torch.cat([s[0] for s in states], dim=2),  # [Layer, 2, B, C]
+            torch.cat([s[1] for s in states], dim=1),  # [Layer, B, H, N, N]
+            torch.cat([s[2].unsqueeze(0) for s in states], dim=0),  # [B]
+        ]
+        out = torch.stack(logits, dim=0).float()  # [B, vocab]
+
+        # Free individual state references
+        for s in states:
+            del s
+
+        return state, out
+
+    def _batch_decode_blocking(self, prompts, sampler, max_length, stop_tokens, cancel_token,
+                               prefix_cache_manager=None):
+        """Shared blocking decode loop for V1/V2. Returns (decoded_texts, finish_reasons)."""
+        state = None
+        try:
+            batch_size = len(prompts)
+            state, out = self._batch_prefill(prompts, prefix_cache_manager, cancel_token)
 
             torch = inference_deps.get_torch()
             finish_reasons = [None] * batch_size
@@ -170,16 +209,13 @@ class BatchInferenceMixin:
 
     # -- Shared streaming decode core (with compaction + SSE) ---------------
 
-    async def _batch_decode_streaming(self, prompts, sampler, max_length, stop_tokens, chunk_size, cancel_token):
+    async def _batch_decode_streaming(self, prompts, sampler, max_length, stop_tokens, chunk_size, cancel_token,
+                                      prefix_cache_manager=None):
         """Shared streaming decode loop for V1/V2. Yields SSE chunks."""
         state = None
         try:
             batch_size = len(prompts)
-            state = self.model.generate_zero_state(batch_size)
-            encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
-            out = self._forward_batch_prompts_chunked(
-                encoded_prompts, state, cancel_token=cancel_token
-            ).float()
+            state, out = self._batch_prefill(prompts, prefix_cache_manager, cancel_token)
 
             torch = inference_deps.get_torch()
             finish_reasons = [None] * batch_size
@@ -287,6 +323,7 @@ class BatchInferenceMixin:
         alpha_decay=0.99,
         stop_tokens=("\nUser:",),
         cancel_token=None,
+        prefix_cache_manager=None,
     ):
         batch_size = len(prompts)
         # Peek at vocab size from model for sampler init
@@ -297,7 +334,8 @@ class BatchInferenceMixin:
             temperature=temperature, top_k=top_k, top_p=top_p,
             alpha_presence=alpha_presence, alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
         )
-        return self._batch_decode_blocking(prompts, sampler, max_length, stop_tokens, cancel_token)
+        return self._batch_decode_blocking(prompts, sampler, max_length, stop_tokens, cancel_token,
+                                           prefix_cache_manager=prefix_cache_manager)
 
     async def batch_infer_stream_v2(
         self,
@@ -312,6 +350,7 @@ class BatchInferenceMixin:
         stop_tokens=("\nUser:",),
         chunk_size=32,
         cancel_token=None,
+        prefix_cache_manager=None,
     ):
         batch_size = len(prompts)
         vocab_size = self.model.args.vocab_size
@@ -321,7 +360,8 @@ class BatchInferenceMixin:
             temperature=temperature, top_k=top_k, top_p=top_p,
             alpha_presence=alpha_presence, alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
         )
-        async for chunk in self._batch_decode_streaming(prompts, sampler, max_length, stop_tokens, chunk_size, cancel_token):
+        async for chunk in self._batch_decode_streaming(prompts, sampler, max_length, stop_tokens, chunk_size, cancel_token,
+                                                        prefix_cache_manager=prefix_cache_manager):
             yield chunk
 
     # -- V1 public API ------------------------------------------------------
@@ -338,6 +378,7 @@ class BatchInferenceMixin:
         alpha_decay=0.996,
         stop_tokens=("\nUser:",),
         cancel_token=None,
+        prefix_cache_manager=None,
     ):
         batch_size = len(prompts)
         vocab_size = self.model.args.vocab_size
@@ -346,7 +387,8 @@ class BatchInferenceMixin:
             temperature=temperature, top_k=top_k, top_p=top_p,
             alpha_presence=alpha_presence, alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
         )
-        return self._batch_decode_blocking(prompts, sampler, max_length, stop_tokens, cancel_token)
+        return self._batch_decode_blocking(prompts, sampler, max_length, stop_tokens, cancel_token,
+                                           prefix_cache_manager=prefix_cache_manager)
 
     async def batch_infer_stream(
         self,
@@ -361,6 +403,7 @@ class BatchInferenceMixin:
         stop_tokens=("\nUser:",),
         chunk_size=32,
         cancel_token=None,
+        prefix_cache_manager=None,
     ):
         batch_size = len(prompts)
         vocab_size = self.model.args.vocab_size
@@ -369,7 +412,8 @@ class BatchInferenceMixin:
             temperature=temperature, top_k=top_k, top_p=top_p,
             alpha_presence=alpha_presence, alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
         )
-        async for chunk in self._batch_decode_streaming(prompts, sampler, max_length, stop_tokens, chunk_size, cancel_token):
+        async for chunk in self._batch_decode_streaming(prompts, sampler, max_length, stop_tokens, chunk_size, cancel_token,
+                                                        prefix_cache_manager=prefix_cache_manager):
             yield chunk
 
     # -- State reuse endpoint (bsz=1, unchanged) ----------------------------
