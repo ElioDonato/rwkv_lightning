@@ -202,7 +202,7 @@ async def stream_openai_chunks(
     }
     yield f"data: {json.dumps(start_chunk, ensure_ascii=False)}\n\n"
 
-    stream = engine.singe_infer_stream(
+    stream = engine.single_infer_stream(
         prompt=prompt_formatted,
         max_length=req.max_tokens,
         temperature=req.temperature,
@@ -321,7 +321,7 @@ async def openai_chat_completions(request: Request):
 
         cancel_token = CancellationToken()
         async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
-            result_text, finish_reason = await engine.singe_infer(
+            result_text, finish_reason = await engine.single_infer(
                 prompt=prompt_formatted,
                 max_length=req.max_tokens,
                 temperature=req.temperature,

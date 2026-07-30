@@ -406,20 +406,23 @@ class BatchInferenceMixin:
                 encoded_prompts, state, cancel_token=cancel_token
             ).float()
 
-            finished = [False] * batch_size
+            # Per-row tracking with active_indices for decode-time compaction.
             finish_reasons = [None] * batch_size
+            active_indices = list(range(batch_size))
             stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
             chunk_token_counts = [0] * batch_size
             text_buffers = [""] * batch_size
+            torch = inference_deps.get_torch()
             sample_rand_states = inference_deps.get_sample().setup_rand(
                 random.randint(0, 2**63 - 1), batch_size
             )
-            penalties = inference_deps.get_torch().zeros(
+            penalties = torch.zeros(
                 batch_size, out.size(-1), device=out.device
             )
 
-            while not all(finished) and max_length > 0:
+            while active_indices and max_length > 0:
                 self._raise_if_cancelled(cancel_token)
+                n_active = len(active_indices)
                 new_tokens_tensor = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
                     out,
                     penalties,
@@ -438,62 +441,73 @@ class BatchInferenceMixin:
                 new_tokens = new_tokens_tensor.tolist()
                 max_length -= 1
 
-                contents_to_send = [""] * batch_size
-                terminal_chunks = []  # (index, finish_reason)
+                contents_to_send = {}  # orig_index -> content string
+                terminal_chunks = []   # (orig_index, finish_reason)
+                newly_finished_positions = []
 
-                for i in range(batch_size):
-                    if finished[i]:
-                        continue
+                for pos in range(n_active):
+                    orig_i = active_indices[pos]
+                    tok = new_tokens[pos]
 
-                    tok = new_tokens[i]
-
-                    content, should_stop = self._ingest_token_with_stop(stop_states[i], tok)
+                    content, should_stop = self._ingest_token_with_stop(stop_states[orig_i], tok)
                     if content:
-                        text_buffers[i] += content
+                        text_buffers[orig_i] += content
 
                     if should_stop:
-                        finished[i] = True
-                        finish_reasons[i] = "stop"
-                        flushed = self._flush_stop_state(stop_states[i], final=True)
+                        finish_reasons[orig_i] = "stop"
+                        flushed = self._flush_stop_state(stop_states[orig_i], final=True)
                         if flushed:
-                            text_buffers[i] += flushed
-                        if text_buffers[i]:
-                            contents_to_send[i] += text_buffers[i]
-                            text_buffers[i] = ""
-                        terminal_chunks.append((i, "stop"))
+                            text_buffers[orig_i] += flushed
+                        if text_buffers[orig_i]:
+                            contents_to_send[orig_i] = text_buffers[orig_i]
+                            text_buffers[orig_i] = ""
+                        terminal_chunks.append((orig_i, "stop"))
+                        newly_finished_positions.append(pos)
                         continue
 
-                    chunk_token_counts[i] += 1
-                    if chunk_token_counts[i] >= chunk_size and text_buffers[i]:
-                        contents_to_send[i] += text_buffers[i]
-                        text_buffers[i] = ""
-                        chunk_token_counts[i] = 0
+                    chunk_token_counts[orig_i] += 1
+                    if chunk_token_counts[orig_i] >= chunk_size and text_buffers[orig_i]:
+                        contents_to_send[orig_i] = text_buffers[orig_i]
+                        text_buffers[orig_i] = ""
+                        chunk_token_counts[orig_i] = 0
 
-                if any(contents_to_send) or terminal_chunks:
-                    choices = [
-                        {"index": i, "delta": {"content": contents_to_send[i]}}
-                        for i in range(batch_size)
-                        if contents_to_send[i]
-                    ]
+                if contents_to_send or terminal_chunks:
+                    choices = []
+                    for orig_i, text in contents_to_send.items():
+                        choices.append({"index": orig_i, "delta": {"content": text}})
                     for idx, reason in terminal_chunks:
                         choices.append({"index": idx, "delta": {}, "finish_reason": reason})
                     if choices:
                         chunk = {"object": "chat.completion.chunk", "choices": choices}
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
+                # Decode-time row compaction: remove finished rows from the GPU batch
+                if newly_finished_positions:
+                    still_active = [p for p in range(n_active) if p not in set(newly_finished_positions)]
+                    if still_active:
+                        idx_t = torch.tensor(still_active, device=out.device, dtype=torch.long)
+                        out = out[idx_t]
+                        penalties = penalties[idx_t]
+                        sample_rand_states = sample_rand_states[idx_t]
+                        state[0] = state[0][:, :, idx_t]
+                        state[1] = state[1][:, idx_t]
+                        active_indices = [active_indices[p] for p in still_active]
+                    else:
+                        active_indices = []
+
                 await asyncio.sleep(0)
 
             remaining_choices = []
-            for i in range(batch_size):
-                if finish_reasons[i] is None:
-                    finish_reasons[i] = "length"
-                flushed = self._flush_stop_state(stop_states[i], final=True)
+            for orig_i in range(batch_size):
+                if finish_reasons[orig_i] is None:
+                    finish_reasons[orig_i] = "length"
+                flushed = self._flush_stop_state(stop_states[orig_i], final=True)
                 if flushed:
-                    text_buffers[i] += flushed
-                if text_buffers[i]:
-                    remaining_choices.append({"index": i, "delta": {"content": text_buffers[i]}})
-                if finish_reasons[i] == "length":
-                    remaining_choices.append({"index": i, "delta": {}, "finish_reason": "length"})
+                    text_buffers[orig_i] += flushed
+                if text_buffers[orig_i]:
+                    remaining_choices.append({"index": orig_i, "delta": {"content": text_buffers[orig_i]}})
+                if finish_reasons[orig_i] == "length":
+                    remaining_choices.append({"index": orig_i, "delta": {}, "finish_reason": "length"})
 
             if remaining_choices:
                 chunk = {"object": "chat.completion.chunk", "choices": remaining_choices}
@@ -673,7 +687,7 @@ class BatchInferenceMixin:
 
 ### generation for OpenAI compatible bsz=1 endpoint ###
 
-    async def singe_infer(
+    async def single_infer(
         self,
         prompt,
         max_length=512,
@@ -737,7 +751,7 @@ class BatchInferenceMixin:
             inference_deps.get_torch().cuda.empty_cache()
             gc.collect()
 
-    async def singe_infer_stream(
+    async def single_infer_stream(
         self,
         prompt,
         max_length=512,
