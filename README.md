@@ -651,3 +651,75 @@ curl -X POST http://localhost:8000/FIM/v1/batch-FIM \
 ```
 
 </details>
+
+___
+### **10. `/v1/responses` [OpenAI Responses API — Stateful multi-turn]**
+
+The [Responses API](https://platform.openai.com/docs/api-reference/responses) is a stateful interface that maps naturally to RWKV's recurrent state. Use `previous_response_id` to chain multi-turn conversations — each turn resumes from the stored RWKV state (O(1) per turn, no re-processing history).
+
+<details>
+<summary><strong><em>curl examples</em></strong></summary>
+
+- Single turn
+```bash
+curl -X POST http://localhost:8081/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-password-if-set" \
+  -d '{
+    "model": "rwkv7",
+    "input": "Write a one-sentence bedtime story about a unicorn.",
+    "max_output_tokens": 256
+  }'
+```
+
+- Multi-turn (stateful via `previous_response_id`)
+```bash
+# Turn 1
+curl -X POST http://localhost:8081/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-password-if-set" \
+  -d '{
+    "model": "rwkv7",
+    "input": "My name is Alice. Remember it.",
+    "instructions": "You are a helpful assistant.",
+    "max_output_tokens": 100
+  }'
+# Response includes "id": "resp_..." — use it in the next turn
+
+# Turn 2
+curl -X POST http://localhost:8081/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-password-if-set" \
+  -d '{
+    "model": "rwkv7",
+    "input": "What is my name?",
+    "previous_response_id": "resp_...",
+    "max_output_tokens": 50
+  }'
+```
+
+- Streaming
+```bash
+curl -N -X POST http://localhost:8081/v1/responses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-password-if-set" \
+  -d '{
+    "model": "rwkv7",
+    "input": "Hello!",
+    "stream": true,
+    "max_output_tokens": 256
+  }'
+```
+
+</details>
+
+**Parameters:**
+- `input` (required): string or message array (`[{"role": "user", "content": "..."}]`)
+- `instructions`: system-level guidance (like a system prompt)
+- `previous_response_id`: resume from a previous response's stored RWKV state
+- `max_output_tokens`: max tokens to generate (default 1024)
+- `temperature`, `top_p`: sampling parameters
+- `stream`: SSE streaming with `response.output_text.delta` events
+- `store`: whether to store state for multi-turn (default `true`)
+
+**Response format** matches the OpenAI spec: `output[]` array with typed message items, `usage` stats, and a `resp_...` ID for chaining.
