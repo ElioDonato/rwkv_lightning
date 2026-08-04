@@ -1,6 +1,9 @@
 __pycache__/
 .vscode/
 rwkv_sessions.db
+rwkv_sessions.db-journal
+rwkv_sessions.db-wal
+rwkv_sessions.db-shm
 ShareGPT_V3_unfiltered_cleaned_split.json
 .codex
 
