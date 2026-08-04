@@ -70,6 +70,26 @@ def check_password(body_password, password):
     return None
 
 
+def extract_bearer_token(request: Request):
+    auth_header = request.headers.get("authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return None
+    return auth_header.split(" ", 1)[1].strip()
+
+
+def check_openai_auth(request: Request, body: dict, password):
+    """Timing-safe Bearer-token or body-password auth, OpenAI-client compatible.
+    Shared by /openai/v1/* and /v1/responses (both accept either an
+    `Authorization: Bearer <password>` header or a `password` body field)."""
+    if not password:
+        return None
+    bearer_token = extract_bearer_token(request) or ""
+    body_password = str(body.get("password") or "")
+    if hmac.compare_digest(bearer_token, password) or hmac.compare_digest(body_password, password):
+        return None
+    return json_response(401, {"error": "Unauthorized: invalid or missing password"})
+
+
 def parse_request_model(model_cls, body: dict):
     """Build a pydantic request model from a parsed JSON body, converting
     ValidationError (e.g. our max_tokens ceiling, or any other field

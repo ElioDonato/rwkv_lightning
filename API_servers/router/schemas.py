@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Any, Optional, Union
 
 from pydantic import BaseModel, field_validator
 
@@ -68,3 +68,38 @@ class TranslateRequest(BaseModel):
 
 class TranslateResponse(BaseModel):
     translations: list[dict]
+
+
+class ResponsesRequest(BaseModel):
+    """Request body for the OpenAI Responses API endpoint (/v1/responses)."""
+
+    model: str = "rwkv7"
+    input: Union[str, list[Any]]
+    instructions: Optional[str] = None
+    previous_response_id: Optional[str] = None
+    max_output_tokens: int = 1024
+    temperature: float = 1.0
+    top_p: float = 0.6
+    top_k: int = 50
+    alpha_presence: float = 1.0
+    alpha_frequency: float = 0.1
+    alpha_decay: float = 0.996
+    stream: bool = False
+    store: bool = True
+    password: Optional[str] = None
+
+    @field_validator("max_output_tokens")
+    @classmethod
+    def _clamp_max_output_tokens(cls, value: int) -> int:
+        if value > MAX_ALLOWED_TOKENS:
+            raise ValueError(
+                f"max_output_tokens={value} exceeds the server limit of {MAX_ALLOWED_TOKENS}"
+            )
+        return value
+
+    @field_validator("input")
+    @classmethod
+    def _require_nonempty_input(cls, value):
+        if not value:
+            raise ValueError("input is required and must not be empty")
+        return value
