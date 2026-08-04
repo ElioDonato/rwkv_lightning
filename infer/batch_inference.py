@@ -442,6 +442,7 @@ class BatchInferenceMixin:
 
             stop_state = self._create_stop_state(stop_tokens)
             generated_text = ""
+            finish_reason = "length"
             for _ in range(max_length):
                 self._raise_if_cancelled(cancel_token)
                 if out.dim() == 1:
@@ -466,11 +467,17 @@ class BatchInferenceMixin:
                     generated_text += content
 
                 if should_stop:
+                    finish_reason = "stop"
                     break
 
                 out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
             generated_text += self._flush_stop_state(stop_state, final=True)
-            return [generated_text]
+            # Returns (texts, finish_reasons) to match batch_generate's (V1)
+            # per-item shape, since /state/ and /multi_state/ callers were
+            # previously hardcoding finish_reason="stop" regardless of
+            # whether generation actually hit a stop string or was
+            # truncated at max_tokens -- see commit fixing that bug.
+            return [generated_text], [finish_reason]
         finally:
             gc.collect()
             inference_deps.get_torch().cuda.empty_cache()
