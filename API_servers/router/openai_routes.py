@@ -2,7 +2,6 @@ import logging
 
 logger = logging.getLogger("api.openai")
 
-import hmac
 import json
 import os
 import time
@@ -15,8 +14,10 @@ from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBsz
 from state_manager.state_pool import get_state_manager
 
 from API_servers.router.common import (
+    check_openai_auth as common_check_openai_auth,
     client_closed_response,
     emit_finish_reason_chunk,
+    extract_bearer_token as common_extract_bearer_token,
     extract_sse_payload,
     json_response,
     prefill_bsz_limit_response,
@@ -169,21 +170,12 @@ def build_openai_message_response(
     return {"role": "assistant", "content": result_text}, finish_reason
 
 
-def extract_bearer_token(request: Request):
-    auth_header = request.headers.get("authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        return None
-    return auth_header.split(" ", 1)[1].strip()
-
-
-def check_openai_auth(request: Request, body: dict, password):
-    if not password:
-        return None
-    bearer_token = extract_bearer_token(request) or ""
-    body_password = str(body.get("password") or "")
-    if hmac.compare_digest(bearer_token, password) or hmac.compare_digest(body_password, password):
-        return None
-    return json_response(401, {"error": "Unauthorized: invalid or missing password"})
+# extract_bearer_token / check_openai_auth now live in API_servers.router.common
+# (shared with /v1/responses and any other Bearer-token-auth'd endpoint). Kept
+# as re-exports here since existing code/tests may still import them from
+# this module.
+extract_bearer_token = common_extract_bearer_token
+check_openai_auth = common_check_openai_auth
 
 
 async def stream_openai_chunks(
