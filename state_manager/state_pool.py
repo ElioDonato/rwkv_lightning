@@ -617,6 +617,16 @@ class StateCacheManager:
             return [(row[0], row[1]) for row in results]
 
     def list_prefix_states_in_db(self) -> List[Tuple[str, int, float]]:
+        """Full `ORDER BY last_updated` scan+sort over the entire prefix_cache
+        table. On a long-running deployment this table can be far larger
+        (row count and on-disk bloat, especially without periodic VACUUM)
+        than the sessions table, and this query has no supporting index --
+        see list_all_states()'s include_prefix_db docstring. Prefer not
+        calling this on a request's hot path; if a caller needs it, consider
+        running it via run_in_threadpool so a slow scan doesn't block the
+        asyncio event loop (and every other in-flight request) for the
+        duration.
+        """
         with self.db_lock:
             self.db_cursor.execute(
                 "SELECT state_id, bucket_len, last_updated FROM prefix_cache ORDER BY last_updated DESC"
@@ -624,8 +634,26 @@ class StateCacheManager:
             results = self.db_cursor.fetchall()
             return [(row[0], int(row[1]), row[2]) for row in results]
 
-    def list_all_states(self) -> dict:
+    def list_all_states(self, include_prefix_db: bool = False) -> dict:
+        """List known session-state keys across L1/L2/disk.
 
+        `include_prefix_db` also runs list_prefix_states_in_db(), a full
+        `SELECT ... FROM prefix_cache ORDER BY last_updated` scan+sort. On a
+        long-running server the prefix_cache table accumulates far more rows
+        (and, from years of INSERT OR REPLACE without VACUUM, far more
+        on-disk bloat) than the sessions table ever does, so that scan can
+        take vastly longer than everything else in this function combined --
+        on this deployment's DB it hung for 20+ seconds and stalled every
+        other request behind it (SQLite access here is synchronous and runs
+        on the asyncio event loop thread, so a slow query blocks the whole
+        server, not just its caller). Every current caller
+        (collect_session_indices for /multi_state/'s dialogue_idx
+        allocation, /state/delete's delete_prefix cleanup, /state/status)
+        only reads l1_cache/l2_cache/database, never prefix_l2_counts,
+        prefix_l2_cache, or prefix_database_count -- so default this off and
+        make it opt-in for any future caller that actually needs prefix-DB
+        visibility.
+        """
         with self.cache_lock:
             l1_states = list(self.l1_cache.keys())
             l2_states = list(self.l2_cache.keys())
@@ -638,7 +666,7 @@ class StateCacheManager:
 
         db_states = self.list_states_in_db()
         db_states_keys = [state[0] for state in db_states]
-        prefix_db_states = self.list_prefix_states_in_db()
+        prefix_db_states = self.list_prefix_states_in_db() if include_prefix_db else []
 
         return {
             "l1_cache": l1_states,
@@ -647,7 +675,7 @@ class StateCacheManager:
             "total_count": len(l1_states) + len(l2_states) + len(db_states_keys),
             "prefix_l2_counts": prefix_l2_counts,
             "prefix_l2_cache": prefix_l2_keys,
-            "prefix_database_count": len(prefix_db_states),
+            "prefix_database_count": len(prefix_db_states) if include_prefix_db else None,
         }
 
     def print_all_states_status(self):

@@ -49,6 +49,20 @@ if str(ROOT) not in sys.path:
 import state_manager.state_pool as state_pool
 
 
+# state_pool.py's methods read L1_CAPACITY/L2_CAPACITY as bare module-level
+# globals, not self.*/a config object, so tests that need non-default
+# capacities monkeypatch the module attribute directly (see _reset_manager
+# below). Snapshot the real defaults once so every test can restore them
+# afterward -- without this, a test that patches L1_CAPACITY=1 would leak
+# that value into every test that runs later in the same pytest session
+# (regardless of file), silently changing their eviction behavior. Confirmed
+# this was a real, live bug: test_l2_overflow_persists_oldest_to_disk sets
+# L1_CAPACITY=1 and never restored it, which broke an unrelated
+# StateCacheManager test in a different file when both ran in one session.
+_DEFAULT_L1_CAPACITY = state_pool.L1_CAPACITY
+_DEFAULT_L2_CAPACITY = state_pool.L2_CAPACITY
+
+
 def _reset_manager(tmp_db_path: str, l1_capacity=None, l2_capacity=None):
     """Mirrors test_prefix_state_cache.py's _reset_manager, plus optional
     monkeypatching of the module-level capacity constants. state_pool.py's
@@ -66,10 +80,8 @@ def _reset_manager(tmp_db_path: str, l1_capacity=None, l2_capacity=None):
     finally:
         state_pool.StateCacheManager._instance = None
         state_pool.DB_PATH = tmp_db_path
-        if l1_capacity is not None:
-            state_pool.L1_CAPACITY = l1_capacity
-        if l2_capacity is not None:
-            state_pool.L2_CAPACITY = l2_capacity
+        state_pool.L1_CAPACITY = l1_capacity if l1_capacity is not None else _DEFAULT_L1_CAPACITY
+        state_pool.L2_CAPACITY = l2_capacity if l2_capacity is not None else _DEFAULT_L2_CAPACITY
 
 
 def _fake_state(marker: float, token_count: int = 3):
