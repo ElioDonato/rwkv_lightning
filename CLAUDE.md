@@ -459,3 +459,95 @@ All 21 CPU tests pass. All GPU verification scripts pass (V1 3/3, V2 3/3,
 big_batch 2/2, state 2/2).
 
 
+
+## Responses API, prefix cache, and a live-server deadlock fix (2026-08-01 to 2026-08-04)
+
+**Prefix cache support for V1/V2 batch endpoints** (commit `c515ce8`): added
+`_batch_prefill` helper so `/v1/chat/completions` and `/v2/chat/completions`
+can reuse `StateCacheManager`'s prefix-cache matching, not just `/state/`.
+
+**OpenAI Responses API** (`POST /v1/responses`, commits `66114af`→`4830a8b`):
+maps `previous_response_id` to RWKV's recurrent state for O(1) multi-turn
+latency (addresses upstream issue #27). First version worked but had rough
+edges from being built under time pressure — rewritten in `4830a8b` to:
+- Reuse `batch_generate_state`/`batch_infer_stream_state` (same decode loops
+  `/state/chat/completions` uses) instead of a hand-duplicated decode loop
+  with `__import__("infer...")` calls. This wasn't just cleanup: the original
+  streaming path called `single_infer_stream()` (owns its own state, never
+  exposes it) then separately re-prefilled the prompt against a fresh zero
+  state to "reconstruct" what to persist — that reconstruction only replayed
+  the prompt, never the just-generated reply, so multi-turn conversations
+  would silently forget what the assistant itself said. Fixed by using the
+  *same* decode call to both generate the reply and produce the state that
+  gets stored.
+- Store response state in `StateCacheManager` (same L1/L2/L3 cache as
+  `/state/`) instead of an ad-hoc 64-entry dict with naive eviction.
+- Route streaming through `prefill_sse_response` for prefill-admission
+  control (original streaming path bypassed it entirely — a DoS gap).
+- `hmac.compare_digest` auth (shared `check_openai_auth`, moved to
+  `common.py`) instead of a hand-rolled `==` compare.
+- New `ResponsesRequest` schema with the same `MAX_ALLOWED_TOKENS` cap
+  `ChatRequest` has.
+- Added `DELETE /v1/responses/{id}`.
+
+**Two upstream PRs**: #28 (comprehensive improvements, built from
+`origin/main` + `fork/main`, scrubbed of local-only docs) and #29
+(Responses API, stacked on #28's branch since it depends on `session_lock`/
+`parse_request_model` introduced there — documented as a stacked-PR
+dependency in #29's description since GitHub doesn't support cross-fork
+base branches).
+
+**Critical bug found via live GPU testing, not code review**: a single
+`/multi_state/chat/completions` request with a fresh `session_id` hung the
+*entire server* for 20+ seconds. `py-spy dump` on the stuck process showed
+the event loop's only thread stuck inside `list_prefix_states_in_db()` —
+`allocate_next_dialogue_idx` → `collect_session_indices` →
+`list_all_states()` unconditionally ran a full unindexed
+`ORDER BY last_updated` scan over the `prefix_cache` table, even though none
+of its three callers (`collect_session_indices`, `/state/delete`'s
+`delete_prefix`, `/state/status`) read the fields that scan produces. On
+this deployment's real DB (81GB on disk from years without `VACUUM`, 7334
+prefix_cache rows) the scan reproducibly hung even standalone via
+`sqlite3.connect(..., timeout=2.0)` with no other process touching the file.
+Fix (`598fff6`): `list_all_states(include_prefix_db=False)` by default.
+*Deliberately did not* add a `CREATE INDEX` for this in `_init_db()` —
+tested that live too, and the index creation itself hung on the same
+fragmented table, which would have made every future server startup hang.
+Reindexing/VACUUMing that DB is an operational decision for whoever owns
+this deployment's data, not something to silently do as a side effect of a
+bug fix.
+
+**Also fixed**: `batch_generate_state()` (backing `/state/` and
+`/multi_state/`) hardcoded `finish_reason="stop"` regardless of actual
+truncation — same bug class already fixed for V1/V2/big_batch, just missed
+for the state-reuse path since it has its own decode loop (`e19e896`).
+
+All three fixes GPU-validated live (server restarted multiple times,
+including a genuine cold restart to confirm `_init_db()` doesn't hang):
+`/multi_state/` went from a 20+s server-wide hang (had to `kill -9`) to a
+1.1s response; `/v1/responses` 3-hop multi-turn chain correctly recalled
+facts from two separate earlier turns; `finish_reason` correctly reports
+`stop` vs `length` depending on real generation outcome.
+
+New tests: `test/test_responses_prompt_building.py` (13), 
+`test/test_state_pool_list_all_states.py` (3, plus fixed a pre-existing
+`L1_CAPACITY`/`L2_CAPACITY` monkeypatch leak in
+`test_state_pool_l1_l2_cache.py`'s `_reset_manager` that made these
+nondeterministic depending on run order).
+
+## Unit-test coverage pass for previously-untested pure helpers (2026-08-05)
+
+Fresh improvement-mode inspection found three pure/near-pure functions in
+`API_servers/router/common.py` and `v1_routes.py` with zero direct test
+coverage (only ever exercised indirectly via GPU integration tests or
+manual curl): `normalize_state_prompts` (the `\n\n` continuation-prefix
+logic for `/state/`/`/multi_state/`), `collect_session_indices` +
+`allocate_next_dialogue_idx` (the `dialogue_idx` counter/allocation logic
+for `/multi_state/`, including its `threading.Lock`), and
+`create_translation_prompt` (language-name lookup for `/translate/v1/batch-translate`).
+
+Added `test/test_common_prompt_and_dialogue_idx.py` (14 tests, including a
+real 20-thread concurrency stress test on `allocate_next_dialogue_idx`'s
+lock — verifies no duplicate/racing indices, not just single-threaded
+correctness) and `test/test_translation_prompt.py` (7 tests). All CPU-only,
+no GPU/model required. Total CPU suite: 40 → 61 tests, all passing.
