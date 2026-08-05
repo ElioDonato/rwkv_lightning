@@ -55,6 +55,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import nullcontext
 
 from fastapi import APIRouter, Request
 
@@ -131,6 +132,25 @@ def _build_message_output(msg_id: str, text: str) -> dict:
     }
 
 
+def _response_lock_context(previous_response_id: str | None):
+    """Pick the concurrency guard for a /v1/responses request.
+
+    session_lock(previous_response_id) is only meaningful -- and only
+    acquired -- when there's an existing previous_response_id two requests
+    could actually race on (a client retry, or two branches chained off the
+    same prior turn). A first-turn request's response_id is a UUID minted
+    fresh inside the request itself, unknown to any other request until
+    this one returns it in its HTTP response, so no concurrent request
+    could ever contend for it; locking on it anyway would leak one
+    permanent entry into common.py's process-lifetime _session_locks dict
+    per request for zero correctness benefit. See the call site in
+    create_response() for the full incident writeup.
+    """
+    if previous_response_id:
+        return session_lock(previous_response_id)
+    return nullcontext()
+
+
 def _build_response_payload(response_id, created_at, model_name, msg_id, text, usage, status="completed"):
     return {
         "id": response_id,
@@ -187,12 +207,9 @@ async def create_response(request: Request):
     created_at = int(time.time())
     model_name = os.path.basename(engine.args.MODEL_NAME)
 
-    # Use the response_id itself as the session_lock key so concurrent
-    # requests chained off the same previous_response_id (a client retry, or
-    # two branches racing) are serialized rather than concurrently mutating
-    # clones of the same base state and racing on which one gets persisted
-    # last -- the same guard /state/chat/completions uses for session_id.
-    lock_key = previous_response_id or response_id
+    # See _response_lock_context()'s docstring for why this is *not*
+    # session_lock(response_id) unconditionally.
+    lock_ctx = _response_lock_context(previous_response_id)
 
     try:
         if req.stream:
@@ -204,7 +221,7 @@ async def create_response(request: Request):
                 # driving this generator -- reserving it again here would
                 # double-count this request against the server's admission
                 # budget, so this generator only needs the session lock.
-                async with session_lock(lock_key):
+                async with lock_ctx:
                     state = prev_state if is_continuation else engine.model.generate_zero_state(0)
                     inner_stream = engine.batch_infer_stream_state(
                         prompts=[prompt],
@@ -273,7 +290,7 @@ async def create_response(request: Request):
             return prefill_sse_response(request, response_stream(), cancel_token, 1)
 
         # Non-streaming path.
-        async with session_lock(lock_key):
+        async with lock_ctx:
             cancel_token = CancellationToken()
             async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
                 state = prev_state if is_continuation else engine.model.generate_zero_state(0)
