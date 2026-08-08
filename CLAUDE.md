@@ -41,14 +41,26 @@ and start in seconds.
 ## Models
 
 Not checked into the repo. Downloaded from `BlinkDL/rwkv7-g1` on
-HuggingFace (public, no auth) into `models/`:
-- `rwkv7-g1h-2.9b-20260710-ctx10240.pth` (5.9GB on disk, ~6GB VRAM loaded)
-- `rwkv7-g1h-7.2b-20260710-ctx10240.pth` (14.4GB on disk, ~14.1GB VRAM loaded)
+HuggingFace (public, no auth) into `models/`.
 
-Both fit comfortably on the 3090 Ti's 24GB, with more headroom for batching
-on the 2.9b (max_prefill_bsz≈269 for 2.9b vs ≈138-402 for 7.2b depending on
-free VRAM at the time — it's computed dynamically in
-`RWKV_x070.refresh_max_prefill_bsz()`).
+**Current (active) — RWKV7-G1i**, the newest G1 release as of 2026-08-08
+(same RWKV-7 architecture as G1h — head_size 64, vocab 65536, identical
+weight-key layout and `User:`/`Assistant:` chat template — so it is a
+drop-in weights replacement requiring NO inference-code changes; the only
+user-facing differences are better-trained weights and ctx16384 instead of
+ctx10240, which doesn't affect RWKV inference since recurrent state is O(1)
+in sequence length):
+- `rwkv7-g1i-2.9b-20260805-ctx16384.pth` (5.5GB on disk, ~6GB VRAM loaded) — served live
+- `rwkv7-g1i-7.2b-20260805-ctx16384.pth` (13.4GB on disk, ~13.4GB VRAM loaded)
+
+Kept on disk as a fallback/backup (superseded by G1i, no longer served):
+- `rwkv7-g1h-2.9b-20260710-ctx10240.pth`
+- `rwkv7-g1h-7.2b-20260710-ctx10240.pth`
+
+Both G1i sizes fit comfortably on the 3090 Ti's 24GB, with more headroom for
+batching on the 2.9b (max_prefill_bsz is computed dynamically in
+`RWKV_x070.refresh_max_prefill_bsz()`). Note the 13.3B G1i (26.5GB weights)
+does NOT fit fp16 on the 24GB card — only usable via W8A16/GemLite quant.
 
 Launch: `uv run python app.py --model-path models/<name-without-.pth> --port <p> --password <pw>`
 (one model per server process — there's no hot-swap/multi-model routing).
@@ -551,3 +563,39 @@ real 20-thread concurrency stress test on `allocate_next_dialogue_idx`'s
 lock — verifies no duplicate/racing indices, not just single-threaded
 correctness) and `test/test_translation_prompt.py` (7 tests). All CPU-only,
 no GPU/model required. Total CPU suite: 40 → 61 tests, all passing.
+
+## G1i model upgrade + prefix-cache batch-stacking fix (2026-08-08)
+
+**Model upgrade to RWKV7-G1i.** Downloaded `rwkv7-g1i-2.9b-20260805-ctx16384`
+and `rwkv7-g1i-7.2b-20260805-ctx16384` from `BlinkDL/rwkv7-g1` (G1i is the
+newest G1 release, 2026-08-05). G1i is architecturally identical to the G1h
+models previously served (RWKV-7, head_size 64, vocab 65536, same weight-key
+layout and chat template), so it is a drop-in weights replacement — verified
+`test/test_local_state_and_batch.py` passes on g1i-2.9b before switching.
+`service_run.sh` now points at `models/rwkv7-g1i-2.9b-20260805-ctx16384`;
+the g1h weights are kept on disk as backup (see Models section).
+
+**Bug found + fixed during the switch (pre-existing, NOT caused by G1i):**
+`/v1/chat/completions` and `/v2/chat/completions` returned 500 with
+`RuntimeError: Tensors must have same number of dimensions: got 2 and 3`
+whenever `use_prefix_cache` was true (the default). Root cause: the
+prefix-cache branch of `_batch_prefill` (`infer/batch_inference.py`, added
+2026-08-01 in commit c515ce8) stacks the per-prompt states returned by
+`_prefill_prompt_with_prefix_cache` — but those are single-sequence bsz=0
+states (`generate_zero_state(0)` → `state[0]` is `[Layer,2,C]` with NO batch
+dim). The stacking used `torch.cat(..., dim=2)` as if they were already
+`[Layer,2,1,C]`, so it concatenated along the feature axis instead of adding
+a batch axis, producing a malformed state that `forward_seq_batch_tensor`
+rejects. Fix: `unsqueeze` each state to insert the batch dim before
+concatenating (`s[0].unsqueeze(2)`, `s[1].unsqueeze(1)`), matching the fast
+path's `generate_zero_state(B)` layout. The bug affected ONLY the prefix-cache
+batch path: `/openai/v1/` (uses `single_infer`), `/big_batch/` (own decode
+loop), `/state/`+`/multi_state/`+`/v1/responses` (`batch_generate_state`)
+were never affected, and `use_prefix_cache:false` always worked. Verified
+fixed live for `/v1` (bsz=1, bsz=2, streaming) and `/v2` with prefix cache
+on, plus regression-checked all unaffected endpoints. New CPU regression test
+`test/test_batch_prefill_prefix_cache_stacking.py` (3 tests, monkeypatches
+`_prefill_prompt_with_prefix_cache` to emit controlled bsz=0 states and asserts
+the stacked shapes/row-order; confirmed it fails when the `unsqueeze` is
+removed). Note this test needs `env.sh` (import chain JIT-compiles the sampler
+kernel) but does no GPU compute, same as `test_prefill_admission_queue.py`.
