@@ -135,10 +135,17 @@ class BatchInferenceMixin:
             states.append(s)
             logits.append(o)
 
-        # Stack individual bsz=1 states into a batch state
+        # Stack individual single-sequence states into a batch state.
+        # _prefill_prompt_with_prefix_cache returns bsz=0 states (from
+        # generate_zero_state(0)), whose state[0] is [Layer, 2, C] and state[1]
+        # is [Layer, H, N, N] -- i.e. they carry NO batch dimension. Insert one
+        # via unsqueeze before concatenating; concatenating along the existing
+        # trailing dim would instead fuse the feature axis and produce a state
+        # that forward_seq_batch_tensor rejects (issue: /v1 & /v2 500'd whenever
+        # use_prefix_cache was on).
         state = [
-            torch.cat([s[0] for s in states], dim=2),  # [Layer, 2, B, C]
-            torch.cat([s[1] for s in states], dim=1),  # [Layer, B, H, N, N]
+            torch.cat([s[0].unsqueeze(2) for s in states], dim=2),  # [Layer, 2, B, C]
+            torch.cat([s[1].unsqueeze(1) for s in states], dim=1),  # [Layer, B, H, N, N]
             torch.cat([s[2].unsqueeze(0) for s in states], dim=0),  # [B]
         ]
         out = torch.stack(logits, dim=0).float()  # [B, vocab]
