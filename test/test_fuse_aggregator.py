@@ -51,6 +51,7 @@ class _FakeEngine:
 
     def __init__(self):
         self.solo_calls = []   # (prompt, max_length, temperature, stop_tokens)
+        self.solo_kw = []      # per-solo sampler controls (top_k/top_p/alpha_*/prefix_cache_manager)
         self.batch_calls = []  # (prompts_list, max_length, temperature, stop_tokens)
         self.permits = []      # admitted request_bsz values
         self.model = types.SimpleNamespace(max_prefill_bsz_limit=64)
@@ -78,6 +79,7 @@ class _FakeEngine:
     async def single_infer_stream(self, prompt, max_length, temperature, stop_tokens,
                                   chunk_size=1, **kw):
         self.solo_calls.append((prompt, max_length, temperature, tuple(stop_tokens)))
+        self.solo_kw.append(dict(kw))
         yield self._solo_chunk(prompt)
         yield self._finish_chunk()
         yield "data: [DONE]\n\n"
@@ -466,11 +468,11 @@ async def test_abandon_resolves_queued_and_inflight_jobs():
 
     queued = [
         fuse_mod._ChatJob(i, f"q{i}", 32, 1.0, ("\nUser:",), 2,
-                          20, 0.6, 1.0, 0.1, 0.996, False, loop) for i in range(2)
+                          20, 0.6, 1.0, 0.1, 0.996, False, None, loop) for i in range(2)
     ]
     inflight = [
         fuse_mod._ChatJob(10 + i, f"f{i}", 32, 1.0, ("\nUser:",), 2,
-                          20, 0.6, 1.0, 0.1, 0.996, False, loop) for i in range(2)
+                          20, 0.6, 1.0, 0.1, 0.996, False, None, loop) for i in range(2)
     ]
     agg._pending.extend(queued)
     agg._inflight_batch = inflight
@@ -529,6 +531,92 @@ async def test_pending_cap_rejects_burst_instead_of_buffering():
     assert engine.batch_calls == [(["a", "b"], 32, 1.0, ("\nUser:",))]
     assert any("[c:solo]" in c for c in out3), "rejected request served solo"
     assert agg.pending_count == 0
+    await agg.stop()
+
+
+# ---------------------------------------------------------------------------
+# (j) HIGH-2: an UNFUSED (solo) request is byte-identical to fuse=OFF -- the
+# solo path forwards the request's OWN sampler controls (top_k/top_p/alpha_*)
+# into single_infer_stream, so enabling the flag never changes a request that
+# isn't actually fused.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_non_fusable_top_k_non_default_solo_passes_exact_top_k():
+    """(a) A non-fusable job (top_k non-default, always excluded from fusion)
+    served solo must pass its EXACT top_k to the underlying single_infer_stream
+    -- not fall back to a hardcoded temp-only sampler."""
+    engine = _FakeEngine()
+    agg = ChatFuseAggregator(engine, enabled=True, window_ms=0, max_bsz=8)
+    agg.start()
+
+    # top_k=1 is non-default -> not fusable; a lone request head-fires solo.
+    stream = await agg.submit("k", 32, 1.0, ["\nUser:"], 2, top_k=1)
+    await _drain(stream)
+
+    assert engine.solo_calls, "non-fusable job must run solo"
+    assert engine.batch_calls == [], "non-fusable job must never fuse"
+    # route default passes top_k=20 -> the CHAT route value; the solo path must
+    # forward the REQUEST's top_k (1), not the sampler's standalone default (50).
+    assert engine.solo_kw and engine.solo_kw[0]["top_k"] == 1, \
+        f"solo must forward the request's exact top_k=1, got {engine.solo_kw}"
+    await agg.stop()
+
+
+@pytest.mark.anyio
+async def test_default_solo_passes_route_top_k_20_not_50():
+    """(b) A DEFAULT request under fuse=ON served solo must pass top_k=20 (the
+    /openai/v1/chat/completions route default) -- not single_infer_stream's own
+    standalone default of 50. This is the 'fuse=ON-solo == fuse=OFF-solo for the
+    same request' byte-identity guarantee."""
+    engine = _FakeEngine()
+    agg = ChatFuseAggregator(engine, enabled=True, window_ms=0, max_bsz=8)
+    agg.start()
+
+    # Default top_k (submit default = _FUSE_TOP_K_DEFAULT = 20); lone -> solo.
+    stream = await agg.submit("d", 32, 1.0, ["\nUser:"], 2)
+    await _drain(stream)
+
+    assert engine.solo_calls, "default lone request must head-fire solo"
+    assert engine.solo_kw and engine.solo_kw[0]["top_k"] == 20, \
+        f"default solo must forward top_k=20 (route default), got {engine.solo_kw}"
+    # top_p default is 0.6 in the route AND in single_infer_stream, so it must
+    # be forwarded verbatim either way -- a regression that drops it to the
+    # route/standalone default would be invisible, so assert it is PRESENT.
+    assert engine.solo_kw[0].get("top_p") == 0.6
+    await agg.stop()
+
+
+# ---------------------------------------------------------------------------
+# (k) HIGH-1: the pending-cap REJECT path must respect VRAM admission -- it
+# acquires + releases a bsz=1 prefill permit around its inline single_infer
+# (mirroring _run_solo), so a before-merge path never bypasses the shared
+# max-prefill-bsz budget exactly when a burst has overloaded the queue.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_cap_reject_acquires_prefill_permit():
+    engine = _FakeEngine()
+    agg = ChatFuseAggregator(engine, enabled=True, window_ms=0, max_bsz=8,
+                             pending_cap=1)
+    agg.start()
+
+    s1 = await agg.submit("a", 32, 1.0, ["\nUser:"], 2)
+    s2 = await agg.submit("b", 32, 1.0, ["\nUser:"], 2)  # queue already at cap=1
+
+    # The second submit is rejected to the inline solo path.
+    assert isinstance(s2, fuse_mod._InlineFuseStream)
+
+    await _drain(s1)
+    out2 = await _drain(s2)
+    assert any("[b:solo]" in c for c in out2)
+
+    # The reject's inline solo acquired its own bsz=1 prefill permit (in
+    # addition to the fused/queued job's). Without HIGH-1 this reject path was
+    # the ONE before-merge route that iterated single_infer_stream with NO
+    # permit -- exactly the sustained-burst OOM hole this test closes.
+    assert 1 in engine.permits, \
+        f"reject path must acquire a bsz=1 prefill permit, permits={engine.permits}"
     await agg.stop()
 
 

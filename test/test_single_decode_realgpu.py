@@ -165,5 +165,120 @@ def test_real_gpu_forward_one_matches_forward_batch_bsz_1():
         # meaningful even for near-zero logits).
 
 
+_N_SMOKE_STEPS = 3
+
+
+@_PYTEST_GPU
+def test_real_gpu_single_infer_full_loop_merged_step_matches_old():
+    """MED-3 (CR1): the item-2 merged ``_gpu_decode_step`` (sample + forward_batch
+    in ONE unit over a bsz=1 reshaped state) must reproduce the PRE-item-2
+    two-call loop (identical sampling, scalar ``forward_one``) TOKEN-for-TOKEN
+    over a multi-step decode WITH repetition-penalty state carried.
+
+    The kernel-equivalence test above compares raw forward_one vs forward_batch
+    on a FIXED sequence with no sampler / no repetition-penalty state. That is
+    not a sufficient gate for item 2's ALWAYS-APPLIED merged switch: a regression
+    in the merged step's state reshape or penalty carry would pass it. This test
+    runs the FULL multi-step single_infer decode shape -- both paths seed their
+    OWN sampler RNG identically, sample through the REAL
+    ``batch_sampling_repetition_temperature_topk_topp`` (which carries the
+    repetition-penalty counts across steps) and assert the EMITTED tokens match
+    at every step, plus next-logits within the fp16 tolerance.
+    """
+    from model_load.model_loader import load_model_and_tokenizer
+    from infer import inference_deps
+
+    model_path = _resolve_model_path()
+    model, tokenizer, _args, _rocm = load_model_and_tokenizer(model_path)
+    device = "cuda"
+    torch = inference_deps.get_torch()
+    sample = inference_deps.get_sample()
+
+    tokens = tokenizer.encode(_PROMPT)
+    assert len(tokens) > 1, "prompt must tokenize to a usable sequence"
+
+    # Chat-route sampler defaults (build_internal_chat_request); AF != 0 so the
+    # repetition-penalty state is genuinely carried across steps.
+    top_k = 20
+    top_p = 0.6
+    temperature = 1.0
+    alpha_presence = 1.0
+    alpha_frequency = 0.1
+    alpha_decay = 0.996
+
+    # --- Shared scalar bsz=0 prefill. -----------------------------------------
+    state = model.generate_zero_state(0)
+    # single_infer's prefill passes fp32 logits to the sampler
+    # (_prefill_prompt_with_prefix_cache -> _forward_tokens_chunked .float());
+    # mirror that so the sampling kernel is fed the same dtype as production.
+    out = model.forward(tokens, state).float()  # [vocab] fp32 next-token logits
+    vocab = out.size(-1)
+    seed = 0x5EED
+
+    # --- OLD (pre-item-2) loop: sample + scalar forward_one on bsz=0 state. ----
+    s_state = [t.clone() for t in state]
+    s_out = out                          # [vocab] fp32
+    old_pen = torch.zeros(1, vocab, device=device)
+    old_rand = sample.setup_rand(seed, 1)
+    old_tokens = []
+    old_logits = []
+    with torch.no_grad():
+        for _ in range(_N_SMOKE_STEPS):
+            logits_reshaped = s_out.unsqueeze(0) if s_out.dim() == 1 else s_out
+            old_logits.append(s_out.float().detach().cpu())
+            ntok = sample.batch_sampling_repetition_temperature_topk_topp(
+                logits_reshaped, old_pen, old_rand,
+                alpha_presence, alpha_frequency, alpha_decay,
+                temperature, top_k, top_p,
+            ).tolist()
+            tok = ntok[0]
+            old_tokens.append(tok)
+            x = model.z["emb.weight"][tok]
+            s_out = model.forward_one(x, s_state).float()
+
+    # --- NEW (item-2) loop: merged sample+forward_batch on bsz=1 reshaped state.
+    b_state = [
+        state[0].unsqueeze(2).contiguous(),   # [Layer,2,1,C]
+        state[1].unsqueeze(1).contiguous(),   # [Layer,1,H,N,N]
+        state[2].reshape(1),                  # [1]
+    ]
+    b_out = out.unsqueeze(0)                 # [1,vocab]
+    n_pen = torch.zeros(1, vocab, device=device)
+    n_rand = sample.setup_rand(seed, 1)
+    new_tokens = []
+    new_logits = []
+    with torch.no_grad():
+        for _ in range(_N_SMOKE_STEPS):
+            t = sample.batch_sampling_repetition_temperature_topk_topp(
+                b_out, n_pen, n_rand,
+                alpha_presence, alpha_frequency, alpha_decay,
+                temperature, top_k, top_p,
+            )
+            new_tokens.append(t.tolist()[0])
+            new_logits.append(b_out[0].float().detach().cpu())
+            b_out = model.forward_batch(t, b_state).float()
+
+    # --- Compare the EMITTED tokens (the byte-identity signature). ------------
+    assert old_tokens == new_tokens, (
+        f"item-2 merged decode diverged from the old two-call loop: "
+        f"old={old_tokens} new={new_tokens}"
+    )
+    # Per-step next-logits agree within the same fp16 scale-relative bound as
+    # the kernel-equivalence test above (1% of peak logit magnitude).
+    assert len(old_logits) == len(new_logits) == _N_SMOKE_STEPS
+    for i, (a, b) in enumerate(zip(old_logits, new_logits)):
+        assert a.shape == b.shape, \
+            f"step {i} shape mismatch old={tuple(a.shape)} new={tuple(b.shape)}"
+        diff = (a - b).abs()
+        peak = max(a.abs().max().item(), b.abs().max().item(), 1.0)
+        rel = diff.max().item() / peak
+        assert rel < 0.01, (
+            f"step {i} old-vs-new loop peak-relative diff = {rel:.3e} (max_abs "
+            f"{diff.max().item():.3e} on |logit|~{peak:.1f}) >= 1%: the merged "
+            "single_infer loop disagrees with the pre-item-2 two-call loop beyond "
+            "fp16 noise on the REAL GPU"
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

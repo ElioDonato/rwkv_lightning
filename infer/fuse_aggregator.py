@@ -52,35 +52,45 @@ Design
 
 FULL SAMPLING / PREFIX CONTRACT (read before enabling):
 ======================================================
-**fuse=ON may produce different output than fuse=OFF.** The fused path rides
+**fuse=ON routes CONCURRENT homogeneous requests through big_batch's gumbel-temp
+sampling (output may differ from solo for FUSED rows).** The fused path rides
 ``big_batch_stream`` which samples with ``sampler_gumbel_batch`` (TEMPERATURE-ONLY
-gumbel; no repetition-penalty / top_k / top_p). Under the enabled flag the
-sampler-control values -- ``top_k`` / ``top_p`` / ``alpha_presence`` /
-``alpha_frequency`` / ``alpha_decay`` (and hence the repetition penalty they
-drive) -- are IGNORED for EVERY fused chat request, INCLUDING a solo head-fire
-under the enabled flag (``_run_solo`` forwards only temperature/max_length/
-stop_tokens to ``single_infer_stream``, not the sampler controls). Requests whose
-top_k/top_p/alpha are non-DEFAULT are refused from any SHARED batch (the
-homogeneity gate, ``_homogeneous``, marks them not-fusable so they never fuse
-with rows whose top_* differ), but they still run solo through the aggregator's
-temp-only path and so still ignore their sampler controls as long as fuse is ON.
+gumbel; no repetition-penalty / top_k / top_p). Only jobs whose sampler controls
+are all DEFAULT and which don't need prefix caching qualify to fuse (the
+homogeneity gate, ``_ChatJob.fusable``); a NON-DEFAULT ``top_k``/``top_p``/``alpha_*``
+or ``use_prefix_cache=True`` marks the job not-fusable so it NEVER shares a
+fused batch (a fused row would silently drop that request's own setting).
 
-**Prefix caching is disabled while fuse is on**: the fused route never builds a
-``prefix_cache_manager``, and any job with ``use_prefix_cache=True`` is
-excluded from fusion entirely (``_homogeneous``). A request that needs exact
-per-request prefix caching or exact sampler behavior must keep ``RWKV_FUSE_CHAT_BATCH``
-OFF (the default).
+**A SOLO request (unfused) matches fuse=OFF for the SAME request.** Every
+before-merge solo path -- ``_run_solo`` (head-fire, or non-homogeneous /
+non-fusable) and the inline ``_InlineFuseStream`` proxy (the pending-cap reject,
+and default-off) -- forwards the request's OWN sampler controls ``top_k`` /
+``top_p`` / ``alpha_presence`` / ``alpha_frequency`` / ``alpha_decay`` (plus its
+``prefix_cache_manager`` when it asked for prefix caching) straight through to
+``single_infer_stream``, mirroring the original un-fused route. So enabling the
+flag never changes a request that isn't actually fused: fuse=ON-solo is
+byte-identical to fuse=OFF-solo for the same request. With TRUE concurrency of
+homogeneous default requests, the fused rows sample with gumbel-temperature only
+and MAY differ from their own solo output -- that is the documented trade.
+
+**Prefix caching is served by the SOLO path, not the fused path.** The fused
+route never builds a ``prefix_cache_manager``; a job with ``use_prefix_cache=True``
+never fuses and is served solo through ``single_infer_stream`` WITH its
+``prefix_cache_manager`` and exact sampler controls -- identical to fuse=OFF.
+The ROUTE opts the homogeneous DEFAULT chat workload (body omits
+``use_prefix_cache``) into fusion (route default off under the flag), so default
+traffic fuses; an EXPLICIT ``use_prefix_cache=True`` stays solo-faithful.
 
 **Fusion requires sustained concurrent arrivals** (>decode-duration
 inter-arrival): a request arriving at an EMPTY queue head-fires solo and sees
 no fusion latency; only when >=2 homogeneous jobs are pending at a drain point
 does the scheduler open the ``RWKV_FUSE_CHAT_WINDOW_MS`` gather window. A
 low-traffic endpoint therefore gets little occupancy benefit and only the
-(temperature-only) sampler divergence above. For the deletion/extraction
-workload -- which shares an identical prompt template + temperature + stop_tokens
-and accepts gumbel-with-temp sampling -- this trade is acceptable; a service
-that must preserve per-request top_k/top_p/penalty sampling byte-for-byte must
-not enable the flag.
+(temperature-only) sampler divergence above for rows that ARE fused. For the
+deletion/extraction workload -- which shares an identical prompt template +
+temperature + stop_tokens and accepts gumbel-with-temp sampling -- this trade is
+acceptable; a service that must preserve per-request top_k/top_p/penalty
+sampling byte-for-byte must not enable the flag.
 
 Default-OFF
 -----------
@@ -208,12 +218,14 @@ class _ChatJob:
 
     __slots__ = ("request_id", "prompt", "max_tokens", "temperature",
                  "stop_tokens", "chunk_size", "top_k", "top_p", "alpha_presence",
-                 "alpha_frequency", "alpha_decay", "use_prefix_cache", "fusable",
+                 "alpha_frequency", "alpha_decay", "use_prefix_cache",
+                 "prefix_cache_manager", "fusable",
                  "queue", "cancelled", "ended", "future")
 
     def __init__(self, request_id, prompt, max_tokens, temperature,
                  stop_tokens, chunk_size, top_k, top_p, alpha_presence,
-                 alpha_frequency, alpha_decay, use_prefix_cache, loop):
+                 alpha_frequency, alpha_decay, use_prefix_cache,
+                 prefix_cache_manager, loop):
         self.request_id = request_id
         self.prompt = prompt
         self.max_tokens = max_tokens
@@ -230,6 +242,10 @@ class _ChatJob:
         self.alpha_frequency = alpha_frequency
         self.alpha_decay = alpha_decay
         self.use_prefix_cache = use_prefix_cache
+        # Forwarded unchanged into single_infer_stream by the SOLO paths so a
+        # prefix-caching (non-fusable) job keeps its exact prefix cache + sampler
+        # behavior -- byte-identical to fuse=OFF.
+        self.prefix_cache_manager = prefix_cache_manager
         # A job may only share a fused big_batch_stream batch when its sampler
         # controls are ALL default AND it does not need prefix caching -- the
         # fused path ignores top_k/top_p/alpha (gumbel temp-only) and has no
@@ -250,18 +266,33 @@ class _ChatJob:
 
 
 class _InlineFuseStream:
-    """Default-off (and single-job) stream: a thin async-iterable over the
-    engine's original ``single_infer_stream`` generator. Byte-identical to the
-    pre-feature chat stream."""
+    """Default-off (and reject-path / single-job) stream: a thin async-iterable
+    over the engine's original ``single_infer_stream`` generator. Byte-identical
+    to the pre-feature chat stream for the SAME request -- it forwards the
+    request's OWN sampler controls (top_k/top_p/alpha_* and, when requested, its
+    prefix_cache_manager) and ACQUIRES a prefill-admission permit for its bsz=1
+    (mirroring ``_run_solo``), so even the overload REJECT path respects the
+    shared VRAM admission budget when it fires on a sustained burst."""
 
-    def __init__(self, engine, prompt, max_tokens, temperature, stop_tokens, chunk_size):
+    def __init__(self, engine, prompt, max_tokens, temperature, stop_tokens,
+                 chunk_size, top_k=_FUSE_TOP_K_DEFAULT, top_p=_FUSE_TOP_P_DEFAULT,
+                 alpha_presence=_FUSE_ALPHA_PRESENCE_DEFAULT,
+                 alpha_frequency=_FUSE_ALPHA_FREQUENCY_DEFAULT,
+                 alpha_decay=_FUSE_ALPHA_DECAY_DEFAULT,
+                 use_prefix_cache=False, prefix_cache_manager=None):
         self._engine = engine
         self._params = dict(
             prompt=prompt,
             max_length=max_tokens,
             temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            alpha_presence=alpha_presence,
+            alpha_frequency=alpha_frequency,
+            alpha_decay=alpha_decay,
             stop_tokens=stop_tokens,
             chunk_size=chunk_size,
+            prefix_cache_manager=prefix_cache_manager,
         )
         self._gen = None
 
@@ -269,16 +300,31 @@ class _InlineFuseStream:
         return self._agen()
 
     async def _agen(self):
-        self._gen = self._engine.single_infer_stream(**self._params)
+        permit = None
         try:
+            permit = await self._engine.acquire_prefill_permit(
+                request_bsz=1, request_label="/openai/v1/chat/completions(fuse-inline)"
+            )
+            self._gen = self._engine.single_infer_stream(**self._params)
             async for chunk in self._gen:
                 yield chunk
         finally:
             try:
-                await self._gen.aclose()
+                if self._gen is not None:
+                    await self._gen.aclose()
             except Exception:
                 pass
-            self._gen = None
+            finally:
+                self._gen = None
+            if permit is not None:
+                try:
+                    await self._engine.release_prefill_permit(
+                        request_bsz=1,
+                        request_label="/openai/v1/chat/completions(fuse-inline)",
+                        permit=permit,
+                    )
+                except Exception:
+                    pass
 
     def cancel(self):
         # Solo path: closing/abandoning the iterator ends generation (the route's
@@ -387,16 +433,18 @@ class ChatFuseAggregator:
         if not self._enabled or self._task is not None:
             return
         if not self._gumbel_warned:
-            # ONE-TIME loud warning that the enabled flag switches the chat
-            # sampler to big_batch_stream's gumbel TEMPERATURE-only path for
-            # every request routed through the aggregator (including solo
-            # head-fire). See the FULL SAMPLING / PREFIX CONTRACT docstring.
+            # ONE-TIME loud warning that the enabled flag switches FUSED chat
+            # rows to big_batch's gumbel TEMPERATURE-only sampling. SOLO
+            # (unfused) requests keep their exact sampler controls + prefix cache
+            # and match fuse=OFF. See the FULL SAMPLING / PREFIX CONTRACT docstring.
             self._gumbel_warned = True
             logger.warning(
-                "[ChatFuse] RWKV_FUSE_CHAT_BATCH enabled: gumbel temperature "
-                "sampling is now in effect -- top_k/top_p/alpha/repetition-penalty "
-                "and prefix caching are IGNORED for fused chat requests (incl. "
-                "solo head-fire); fuse=ON may differ from fuse=OFF output."
+                "[ChatFuse] RWKV_FUSE_CHAT_BATCH enabled: FUSED rows are sampled "
+                "with gumbel TEMPERATURE-only sampling (top_k/top_p/alpha/"
+                "repetition-penalty and prefix caching IGNORED for fused rows). "
+                "SOLO requests (head-fire, or non-homogeneous/non-fusable) keep "
+                "their exact sampler controls + prefix cache and match fuse=OFF; "
+                "a fused batch may differ from solo output."
             )
         self._task = asyncio.create_task(self._run_scheduler())
 
@@ -426,31 +474,37 @@ class ChatFuseAggregator:
                      alpha_presence=_FUSE_ALPHA_PRESENCE_DEFAULT,
                      alpha_frequency=_FUSE_ALPHA_FREQUENCY_DEFAULT,
                      alpha_decay=_FUSE_ALPHA_DECAY_DEFAULT,
-                     use_prefix_cache=False):
+                     use_prefix_cache=False, prefix_cache_manager=None):
         """Enqueue a chat request and return a fuse stream (async-iterable of SSE
         chunk strings; ``cancel()`` marks the request's row dropped).
 
         Disabled (default): returns an inline ``single_infer_stream`` proxy --
-        byte-identical output and latency to the pre-feature path. Enabled:
-        enqueues the request; the scheduler runs it solo (head-fire) or fused.
+        byte-identical output and latency to the pre-feature path (the request's
+        own sampler controls and ``prefix_cache_manager`` are forwarded). Enabled:
+        if fusable (all-default sampler, no prefix caching) the request is queued
+        and the scheduler runs it solo (head-fire) or fused; a NON-fusable job
+        (non-default ``top_k``/``top_p``/``alpha_*`` or ``use_prefix_cache=True``)
+        is served SOLO with its exact sampler controls + prefix_cache_manager so
+        it stays byte-identical to fuse=OFF while the flag is on.
 
-        ``top_k``/``top_p``/``alpha_*``/``use_prefix_cache`` are carried on the
-        job only to drive the fusion-eligibility gate: any NON-default sampler
-        control, or ``use_prefix_cache=True``, marks the job NOT fusable (it
-        never shares a fused batch). Under the enabled flag this request still
-        runs solo through the temp-only head-fire/_run_solo path, so its
-        sampler controls / prefix caching remain IGNORED while fuse is ON (see
-        the FULL SAMPLING / PREFIX CONTRACT docstring).
+        ``prefix_cache_manager`` is only used by the SOLO paths (forwarded into
+        ``single_infer_stream``); the FUSED path has no prefix-cache wiring.
 
         When the pending deque is at capacity (``RWKV_FUSE_CHAT_PENDING_CAP``,
         default 64) a new submit is REJECTED: instead of buffering unboundedly
         under a burst it returns an inline solo ``single_infer_stream`` proxy,
         so the caller's request is served immediately by the original solo path
-        (graceful degrade, mirroring the embed aggregator's hard ceiling).
+        (graceful degrade, mirroring the embed aggregator's hard ceiling). That
+        inline reject path acquires + releases a bsz=1 prefill-admission permit
+        (this module owns no permit for it), so even at the overload moment it
+        still respects the shared VRAM budget.
         """
         if not self._enabled:
             return _InlineFuseStream(
-                self._engine, prompt, max_tokens, temperature, stop_tokens, chunk_size
+                self._engine, prompt, max_tokens, temperature, stop_tokens, chunk_size,
+                top_k=top_k, top_p=top_p, alpha_presence=alpha_presence,
+                alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
+                use_prefix_cache=use_prefix_cache, prefix_cache_manager=prefix_cache_manager,
             )
         if self._task is None:
             self.start()
@@ -458,7 +512,10 @@ class ChatFuseAggregator:
                 # start() was a no-op (e.g. feature became disabled); fall back
                 # to the inline solo stream so this request still completes.
                 return _InlineFuseStream(
-                    self._engine, prompt, max_tokens, temperature, stop_tokens, chunk_size
+                    self._engine, prompt, max_tokens, temperature, stop_tokens, chunk_size,
+                    top_k=top_k, top_p=top_p, alpha_presence=alpha_presence,
+                    alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
+                    use_prefix_cache=use_prefix_cache, prefix_cache_manager=prefix_cache_manager,
                 )
             if not self._dead_warned:
                 self._dead_warned = True
@@ -470,15 +527,21 @@ class ChatFuseAggregator:
         if len(self._pending) >= self._pending_cap():
             # Overload bound: reject buffering this request -- serve it inline
             # solo through the original single_infer_stream path instead of
-            # growing the pending deque without limit.
+            # growing the pending deque without limit. The inline stream acquires
+            # and releases its own bsz=1 prefill permit (HIGH-1: this reject
+            # fires exactly on the sustained burst when max-prefill-bsz VRAM is
+            # most stressed, so before-merge admission must not be skipped).
             return _InlineFuseStream(
-                self._engine, prompt, max_tokens, temperature, stop_tokens, chunk_size
+                self._engine, prompt, max_tokens, temperature, stop_tokens, chunk_size,
+                top_k=top_k, top_p=top_p, alpha_presence=alpha_presence,
+                alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
+                use_prefix_cache=use_prefix_cache, prefix_cache_manager=prefix_cache_manager,
             )
         loop = asyncio.get_running_loop()
         job = _ChatJob(
             self._next_request_id, prompt, max_tokens, temperature, stop_tokens,
             chunk_size, top_k, top_p, alpha_presence, alpha_frequency,
-            alpha_decay, use_prefix_cache, loop,
+            alpha_decay, use_prefix_cache, prefix_cache_manager, loop,
         )
         self._next_request_id += 1
         self._pending.append(job)
@@ -621,7 +684,12 @@ class ChatFuseAggregator:
         self._wake.set()
 
     async def _run_solo(self, job):
-        """Run one job through the ORIGINAL single_infer_stream path (solo)."""
+        """Run one job through the ORIGINAL single_infer_stream path (solo).
+
+        Forward the job's OWN sampler controls (top_k/top_p/alpha_*) and, when it
+        asked for it, its prefix_cache_manager, so an unfused (head-fire, or
+        non-homogeneous / non-fusable) request is byte-identical to fuse=OFF for
+        the SAME request. Owns a bsz=1 prefill-admission permit (HIGH-1)."""
         permit = None
         try:
             permit = await self._engine.acquire_prefill_permit(
@@ -631,8 +699,14 @@ class ChatFuseAggregator:
                 prompt=job.prompt,
                 max_length=job.max_tokens,
                 temperature=job.temperature,
+                top_k=job.top_k,
+                top_p=job.top_p,
+                alpha_presence=job.alpha_presence,
+                alpha_frequency=job.alpha_frequency,
+                alpha_decay=job.alpha_decay,
                 stop_tokens=job.stop_tokens,
                 chunk_size=job.chunk_size,
+                prefix_cache_manager=job.prefix_cache_manager,
             )
             try:
                 async for chunk in stream:

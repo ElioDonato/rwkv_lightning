@@ -383,6 +383,19 @@ async def openai_chat_completions(request: Request):
         # unchanged (byte-identical).
         fuse = getattr(request.app.state, "chat_fuse_aggregator", None)
         if fuse is not None and fuse.enabled:
+            # Fusion-eligibility for prefix caching (CR1 HIGH-2): fuse=OFF (and
+            # req.use_prefix_cache above) defaults use_prefix_cache=True, which
+            # would make EVERY default chat request non-fusable (the fused path
+            # has no prefix-cache wiring) and the combine-queue would never
+            # engage. Under the fuse flag the DEFAULT workload (body omits
+            # use_prefix_cache) is opted INTO fusion -- no prefix caching, so a
+            # homogeneous default request is fusable -- while an EXPLICIT
+            # use_prefix_cache=True keeps its exact per-request prefix cache and
+            # is served by the aggregator's faithful SOLO path (matching
+            # fuse=OFF). Prefix caching per se is served by the solo path, not
+            # the fused path.
+            fuse_prefix_cache = body.get("use_prefix_cache", False)
+            fuse_prefix_cache_manager = get_state_manager() if fuse_prefix_cache else None
             cancel_token = CancellationToken()
             fuse_stream = await fuse.submit(
                 prompt_formatted,
@@ -395,7 +408,8 @@ async def openai_chat_completions(request: Request):
                 alpha_presence=req.alpha_presence,
                 alpha_frequency=req.alpha_frequency,
                 alpha_decay=req.alpha_decay,
-                use_prefix_cache=req.use_prefix_cache,
+                use_prefix_cache=fuse_prefix_cache,
+                prefix_cache_manager=fuse_prefix_cache_manager,
             )
             if req.stream:
                 stream = _relay_openai_stream(
