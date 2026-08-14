@@ -222,7 +222,9 @@ class BatchInferenceMixin:
         state = None
         try:
             batch_size = len(prompts)
-            state, out = self._batch_prefill(prompts, prefix_cache_manager, cancel_token)
+            state, out = await self._offload_gpu(
+                self._batch_prefill, prompts, prefix_cache_manager, cancel_token
+            )
 
             torch = inference_deps.get_torch()
             finish_reasons = [None] * batch_size
@@ -234,9 +236,18 @@ class BatchInferenceMixin:
             while active_indices and max_length > 0:
                 self._raise_if_cancelled(cancel_token)
                 n_active = len(active_indices)
-                new_tokens_tensor = sampler.sample(out)
-                out = self.model.forward_batch(new_tokens_tensor, state).float()
-                new_tokens = new_tokens_tensor.tolist()
+
+                # One full GPU decode step (sample -> forward_batch -> .tolist())
+                # as a single unit on the GPU-worker thread under the opt-in, so
+                # the event-loop thread never issues its own CUDA call while the
+                # worker has a forward in flight (single-thread-CUDA guarantee).
+                def _gpu_decode_step():
+                    new_tokens_tensor = sampler.sample(out)
+                    new_out = self.model.forward_batch(new_tokens_tensor, state).float()
+                    new_tokens = new_tokens_tensor.tolist()
+                    return new_out, new_tokens
+
+                out, new_tokens = await self._offload_gpu(_gpu_decode_step)
                 max_length -= 1
 
                 contents_to_send = {}
@@ -280,12 +291,14 @@ class BatchInferenceMixin:
                 if newly_finished_positions:
                     still_active = [p for p in range(n_active) if p not in set(newly_finished_positions)]
                     if still_active:
-                        idx_t = torch.tensor(still_active, device=out.device, dtype=torch.long)
-                        out = out[idx_t]
-                        sampler.compact(idx_t)
-                        state[0] = state[0][:, :, idx_t]
-                        state[1] = state[1][:, idx_t]
-                        state[2] = state[2][idx_t]
+                        def _gpu_compact():
+                            idx_t = torch.tensor(still_active, device=out.device, dtype=torch.long)
+                            new_out = out[idx_t]
+                            sampler.compact(idx_t)
+                            new_state = [state[0][:, :, idx_t], state[1][:, idx_t], state[2][idx_t]]
+                            return new_out, new_state
+
+                        out, state = await self._offload_gpu(_gpu_compact)
                         active_indices = [active_indices[p] for p in still_active]
                     else:
                         active_indices = []
@@ -512,7 +525,9 @@ class BatchInferenceMixin:
 
         try:
             tokens = encoded_prompts[0]
-            out = self._forward_tokens_chunked(tokens, state, cancel_token=cancel_token)
+            out = await self._offload_gpu(
+                self._forward_tokens_chunked, tokens, state, cancel_token=cancel_token
+            )
             sample_rand_states = inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1)
             penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
 
@@ -526,17 +541,20 @@ class BatchInferenceMixin:
                 if out.dim() == 1:
                     out = out.unsqueeze(0)
 
-                new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                    out,
-                    penalties,
-                    sample_rand_states,
-                    alpha_presence,
-                    alpha_frequency,
-                    alpha_decay,
-                    temperature,
-                    top_k,
-                    top_p,
-                ).tolist()
+                def _gpu_sample():
+                    return inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                        out,
+                        penalties,
+                        sample_rand_states,
+                        alpha_presence,
+                        alpha_frequency,
+                        alpha_decay,
+                        temperature,
+                        top_k,
+                        top_p,
+                    ).tolist()
+
+                new_tokens = await self._offload_gpu(_gpu_sample)
 
                 tok = new_tokens[0]
 
@@ -567,7 +585,9 @@ class BatchInferenceMixin:
                     text_buffer = ""
                     buffered_tokens = 0
 
-                out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
+                out = await self._offload_gpu(
+                    self._forward_tokens_chunked, [tok], state, cancel_token=cancel_token
+                )
 
                 await asyncio.sleep(0)
 
@@ -617,7 +637,8 @@ class BatchInferenceMixin:
         state = None
 
         try:
-            _, state, out, _, _ = self._prefill_prompt_with_prefix_cache(
+            _, state, out, _, _ = await self._offload_gpu(
+                self._prefill_prompt_with_prefix_cache,
                 prompt,
                 prefix_cache_manager=prefix_cache_manager,
                 cancel_token=cancel_token,
@@ -629,17 +650,21 @@ class BatchInferenceMixin:
                 self._raise_if_cancelled(cancel_token)
                 max_length -= 1
                 logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
-                new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                    logits_reshaped,
-                    penalties,
-                    sample_rand_states,
-                    alpha_presence,
-                    alpha_frequency,
-                    alpha_decay,
-                    temperature,
-                    top_k,
-                    top_p,
-                ).tolist()
+
+                def _gpu_sample():
+                    return inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                        logits_reshaped,
+                        penalties,
+                        sample_rand_states,
+                        alpha_presence,
+                        alpha_frequency,
+                        alpha_decay,
+                        temperature,
+                        top_k,
+                        top_p,
+                    ).tolist()
+
+                new_tokens = await self._offload_gpu(_gpu_sample)
 
                 tok = new_tokens[0]
                 content, should_stop = self._ingest_token_with_stop(stop_state, tok)
@@ -650,7 +675,9 @@ class BatchInferenceMixin:
                     finish_reason = "stop"
                     break
 
-                out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
+                out = await self._offload_gpu(
+                    self._forward_tokens_chunked, [tok], state, cancel_token=cancel_token
+                )
                 await asyncio.sleep(0)
 
             generated_text += self._flush_stop_state(stop_state, final=True)
@@ -680,7 +707,8 @@ class BatchInferenceMixin:
         state = None
 
         try:
-            _, state, out, _, _ = self._prefill_prompt_with_prefix_cache(
+            _, state, out, _, _ = await self._offload_gpu(
+                self._prefill_prompt_with_prefix_cache,
                 prompt,
                 prefix_cache_manager=prefix_cache_manager,
                 cancel_token=cancel_token,
@@ -695,17 +723,21 @@ class BatchInferenceMixin:
                 self._raise_if_cancelled(cancel_token)
                 max_length -= 1
                 logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
-                new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                    logits_reshaped,
-                    penalties,
-                    sample_rand_states,
-                    alpha_presence,
-                    alpha_frequency,
-                    alpha_decay,
-                    temperature,
-                    top_k,
-                    top_p,
-                ).tolist()
+
+                def _gpu_sample():
+                    return inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                        logits_reshaped,
+                        penalties,
+                        sample_rand_states,
+                        alpha_presence,
+                        alpha_frequency,
+                        alpha_decay,
+                        temperature,
+                        top_k,
+                        top_p,
+                    ).tolist()
+
+                new_tokens = await self._offload_gpu(_gpu_sample)
 
                 tok = new_tokens[0]
                 content, should_stop = self._ingest_token_with_stop(stop_state, tok)
@@ -736,7 +768,9 @@ class BatchInferenceMixin:
                     text_buffer = ""
                     buffered_tokens = 0
 
-                out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
+                out = await self._offload_gpu(
+                    self._forward_tokens_chunked, [tok], state, cancel_token=cancel_token
+                )
                 await asyncio.sleep(0)
 
             flushed = self._flush_stop_state(stop_state, final=True)
