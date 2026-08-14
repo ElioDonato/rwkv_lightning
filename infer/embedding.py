@@ -58,6 +58,16 @@ from infer.rwkv_batch.rwkv7 import (
     RWKV_x070_TMix_seq_batch,
 )
 
+# Hard ceiling (texts) applied to a sub-batch when the model carries no
+# max_prefill_bsz cap (attribute absent or <= 0). Mirrors
+# infer.embed_aggregator's _HARD_CEILING_DEFAULT so the two never diverge; it is
+# duplicated (not imported) because embed_aggregator already imports
+# embed_texts from this module, so importing back would be a circular import.
+# Without a cap, "no cap / 0 cap" must never mean "whole request in one batch"
+# (a lone oversized request could otherwise spike VRAM on a GPU co-resident
+# with live :8081 chat) -- cap each sub-batch here instead.
+_HARD_CEILING_DEFAULT = 64
+
 
 def _embed_single(model, z, tokens, device):
     """Return the pre-``ln_out`` final-token hidden state ``[n_embd]`` for one
@@ -255,7 +265,9 @@ def embed_texts(model, tokenizer, texts, normalize=True, device="cuda"):
         # remainder sub-batch of size 1) instead takes the exact pre-MOD
         # single-sequence loop for a byte-identical result. Divide the request
         # into sub-batches first so every unit runs through the same finalize.
-        max_bsz = max(1, int(getattr(model, "max_prefill_bsz", 0) or len(non_empty)))
+        max_bsz = max(
+            1, int(getattr(model, "max_prefill_bsz", 0) or _HARD_CEILING_DEFAULT)
+        )
         sub_batches = [non_empty[i:i + max_bsz] for i in range(0, len(non_empty), max_bsz)]
 
         for sub in sub_batches:
