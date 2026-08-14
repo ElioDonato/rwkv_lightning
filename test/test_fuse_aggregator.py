@@ -283,6 +283,87 @@ async def test_homogeneity_gate_stop_tokens_mismatch_never_fuses():
 
 
 # ---------------------------------------------------------------------------
+# (d2) Sampler-divergence gate (CR1/CR2 item 1): a job carrying a NON-default
+# top_k/top_p/alpha or use_prefix_cache=True is marked not-fusable and NEVER
+# shares a fused batch; it runs solo (the request's sampler controls are then
+# ignored per the documented contract, but it no longer silently fuses with
+# rows whose top_* differ).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_homogeneity_gate_top_p_mismatch_never_fuses():
+    engine = _FakeEngine()
+    agg = ChatFuseAggregator(engine, enabled=True, window_ms=0, max_bsz=8)
+    agg.start()
+
+    s1 = await agg.submit("a", 32, 1.0, ["\nUser:"], 2)  # default top_p=0.6
+    s2 = await agg.submit("b", 32, 1.0, ["\nUser:"], 2, top_p=0.9)  # non-default
+
+    await _drain(s1)
+    await _drain(s2)
+
+    # The non-default top_p job must NOT fuse into a shared batch; both run solo.
+    assert engine.batch_calls == [], "a top_p-mismatch pair must never share a batch"
+    assert len(engine.solo_calls) == 2
+    await agg.stop()
+
+
+@pytest.mark.anyio
+async def test_homogeneity_gate_top_k_non_default_never_fuses():
+    engine = _FakeEngine()
+    agg = ChatFuseAggregator(engine, enabled=True, window_ms=0, max_bsz=8)
+    agg.start()
+
+    s1 = await agg.submit("a", 32, 1.0, ["\nUser:"], 2, top_k=1)  # non-default top_k
+    s2 = await agg.submit("b", 32, 1.0, ["\nUser:"], 2)
+
+    await _drain(s1)
+    await _drain(s2)
+
+    assert engine.batch_calls == [], "non-default top_k must never share a batch"
+    assert len(engine.solo_calls) == 2
+    await agg.stop()
+
+
+@pytest.mark.anyio
+async def test_homogeneity_gate_alpha_non_default_never_fuses():
+    engine = _FakeEngine()
+    agg = ChatFuseAggregator(engine, enabled=True, window_ms=0, max_bsz=8)
+    agg.start()
+
+    # Non-default repetition-penalty control (alpha_presence).
+    s1 = await agg.submit("a", 32, 1.0, ["\nUser:"], 2, alpha_presence=1.5)
+    s2 = await agg.submit("b", 32, 1.0, ["\nUser:"], 2)
+
+    await _drain(s1)
+    await _drain(s2)
+
+    assert engine.batch_calls == [], "non-default alpha must never share a batch"
+    assert len(engine.solo_calls) == 2
+    await agg.stop()
+
+
+@pytest.mark.anyio
+async def test_use_prefix_cache_job_excluded_from_fusion():
+    engine = _FakeEngine()
+    agg = ChatFuseAggregator(engine, enabled=True, window_ms=0, max_bsz=8)
+    agg.start()
+
+    s1 = await agg.submit("a", 32, 1.0, ["\nUser:"], 2)
+    # use_prefix_cache=True: the fused path has no prefix-cache wiring, so the
+    # job is excluded from fusion entirely (runs solo).
+    s2 = await agg.submit("b", 32, 1.0, ["\nUser:"], 2, use_prefix_cache=True)
+
+    await _drain(s1)
+    await _drain(s2)
+
+    assert engine.batch_calls == [], \
+        "use_prefix_cache=True must exclude a job from fusion entirely"
+    assert len(engine.solo_calls) == 2
+    await agg.stop()
+
+
+# ---------------------------------------------------------------------------
 # (e) VRAM cap: a burst larger than the hard cap splits into <= cap batches.
 # ---------------------------------------------------------------------------
 
@@ -384,10 +465,12 @@ async def test_abandon_resolves_queued_and_inflight_jobs():
     loop = asyncio.get_running_loop()
 
     queued = [
-        fuse_mod._ChatJob(i, f"q{i}", 32, 1.0, ("\nUser:",), 2, loop) for i in range(2)
+        fuse_mod._ChatJob(i, f"q{i}", 32, 1.0, ("\nUser:",), 2,
+                          20, 0.6, 1.0, 0.1, 0.996, False, loop) for i in range(2)
     ]
     inflight = [
-        fuse_mod._ChatJob(10 + i, f"f{i}", 32, 1.0, ("\nUser:",), 2, loop) for i in range(2)
+        fuse_mod._ChatJob(10 + i, f"f{i}", 32, 1.0, ("\nUser:",), 2,
+                          20, 0.6, 1.0, 0.1, 0.996, False, loop) for i in range(2)
     ]
     agg._pending.extend(queued)
     agg._inflight_batch = inflight
@@ -408,6 +491,45 @@ async def test_abandon_resolves_queued_and_inflight_jobs():
 
     assert agg.pending_count == 0
     assert agg._inflight_batch is None
+
+
+# ---------------------------------------------------------------------------
+# (i) Pending-deque overload bound (CR1 item 3): a burst beyond the pending cap
+# is REJECTED (served inline solo through single_infer_stream) rather than
+# buffered unboundedly -- the caller falls back to the solo path.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_pending_cap_rejects_burst_instead_of_buffering():
+    engine = _FakeEngine()
+    # pending_cap=2: the first two concurrent submits fill the deque; the third
+    # arrives at capacity and is rejected (inline solo), never queued forever.
+    agg = ChatFuseAggregator(engine, enabled=True, window_ms=0, max_bsz=8,
+                             pending_cap=2)
+    agg.start()
+
+    # All three submits are synchronous (no await between them), so the
+    # scheduler -- awaiting _wake.wait() -- has not run yet and _pending holds
+    # exactly the two queued jobs when the third arrives.
+    s1 = await agg.submit("a", 32, 1.0, ["\nUser:"], 2)
+    s2 = await agg.submit("b", 32, 1.0, ["\nUser:"], 2)
+    s3 = await agg.submit("c", 32, 1.0, ["\nUser:"], 2)
+
+    # Third request rejected: inline solo proxy, not a queued fuse job.
+    assert isinstance(s3, fuse_mod._InlineFuseStream), \
+        "at pending-capacity a submit must be rejected to the inline solo path"
+    assert agg.pending_count == 2, "pending deque must never exceed the cap"
+
+    out1 = await _drain(s1)
+    out2 = await _drain(s2)
+    out3 = await _drain(s3)
+
+    # The two queued homogeneous jobs fused into ONE shared batch; the rejected
+    # request ran solo via single_infer_stream. Nothing was queued forever.
+    assert engine.batch_calls == [(["a", "b"], 32, 1.0, ("\nUser:",))]
+    assert any("[c:solo]" in c for c in out3), "rejected request served solo"
+    assert agg.pending_count == 0
+    await agg.stop()
 
 
 if __name__ == "__main__":

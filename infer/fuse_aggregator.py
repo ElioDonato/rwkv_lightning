@@ -50,17 +50,37 @@ Design
   same tokens it would get from big_batch_stream run alone. SSE split-back keeps
   per-row stop / finish_reason semantics.
 
-Sampler note (IMPORTANT for reviewers): solo requests ride ``single_infer_stream``
-which uses the repetition-penalty / top_k / top_p sampler
-(``batch_sampling_repetition_temperature_topk_topp``) -- byte-identical to today.
-FUSED batches ride ``big_batch_stream`` which uses ``sampler_gumbel_batch``
-(temp-only gumbel, no penalties / top_k / top_p). So a request's output is NOT
-identical depending on whether it was solo or fused when the feature is ON: fused
-output matches the established /big_batch/completions semantics, not the solo
-chat semantics. This is inherent to re-using big_batch_stream as mandated; it is
-flagged as a residual risk for CR1/CR2 (the deletion/extraction workload shares a
-template + stop_tokens, so its rows are homogeneous and the gumbel-with-temp
-sampling is acceptable).
+FULL SAMPLING / PREFIX CONTRACT (read before enabling):
+======================================================
+**fuse=ON may produce different output than fuse=OFF.** The fused path rides
+``big_batch_stream`` which samples with ``sampler_gumbel_batch`` (TEMPERATURE-ONLY
+gumbel; no repetition-penalty / top_k / top_p). Under the enabled flag the
+sampler-control values -- ``top_k`` / ``top_p`` / ``alpha_presence`` /
+``alpha_frequency`` / ``alpha_decay`` (and hence the repetition penalty they
+drive) -- are IGNORED for EVERY fused chat request, INCLUDING a solo head-fire
+under the enabled flag (``_run_solo`` forwards only temperature/max_length/
+stop_tokens to ``single_infer_stream``, not the sampler controls). Requests whose
+top_k/top_p/alpha are non-DEFAULT are refused from any SHARED batch (the
+homogeneity gate, ``_homogeneous``, marks them not-fusable so they never fuse
+with rows whose top_* differ), but they still run solo through the aggregator's
+temp-only path and so still ignore their sampler controls as long as fuse is ON.
+
+**Prefix caching is disabled while fuse is on**: the fused route never builds a
+``prefix_cache_manager``, and any job with ``use_prefix_cache=True`` is
+excluded from fusion entirely (``_homogeneous``). A request that needs exact
+per-request prefix caching or exact sampler behavior must keep ``RWKV_FUSE_CHAT_BATCH``
+OFF (the default).
+
+**Fusion requires sustained concurrent arrivals** (>decode-duration
+inter-arrival): a request arriving at an EMPTY queue head-fires solo and sees
+no fusion latency; only when >=2 homogeneous jobs are pending at a drain point
+does the scheduler open the ``RWKV_FUSE_CHAT_WINDOW_MS`` gather window. A
+low-traffic endpoint therefore gets little occupancy benefit and only the
+(temperature-only) sampler divergence above. For the deletion/extraction
+workload -- which shares an identical prompt template + temperature + stop_tokens
+and accepts gumbel-with-temp sampling -- this trade is acceptable; a service
+that must preserve per-request top_k/top_p/penalty sampling byte-for-byte must
+not enable the flag.
 
 Default-OFF
 -----------
@@ -96,6 +116,29 @@ _MAX_BSZ_ENV = "RWKV_FUSE_CHAT_MAX_BSZ"
 # chats is already a large occupancy gain over bsz=1 while bounding the VRAM
 # spike of one fused batch against a co-resident :8083.
 _MAX_BSZ_DEFAULT = 8
+
+# Sampler controls the fused big_batch_stream path IGNORES (gumbel temp-only):
+# top_k / top_p / alpha_presence / alpha_frequency / alpha_decay. These are the
+# exact defaults the /openai/v1/chat/completions route applies when the request
+# body omits them (build_internal_chat_request). A job carrying any NON-default
+# on these is marked not-fusable so it never shares a batch (never silently
+# drops a user's distinct sampler setting into ONE shared temp-only decode);
+# see the FULL SAMPLING / PREFIX CONTRACT in the module docstring.
+_FUSE_TOP_K_DEFAULT = 20
+_FUSE_TOP_P_DEFAULT = 0.6
+_FUSE_ALPHA_PRESENCE_DEFAULT = 1.0
+_FUSE_ALPHA_FREQUENCY_DEFAULT = 0.1
+_FUSE_ALPHA_DECAY_DEFAULT = 0.996
+
+_PENDING_CAP_ENV = "RWKV_FUSE_CHAT_PENDING_CAP"
+# Upper bound on the FIFO pending deque. The scheduler drains it every few ms
+# during normal operation (it only ever holds jobs not yet admitted to a batch),
+# so this cap ONLY trips on overload: arrivals landing faster than the
+# decoder's slowest batch takes to drain under a burst. At capacity a new
+# submit is REJECTED (served inline solo through single_infer_stream) rather
+# than buffered unboundedly -- the caller falls back to the solo path, exactly
+# the graceful-degrade the embed aggregator's hard-ceiling cap provides.
+_PENDING_CAP_DEFAULT = 64
 
 # Job-queue terminal sentinel (asyncio.Queue can't hold a bare None that
 # collides with real data, so use a unique object).
@@ -142,6 +185,20 @@ def _max_bsz_value(max_bsz=None) -> int:
     return max(1, cap)
 
 
+def _pending_cap_value(pending_cap=None) -> int:
+    """Pending-deque upper bound (reject-buffering capacity). Explicit override
+    wins over env; always int>=1 so the queue is never unbounded."""
+    if pending_cap is not None:
+        return max(1, int(pending_cap))
+    raw = os.environ.get(_PENDING_CAP_ENV, str(_PENDING_CAP_DEFAULT))
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        logger.warning(f"[ChatFuse] invalid {_PENDING_CAP_ENV}={raw!r}, "
+                       f"using {_PENDING_CAP_DEFAULT}")
+        return _PENDING_CAP_DEFAULT
+
+
 class _ChatJob:
     """One admitted chat request in the combine queue. ``queue`` receives SSE
     chunk strings (single_infer_stream-format: index-0 choices, ``data: ...``
@@ -150,17 +207,42 @@ class _ChatJob:
     exactly-once ``_END`` push."""
 
     __slots__ = ("request_id", "prompt", "max_tokens", "temperature",
-                 "stop_tokens", "chunk_size", "queue", "cancelled", "ended",
-                 "future")
+                 "stop_tokens", "chunk_size", "top_k", "top_p", "alpha_presence",
+                 "alpha_frequency", "alpha_decay", "use_prefix_cache", "fusable",
+                 "queue", "cancelled", "ended", "future")
 
     def __init__(self, request_id, prompt, max_tokens, temperature,
-                 stop_tokens, chunk_size, loop):
+                 stop_tokens, chunk_size, top_k, top_p, alpha_presence,
+                 alpha_frequency, alpha_decay, use_prefix_cache, loop):
         self.request_id = request_id
         self.prompt = prompt
         self.max_tokens = max_tokens
         self.temperature = temperature
-        self.stop_tokens = tuple(stop_tokens)
+        # stop_tokens may be None (a request body can pass `stop_tokens: null`);
+        # convert safely to an empty tuple so neither _homogeneous's
+        # ``tuple(a.stop_tokens)`` nor the engine's _create_stop_state ever see
+        # ``tuple(None)``.
+        self.stop_tokens = tuple(stop_tokens) if stop_tokens else ()
         self.chunk_size = chunk_size
+        self.top_k = top_k
+        self.top_p = top_p
+        self.alpha_presence = alpha_presence
+        self.alpha_frequency = alpha_frequency
+        self.alpha_decay = alpha_decay
+        self.use_prefix_cache = use_prefix_cache
+        # A job may only share a fused big_batch_stream batch when its sampler
+        # controls are ALL default AND it does not need prefix caching -- the
+        # fused path ignores top_k/top_p/alpha (gumbel temp-only) and has no
+        # prefix-cache wiring. Non-fusable jobs never fuse with any sibling
+        # (they run solo through _run_solo / the temp-only head-fire path).
+        self.fusable = (
+            not use_prefix_cache
+            and top_k == _FUSE_TOP_K_DEFAULT
+            and top_p == _FUSE_TOP_P_DEFAULT
+            and alpha_presence == _FUSE_ALPHA_PRESENCE_DEFAULT
+            and alpha_frequency == _FUSE_ALPHA_FREQUENCY_DEFAULT
+            and alpha_decay == _FUSE_ALPHA_DECAY_DEFAULT
+        )
         self.queue = asyncio.Queue()
         self.cancelled = False
         self.ended = False
@@ -265,7 +347,8 @@ class ChatFuseAggregator:
     as if run separately.
     """
 
-    def __init__(self, engine, *, enabled=None, window_ms=None, max_bsz=None):
+    def __init__(self, engine, *, enabled=None, window_ms=None, max_bsz=None,
+                 pending_cap=None):
         self._engine = engine
         # enabled=None resolves from env at construction so tests pin the mode
         # deterministically regardless of environment.
@@ -273,12 +356,16 @@ class ChatFuseAggregator:
         self._window = _window_seconds(window_ms)
         # max_bsz=hard fused-row cap; None resolves from env/default.
         self._max_bsz = max_bsz
+        # pending_cap=overload bound on the pending deque (reject-buffering);
+        # None resolves from env/default.
+        self._pending_cap_override = pending_cap
         self._pending = deque()  # of _ChatJob, FIFO admission order
         self._wake = asyncio.Event()
         self._task = None
         self._inflight_batch = None
         self._next_request_id = 0
         self._dead_warned = False
+        self._gumbel_warned = False
 
     # -- properties ---------------------------------------------------------
 
@@ -299,6 +386,18 @@ class ChatFuseAggregator:
     def start(self):
         if not self._enabled or self._task is not None:
             return
+        if not self._gumbel_warned:
+            # ONE-TIME loud warning that the enabled flag switches the chat
+            # sampler to big_batch_stream's gumbel TEMPERATURE-only path for
+            # every request routed through the aggregator (including solo
+            # head-fire). See the FULL SAMPLING / PREFIX CONTRACT docstring.
+            self._gumbel_warned = True
+            logger.warning(
+                "[ChatFuse] RWKV_FUSE_CHAT_BATCH enabled: gumbel temperature "
+                "sampling is now in effect -- top_k/top_p/alpha/repetition-penalty "
+                "and prefix caching are IGNORED for fused chat requests (incl. "
+                "solo head-fire); fuse=ON may differ from fuse=OFF output."
+            )
         self._task = asyncio.create_task(self._run_scheduler())
 
     async def stop(self):
@@ -321,13 +420,33 @@ class ChatFuseAggregator:
 
     # -- request-facing API -------------------------------------------------
 
-    async def submit(self, prompt, max_tokens, temperature, stop_tokens, chunk_size):
+    async def submit(self, prompt, max_tokens, temperature, stop_tokens, chunk_size,
+                     top_k=_FUSE_TOP_K_DEFAULT,
+                     top_p=_FUSE_TOP_P_DEFAULT,
+                     alpha_presence=_FUSE_ALPHA_PRESENCE_DEFAULT,
+                     alpha_frequency=_FUSE_ALPHA_FREQUENCY_DEFAULT,
+                     alpha_decay=_FUSE_ALPHA_DECAY_DEFAULT,
+                     use_prefix_cache=False):
         """Enqueue a chat request and return a fuse stream (async-iterable of SSE
         chunk strings; ``cancel()`` marks the request's row dropped).
 
         Disabled (default): returns an inline ``single_infer_stream`` proxy --
         byte-identical output and latency to the pre-feature path. Enabled:
         enqueues the request; the scheduler runs it solo (head-fire) or fused.
+
+        ``top_k``/``top_p``/``alpha_*``/``use_prefix_cache`` are carried on the
+        job only to drive the fusion-eligibility gate: any NON-default sampler
+        control, or ``use_prefix_cache=True``, marks the job NOT fusable (it
+        never shares a fused batch). Under the enabled flag this request still
+        runs solo through the temp-only head-fire/_run_solo path, so its
+        sampler controls / prefix caching remain IGNORED while fuse is ON (see
+        the FULL SAMPLING / PREFIX CONTRACT docstring).
+
+        When the pending deque is at capacity (``RWKV_FUSE_CHAT_PENDING_CAP``,
+        default 64) a new submit is REJECTED: instead of buffering unboundedly
+        under a burst it returns an inline solo ``single_infer_stream`` proxy,
+        so the caller's request is served immediately by the original solo path
+        (graceful degrade, mirroring the embed aggregator's hard ceiling).
         """
         if not self._enabled:
             return _InlineFuseStream(
@@ -348,10 +467,18 @@ class ChatFuseAggregator:
                     "it before serving request -- batching restored. If this recurs, "
                     "a prior scheduler crash was the cause."
                 )
+        if len(self._pending) >= self._pending_cap():
+            # Overload bound: reject buffering this request -- serve it inline
+            # solo through the original single_infer_stream path instead of
+            # growing the pending deque without limit.
+            return _InlineFuseStream(
+                self._engine, prompt, max_tokens, temperature, stop_tokens, chunk_size
+            )
         loop = asyncio.get_running_loop()
         job = _ChatJob(
             self._next_request_id, prompt, max_tokens, temperature, stop_tokens,
-            chunk_size, loop,
+            chunk_size, top_k, top_p, alpha_presence, alpha_frequency,
+            alpha_decay, use_prefix_cache, loop,
         )
         self._next_request_id += 1
         self._pending.append(job)
@@ -375,10 +502,23 @@ class ChatFuseAggregator:
         the model's absolute prefill limit -- used to split an oversized burst."""
         return self._cap()
 
+    def _pending_cap(self):
+        """Upper bound on the pending deque (reject-buffering capacity). Always
+        int>=1 so _pending is never unbounded under an arrival burst."""
+        return _pending_cap_value(self._pending_cap_override)
+
     @staticmethod
     def _homogeneous(a, b):
+        # Addition for CR1/CR2: a job that carries a NON-default sampler control
+        # (top_k/top_p/alpha_*) or needs prefix caching is marked not-fusable in
+        # _ChatJob. Never fuse such a job with any sibling -- the fused
+        # big_batch_stream path applies ONE temp-only sampler to the whole batch,
+        # so fusing rows with differing top_* would silently drop each request's
+        # own setting (and its prefix-cache wiring does not exist on this path).
         return (
-            a.max_tokens == b.max_tokens
+            a.fusable
+            and b.fusable
+            and a.max_tokens == b.max_tokens
             and a.temperature == b.temperature
             and tuple(a.stop_tokens) == tuple(b.stop_tokens)
         )

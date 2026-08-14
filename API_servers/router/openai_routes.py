@@ -390,6 +390,12 @@ async def openai_chat_completions(request: Request):
                 req.temperature,
                 req.stop_tokens,
                 req.chunk_size,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                alpha_presence=req.alpha_presence,
+                alpha_frequency=req.alpha_frequency,
+                alpha_decay=req.alpha_decay,
+                use_prefix_cache=req.use_prefix_cache,
             )
             if req.stream:
                 stream = _relay_openai_stream(
