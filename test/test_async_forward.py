@@ -477,5 +477,144 @@ def test_batch_infer_stream_sampler_init_and_decode_no_grad():
         )
 
 
+# ---------------------------------------------------------------------------
+# Item 2: single_infer / single_infer_stream fold sample+forward into ONE
+# merged _gpu_decode_step that feeds the sampled GPU TENSOR straight into
+# forward_batch (no .tolist() -> forward_one two-step). Hermetic: CPU fake model
+# whose forward_batch records whether it received a tensor, plus a fake sampler
+# in the module's sample namespace (real setup_rand needs a CUDA device).
+# ---------------------------------------------------------------------------
+
+class _SingleInferModel(_FakeModel):
+    """FakeModel extension: forward_batch additionally records whether the merged
+    decode step passed a GPU TENSOR (the item-2 fast path) rather than a
+    reconstructed list. generate_zero_state mirrors the real model's bsz=0
+    (scalar, no batch dim) vs bsz>=1 (batch dim) shapes so single_infer's
+    bsz=0 -> bsz=1 reshape is the realistic one."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.decode_tensor_inputs = []
+
+    def generate_zero_state(self, bsz):
+        if bsz >= 1:
+            return [
+                torch.zeros(1, 2, bsz),
+                torch.zeros(1, bsz, 1, 1, 1),
+                torch.zeros(bsz, dtype=torch.int32),
+            ]
+        return [
+            torch.zeros(1, 2),
+            torch.zeros(1, 1, 1, 1),
+            torch.zeros((), dtype=torch.int32),
+        ]
+
+    def forward_batch(self, tokens, state, full_output=False):
+        self.decode_tensor_inputs.append(isinstance(tokens, torch.Tensor))
+        self.forward_threads.append(threading.get_ident())
+        bsz = tokens.shape[0] if isinstance(tokens, torch.Tensor) else len(tokens)
+        return torch.zeros(bsz, self.vocab)
+
+
+def test_single_infer_merged_decode_feeds_tensor_to_forward_batch(monkeypatch):
+    """Item 2: single_infer's decode loop must run ONE merged sample+forward step
+    per token -- the sampled GPU TENSOR fed straight into forward_batch (same
+    fast path big_batch/_batch_decode_streaming use) -- NOT the old two-step
+    (.tolist() then forward_one). Proves one forward_batch per token, each
+    receiving a tensor, terminating on max_length in BOTH modes."""
+    import infer.rwkv_batch.sampler as sampler_mod
+
+    def _setup_rand(seed, batch_size):
+        return torch.zeros(batch_size, dtype=torch.long)
+
+    def _sample(logits, penalties, rand_states, ap, af, ad, temp, top_k, top_p):
+        return torch.tensor([3])  # fixed non-stop token (tokenizer.decode -> "")
+
+    monkeypatch.setattr(sampler_mod.sample, "setup_rand", _setup_rand)
+    monkeypatch.setattr(
+        sampler_mod.sample, "batch_sampling_repetition_temperature_topk_topp", _sample
+    )
+
+    for enabled in (False, True):
+        model = _SingleInferModel()
+        engine = InferenceEngine(
+            model=model, tokenizer=_FakeTokenizer(), args=None, rocm_flag=False
+        )
+        engine._gpu_executor = GpuAsyncExecutor(enabled=enabled)
+        caller = threading.get_ident()
+
+        async def _run():
+            return await engine.single_infer(
+                prompt="hello", max_length=3,
+                temperature=1.0, top_k=5, top_p=0.6,
+                alpha_presence=0.0, alpha_frequency=0.0, alpha_decay=1.0,
+            )
+
+        text, reason = asyncio.run(_run())
+
+        assert reason == "length"
+        assert len(model.decode_tensor_inputs) == 3 == len(model.forward_threads), (
+            "one merged decode step (one forward_batch) per token"
+        )
+        assert all(model.decode_tensor_inputs), (
+            "each decode step must feed the sampled TENSOR to forward_batch"
+        )
+        assert model.forward_threads, "decode must have run forward_batch"
+        if enabled:
+            assert all(t != caller for t in model.forward_threads), \
+                "opt-in: merged decode forward must run on the worker thread"
+            engine.shutdown()
+        else:
+            assert all(t == caller for t in model.forward_threads), \
+                "default-off: merged decode forward stays on the calling thread"
+
+
+def test_single_infer_stream_merged_decode_feeds_tensor_to_forward_batch(monkeypatch):
+    """Item 2 (streaming variant): single_infer_stream runs the same merged
+    sample+forward decode step per token and terminates on max_length with the
+    length finish chunk + [DONE], in both modes."""
+    import infer.rwkv_batch.sampler as sampler_mod
+
+    def _setup_rand(seed, batch_size):
+        return torch.zeros(batch_size, dtype=torch.long)
+
+    def _sample(logits, penalties, rand_states, ap, af, ad, temp, top_k, top_p):
+        return torch.tensor([3])
+
+    monkeypatch.setattr(sampler_mod.sample, "setup_rand", _setup_rand)
+    monkeypatch.setattr(
+        sampler_mod.sample, "batch_sampling_repetition_temperature_topk_topp", _sample
+    )
+
+    for enabled in (False, True):
+        model = _SingleInferModel()
+        engine = InferenceEngine(
+            model=model, tokenizer=_FakeTokenizer(), args=None, rocm_flag=False
+        )
+        engine._gpu_executor = GpuAsyncExecutor(enabled=enabled)
+
+        async def _run_stream():
+            chunks = []
+            async for c in engine.single_infer_stream(
+                prompt="hello", max_length=3,
+                temperature=1.0, top_k=5, top_p=0.6,
+                alpha_presence=0.0, alpha_frequency=0.0, alpha_decay=1.0,
+                chunk_size=2,
+            ):
+                chunks.append(c)
+            return chunks
+
+        chunks = asyncio.run(_run_stream())
+
+        assert len(model.decode_tensor_inputs) == 3, "one merged decode step per token"
+        assert all(model.decode_tensor_inputs), "sampled tensor fed to forward_batch"
+        assert chunks and chunks[-1] == "data: [DONE]\n\n"
+        # Fake tokenizer decodes to "" so no content delta; a length finish chunk
+        # and [DONE] still terminate the stream.
+        assert any("finish_reason" in c for c in chunks)
+        if enabled:
+            engine.shutdown()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

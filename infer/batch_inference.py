@@ -216,8 +216,8 @@ class BatchInferenceMixin:
             # single low-frequency background task drains any accumulation
             # (see InferenceEngine.run_periodic_gpu_cleanup). A per-request
             # torch.cuda.empty_cache() was itself a blocking sync in this hot
-            # path, so dropping it is the fix, not a cleanup optimization. Bare
-            # gc.collect() (non-CUDA, already on the anyio threadpool for this
+            # path, so dropping it is the fix, not a cleanup optimization.
+            # bare gc.collect() (non-CUDA, runs on the anyio threadpool for this
             # blocking core) is kept to preserve Python-reference cleanup.
             gc.collect()
 
@@ -340,7 +340,7 @@ class BatchInferenceMixin:
             # Per-request empty_cache removed (item 1): rely on CUDA's allocator
             # cache reuse between requests plus ONE low-frequency background
             # cleanup (InferenceEngine.run_periodic_gpu_cleanup). There is no
-            # cleanup closure here -- the per-request torch.cuda.empty_cache()
+            # cleanup closure here -- a per-request torch.cuda.empty_cache()
             # (previously routed through the offload seam) was the blocking sync
             # cost being removed from this hot path.
 
@@ -684,6 +684,21 @@ class BatchInferenceMixin:
                 prefix_cache_manager=prefix_cache_manager,
                 cancel_token=cancel_token,
             )
+            # Item 2: the single-token decode now uses the batched-tensor fast
+            # path (forward_batch -> forward_seq_batch_tensor), which operates on
+            # a batch-layout state [Layer,2,B,C]/[Layer,B,H,N,N]/[B] -- but the
+            # bsz=1 prefill returns a bsz=0 (no batch dim) state. View it as a
+            # singleton batch (mirrors _batch_prefill's cache-branch reshape).
+            # contiguous() so the decode kernels get a clean batch-layout (and the
+            # copy means a matched prefix-cache state is no longer mutated by the
+            # decode loop, unlike the old forward_one path).
+            state = [
+                state[0].unsqueeze(2).contiguous(),
+                state[1].unsqueeze(1).contiguous(),
+                state[2].reshape(1),
+            ]
+            out = out.unsqueeze(0) if out.dim() == 1 else out
+
             # setup_rand (CUDA RNG-state alloc kernel) + penalty-tensor cuda-alloc
             # are CUDA ops; route them through the seam so they never run on the
             # event-loop thread while the worker is active under the opt-in.
@@ -698,12 +713,23 @@ class BatchInferenceMixin:
             while max_length > 0:
                 self._raise_if_cancelled(cancel_token)
                 max_length -= 1
-                logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
 
-                def _gpu_sample():
+                # Item 2: ONE full GPU decode step (sample the current logits and
+                # feed the sampled GPU TENSOR straight through forward_batch's
+                # tensor fast path) as a single unit on the GPU-worker thread under
+                # the opt-in -- halves the per-token _offload_gpu dispatches and
+                # removes the GPU->CPU .tolist() sync + event-loop gap between the
+                # old sample and forward calls. Mirror of big_batch.py / 
+                # _batch_decode_streaming's _gpu_decode_step closure. no_grad()
+                # re-entry keeps BOTH modes identical (inference_mode is
+                # thread-local and must NOT be used here). new_out is discarded
+                # when the sampled token is a stop token (the recurrent state is
+                # per-row independent and dropped with the request), matching the
+                # established big_batch behavior of forwarding the stop token.
+                def _gpu_decode_step():
                     with inference_deps.get_torch().no_grad():
-                        return inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                            logits_reshaped,
+                        new_tokens_tensor = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                            out,
                             penalties,
                             sample_rand_states,
                             alpha_presence,
@@ -712,9 +738,14 @@ class BatchInferenceMixin:
                             temperature,
                             top_k,
                             top_p,
-                        ).tolist()
+                        )
+                        new_out = self.model.forward_batch(
+                            new_tokens_tensor, state
+                        ).float()
+                        new_tokens = new_tokens_tensor.tolist()
+                    return new_out, new_tokens
 
-                new_tokens = await self._offload_gpu(_gpu_sample)
+                out, new_tokens = await self._offload_gpu(_gpu_decode_step)
 
                 tok = new_tokens[0]
                 content, should_stop = self._ingest_token_with_stop(stop_state, tok)
@@ -724,10 +755,6 @@ class BatchInferenceMixin:
                 if should_stop:
                     finish_reason = "stop"
                     break
-
-                out = await self._offload_gpu(
-                    self._forward_tokens_chunked, [tok], state, cancel_token=cancel_token
-                )
                 await asyncio.sleep(0)
 
             generated_text += self._flush_stop_state(stop_state, final=True)
@@ -735,8 +762,9 @@ class BatchInferenceMixin:
         finally:
             if state is not None:
                 del state
-            inference_deps.get_torch().cuda.empty_cache()
-            gc.collect()
+            # Per-request empty_cache removed (item 1): the CUDA allocator caches
+            # freed blocks for reuse; one low-frequency background task drains
+            # accumulations (InferenceEngine.run_periodic_gpu_cleanup).
 
     async def single_infer_stream(
         self,
@@ -763,6 +791,15 @@ class BatchInferenceMixin:
                 prefix_cache_manager=prefix_cache_manager,
                 cancel_token=cancel_token,
             )
+            # Item 2: same bsz=0 -> singleton-batch state reshape as single_infer,
+            # so the merged sample+forward step can use forward_batch's tensor
+            # fast path (see single_infer).
+            state = [
+                state[0].unsqueeze(2).contiguous(),
+                state[1].unsqueeze(1).contiguous(),
+                state[2].reshape(1),
+            ]
+            out = out.unsqueeze(0) if out.dim() == 1 else out
             stop_state = self._create_stop_state(stop_tokens)
             buffered_tokens = 0
             text_buffer = ""
@@ -780,12 +817,12 @@ class BatchInferenceMixin:
             while max_length > 0:
                 self._raise_if_cancelled(cancel_token)
                 max_length -= 1
-                logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
 
-                def _gpu_sample():
+                # Item 2: merged sample+forward decode step (see single_infer).
+                def _gpu_decode_step():
                     with inference_deps.get_torch().no_grad():
-                        return inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                            logits_reshaped,
+                        new_tokens_tensor = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                            out,
                             penalties,
                             sample_rand_states,
                             alpha_presence,
@@ -794,9 +831,14 @@ class BatchInferenceMixin:
                             temperature,
                             top_k,
                             top_p,
-                        ).tolist()
+                        )
+                        new_out = self.model.forward_batch(
+                            new_tokens_tensor, state
+                        ).float()
+                        new_tokens = new_tokens_tensor.tolist()
+                    return new_out, new_tokens
 
-                new_tokens = await self._offload_gpu(_gpu_sample)
+                out, new_tokens = await self._offload_gpu(_gpu_decode_step)
 
                 tok = new_tokens[0]
                 content, should_stop = self._ingest_token_with_stop(stop_state, tok)
@@ -827,9 +869,6 @@ class BatchInferenceMixin:
                     text_buffer = ""
                     buffered_tokens = 0
 
-                out = await self._offload_gpu(
-                    self._forward_tokens_chunked, [tok], state, cancel_token=cancel_token
-                )
                 await asyncio.sleep(0)
 
             flushed = self._flush_stop_state(stop_state, final=True)
@@ -850,13 +889,6 @@ class BatchInferenceMixin:
         finally:
             if state is not None:
                 del state
-
-            # empty_cache/gc are CUDA-touching cleanup; keep them off the
-            # event-loop thread under the opt-in (see _batch_decode_streaming).
-            def _cleanup():
-                inference_deps.get_torch().cuda.empty_cache()
-                gc.collect()
-
-            await self._offload_gpu(_cleanup)
+            # Per-request empty_cache removed (item 1); see single_infer.
 
         yield "data: [DONE]\n\n"
