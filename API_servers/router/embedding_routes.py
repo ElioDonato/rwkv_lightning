@@ -56,7 +56,19 @@ async def _embed_hander(request: Request, openai_shape: bool):
 
     try:
         t0 = time.perf_counter()
-        vectors = embed_texts(engine.model, engine.tokenizer, texts, normalize=True)
+        # When the embed aggregation worker is wired into this app's lifespan
+        # (infer/embed_aggregator.EmbedAggregator), route concurrent requests
+        # through its queue so their texts are embedded in a shared GPU batch
+        # under the opt-in; the default-off path inside submit() runs embed_texts
+        # inline exactly as before, so serving behavior is byte-identical unless
+        # RWKV_EMBED_AGGREGATE is explicitly enabled. Falling back to the direct
+        # call keeps this route functional on an app that never created the
+        # aggregator (e.g. an isolated test harness).
+        aggregator = getattr(request.app.state, "embed_aggregator", None)
+        if aggregator is not None:
+            vectors = await aggregator.submit(texts)
+        else:
+            vectors = embed_texts(engine.model, engine.tokenizer, texts, normalize=True)
         elapsed = time.perf_counter() - t0
     except Exception as exc:
         logger.error("[ERROR] embedding endpoint failed: %s", exc)

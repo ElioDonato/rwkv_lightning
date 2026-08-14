@@ -17,6 +17,7 @@ from API_servers.router import (
     v1_router,
     v2_router,
 )
+from infer.embed_aggregator import EmbedAggregator
 
 
 def create_app(engine, password=None):
@@ -30,7 +31,18 @@ def create_app(engine, password=None):
             methods = ",".join(sorted(route.methods - {"HEAD", "OPTIONS"}))
             logger.info("  %-20s %s", methods, route.path)
 
-        yield
+        # Opt-in embed aggregation worker (RWKV_EMBED_AGGREGATE, default-off).
+        # Attached to app.state so the embedding routes route concurrent
+        # /embedding requests through it (shared GPU batches under the opt-in;
+        # byte-identical inline embed_texts when off). Started here, and
+        # stopped (resolving any still-queued requests) when the app shuts down.
+        aggregator = EmbedAggregator(engine.model, engine.tokenizer)
+        app.state.embed_aggregator = aggregator
+        aggregator.start()
+        try:
+            yield
+        finally:
+            await aggregator.stop()
 
     app = FastAPI(lifespan=lifespan)
     # RWKV_CORS_ORIGINS: comma-separated allowlist, e.g. "http://localhost:3000,https://app.example.com"
