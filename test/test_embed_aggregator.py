@@ -354,9 +354,10 @@ async def test_no_cap_mode_bounds_aggregated_batch_by_hard_ceiling(fake):
 async def test_lone_oversized_job_no_cap_is_sub_chunked(fake):
     """Finding-1 regression: ONE job carrying more texts than the hard ceiling,
     in no-cap mode (model.max_prefill_bsz=0, no explicit override), must be fed
-    to embed_texts in MULTIPLE calls each <= the ceiling (embed_texts would
-    otherwise collapse its whole input into one giant _embed_batch, bypassing
-    the ceiling via the HEAD-always-admit rule) -- AND its per-request result
+    to embed_texts in MULTIPLE calls each <= the ceiling (a redundant-but-
+    consistent sub-chunk, mirroring embedding.py's own self-cap, so every
+    shared-batch call stays within the hard ceiling even though embed_texts
+    would itself sub-batch at the same constant) -- AND its per-request result
     must come back as ONE intact vector list in original order (split accounting
     preserved across the sub-chunk boundaries)."""
     ceiling = agg_mod._HARD_CEILING_DEFAULT

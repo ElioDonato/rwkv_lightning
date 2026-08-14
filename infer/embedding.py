@@ -59,13 +59,12 @@ from infer.rwkv_batch.rwkv7 import (
 )
 
 # Hard ceiling (texts) applied to a sub-batch when the model carries no
-# max_prefill_bsz cap (attribute absent or <= 0). Mirrors
-# infer.embed_aggregator's _HARD_CEILING_DEFAULT so the two never diverge; it is
-# duplicated (not imported) because embed_aggregator already imports
-# embed_texts from this module, so importing back would be a circular import.
-# Without a cap, "no cap / 0 cap" must never mean "whole request in one batch"
-# (a lone oversized request could otherwise spike VRAM on a GPU co-resident
-# with live :8081 chat) -- cap each sub-batch here instead.
+# max_prefill_bsz cap (attribute absent or <= 0). Single source of truth:
+# infer.embed_aggregator imports it from here (that module already imports
+# embed_texts from this one, so importing back is acyclic), so the two can
+# never diverge. Without a cap, "no cap / 0 cap" must never mean "whole request
+# in one batch" (a lone oversized request could otherwise spike VRAM on a GPU
+# co-resident with live :8081 chat) -- cap each sub-batch here instead.
 _HARD_CEILING_DEFAULT = 64
 
 

@@ -85,6 +85,22 @@ _SENTENCES = [
     "sentence embeddings must be stable across batched and single inference",
 ]
 
+# A long German paragraph (~12x a repeated sentence, comfortably >= 300 tokens,
+# so well over one prefill_chunk_size (256)-token chunk). Included in the
+# batched call it forces at least one row to span TWO+ chunks while the short
+# companions finish early and the active set shrinks -- the multi-chunk
+# batched-vs-single path that all-short sentences can never exercise. The
+# batched row must still match the single path's row within tolerance.
+_LONG_TEXT = (
+    "Dies ist ein langer deutscher Satz, der mehrfach wiederholt wird, um "
+    "einen Textblock zu erzeugen, der deutlich länger als ein einzelnes "
+    "Prefill-Chunk ist und daher die gestaffelte Batch-Prefill mit einem "
+    "schrumpfenden aktiven Satz tatsächlich beansprucht. "
+) * 12
+
+# The full input to the batched call: the short sentences plus the long text.
+_TEXTS = _SENTENCES + [_LONG_TEXT]
+
 
 @_PYTEST_GPU
 def test_real_gpu_batched_matches_per_text():
@@ -99,9 +115,11 @@ def test_real_gpu_batched_matches_per_text():
     # clarity so the single and batched calls provably run on the same device.
     device = "cuda"
 
-    batched = emb.embed_texts(model, tokenizer, _SENTENCES, device=device)
+    # Batched over the short sentences AND the long (>256-token) text, so the
+    # long row spans at least two chunked passes with a shrinking active set.
+    batched = emb.embed_texts(model, tokenizer, _TEXTS, device=device)
 
-    for i, sent in enumerate(_SENTENCES):
+    for i, sent in enumerate(_TEXTS):
         single = emb.embed_texts(model, tokenizer, [sent], device=device)[0]
         a = torch.as_tensor(batched[i], dtype=torch.float32)
         b = torch.as_tensor(single, dtype=torch.float32)
@@ -110,6 +128,23 @@ def test_real_gpu_batched_matches_per_text():
         assert diff < 1e-2, (
             f"row {i} batched-vs-single max abs diff = {diff:.3e} >= 1e-2; "
             "batched and single paths disagree on the REAL kernels"
+        )
+
+    # Explicitly double-check the two multi-chunk-relevant rows: the long text
+    # (required to span 2+ chunks) and the shortest companion (must match even
+    # though it finishes in the first chunk while others continue).
+    long_i = len(_TEXTS) - 1
+    short_i = 0
+    for row_i in (short_i, long_i):
+        a = torch.as_tensor(batched[row_i], dtype=torch.float32)
+        b = torch.as_tensor(
+            emb.embed_texts(model, tokenizer, [_TEXTS[row_i]], device=device)[0],
+            dtype=torch.float32,
+        )
+        diff = (a - b).abs().max().item()
+        assert diff < 1e-2, (
+            f"{'long' if row_i == long_i else 'short'} companion row "
+            f"{row_i} batched-vs-single max abs diff = {diff:.3e} >= 1e-2"
         )
 
 

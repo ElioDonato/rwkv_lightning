@@ -22,16 +22,18 @@ Design
   admission budget big_batch's prefill admission uses). When
   ``max_prefill_bsz > 0`` the concatenated batch is capped at exactly that so
   the batch never exceeds the shared VRAM estimate. ``max_prefill_bsz=0`` means
-  "no cap" in ``embedding.embed_texts`` (it batches the whole input in one
-  call); here it triggers a sane hard ceiling on the aggregated batch
-  (``_HARD_CEILING_DEFAULT``) instead of unbounded accumulation, so a whole
-  window burst is never packed into one un-isolated VRAM spike against a
-  co-resident :8081 chat. The cap never rejects a pending HEAD job: one that
-  alone exceeds the cap is still admitted and run. In capped mode
-  ``embed_texts``' own sub-batching keeps an oversized HEAD within its
-  model-level budget; in no-cap mode the aggregator sub-chunks the lone
-  job's texts itself (see ``_embed_texts_bounded``) so no single
-  ``embed_texts`` call exceeds the hard ceiling either way.
+  no model-level cap, so ``embedding.embed_texts`` falls back to its own hard
+  ceiling (``embedding._HARD_CEILING_DEFAULT`` = 64, the constant this module
+  imports -- shared, single-sourced); here it triggers the same hard ceiling on
+  the aggregated batch (``_HARD_CEILING_DEFAULT``) instead of unbounded
+  accumulation, so a whole window burst is never packed into one un-isolated
+  VRAM spike against a co-resident :8081 chat. The cap never rejects a pending
+  HEAD job: one that alone exceeds the cap is still admitted and run. In capped
+  mode ``embed_texts``' own sub-batching keeps an oversized HEAD within its
+  model-level budget; in no-cap mode the aggregator sub-chunks the lone job's
+  texts itself (see ``_embed_texts_bounded``) -- a redundant-but-consistent
+  double bound, since embedding.py already self-caps at the same ceiling -- so
+  no single ``embed_texts`` call exceeds the hard ceiling either way.
 
 After a scheduler crash (a non-cancel failure in the scheduler logic), the
 scheduler nulls ``self._task`` so a later ``submit()`` re-starts it via the
@@ -80,7 +82,7 @@ from collections import deque
 
 logger = logging.getLogger("infer.embed_aggregator")
 
-from infer.embedding import embed_texts
+from infer.embedding import _HARD_CEILING_DEFAULT, embed_texts
 
 _AGGREGATE_ENV = "RWKV_EMBED_AGGREGATE"
 _AGGREGATE_DEFAULT = "0"
@@ -91,16 +93,6 @@ _WINDOW_MS_ENV = "RWKV_EMBED_AGGREGATE_WINDOW_MS"
 # concurrent requests to arrive; 10ms is enough to gather a burst while costing
 # an isolated request only ~1 forward-twiddle of latency.
 _WINDOW_MS_DEFAULT = 10
-# Hard ceiling (texts) applied when the model carries no cap (max_prefill_bsz<=0).
-# With no explicit cap, a whole window's burst would otherwise go into ONE
-# embed_texts call with a single empty_cache -- no per-request VRAM isolation
-# against a co-resident :8081 chat on the same GPU. embed_texts would happily
-# swallow the entire window; this bounds the aggregated batch so the shared
-# batch never grows unbounded. In capped mode embed_texts' own sub-batching
-# keeps even an oversized lone job within its model-level budget; in no-cap
-# mode the aggregator sub-chunks the job's texts to this ceiling (see
-# ``_embed_texts_bounded``), so every embed_texts call stays within it.
-_HARD_CEILING_DEFAULT = 64
 
 
 def _aggregate_enabled(enabled=None) -> bool:
@@ -277,11 +269,11 @@ class EmbedAggregator:
     def _no_cap_mode(self) -> bool:
         """True when the batching-cap source is genuinely absent: the model's
         ``max_prefill_bsz <= 0`` and (if overridden) the override itself is
-        ``<= 0``. Only here does ``embed_texts`` collapse its WHOLE input into
-        a single batched prefill (``embedding.py`` does
-        ``max_bsz = max(1, len(non_empty))``), so ``_run_batch`` must sub-chunk
-        a lone job's own texts itself to keep every shared-batch call within
-        the hard ceiling; capped mode already has embed_texts' own
+        ``<= 0``. Here ``embed_texts`` has no model-level ``max_prefill_bsz``
+        to sub-batch at (it only self-caps each sub-batch at
+        ``embedding._HARD_CEILING_DEFAULT``), so ``_run_batch`` sub-chunks a
+        lone job's own texts itself to keep every shared-batch call within the
+        aggregation ceiling; capped mode already has embed_texts' own
         ``max_prefill_bsz`` sub-batching to lean on."""
         if self._max_bsz is not None:
             return int(self._max_bsz) <= 0
@@ -442,16 +434,15 @@ class EmbedAggregator:
         feeding each ``embed_texts`` call at most ``cap`` texts, and return all
         vectors in input order.
 
-        In no-cap mode (``_no_cap_mode``) ``embed_texts`` collapses its WHOLE
-        input into a single batched prefill, so a lone oversized job (> the hard
-        ceiling) would otherwise slide past the aggregation ceiling as ONE giant
-        ``_embed_batch`` (the HEAD-always-admit rule hands it whole to
-        ``embed_texts``, which has no own cap to fall back on). Sub-chunking the
-        job's own texts into slices of at most the ceiling keeps every
-        shared-batch VRAM spike bounded. In capped mode ``embed_texts`` already
-        sub-batches internally at ``max_prefill_bsz``, so the window is fed
-        whole (ONE call), preserving the existing shared-batch composition
-        exactly.
+        In no-cap mode (``_no_cap_mode``) ``embed_texts`` runs on the hard
+        ceiling (embedding.py self-caps each sub-batch at
+        ``_HARD_CEILING_DEFAULT``), so this module's sub-chunking of the
+        aggregated window -- feeding each call at most ``cap`` texts -- is a
+        redundant-but-consistent double bound that keeps the shared-batch VRAM
+        spike within the aggregation ceiling even if embedding.py's constant
+        were ever loosened. In capped mode ``embed_texts`` already sub-batches
+        internally at ``max_prefill_bsz``, so the window is fed whole (ONE
+        call), preserving the existing shared-batch composition exactly.
 
         Exactness / split-accounting are unaffected: every sub-slice runs the
         exact same per-text math, so concatenating the per-slice results is
