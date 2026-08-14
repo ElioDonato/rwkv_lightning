@@ -3,6 +3,7 @@ import logging
 logger = logging.getLogger("infer.engine")
 
 import asyncio
+import os
 from collections import deque
 
 from infer import inference_deps
@@ -75,6 +76,62 @@ class InferenceEngine(
         if executor.enabled:
             return await executor.offload(fn, *args, **kwargs)
         return fn(*args, **kwargs)
+
+    # Env/interval for the single low-frequency background GPU cache cleanup that
+    # replaces the per-request torch.cuda.empty_cache() calls removed in item 1.
+    # The CUDA allocator re-uses freed blocks between requests, so draining the
+    # cache this rarely is enough for steady-state workloads while still
+    # sometimes giving VRAM back to a co-resident process (e.g. the :8083
+    # embedding server) instead of holding onto every block forever.
+    _GPU_CLEANUP_INTERVAL_ENV = "RWKV_GPU_CLEANUP_INTERVAL_S"
+    _GPU_CLEANUP_INTERVAL_DEFAULT = 60.0
+
+    async def run_periodic_gpu_cleanup(self, interval_s=None):
+        """ONE low-frequency background task that calls ``_cleanup_cuda_memory``
+        (torch.cuda.synchronize + empty_cache) on a fixed cadence, replacing the
+        now-removed per-request empty_cache calls in the >:8081 decode hot path
+        (see item 1).
+
+        ``_cleanup_cuda_memory`` is routed through the same ``_offload_gpu`` seam
+        the decode loops use, so under the opt-in (RWKV_ASYNC_FORWARD) it always
+        executes on the single GPU-worker thread and never races an in-flight
+        forward (preserving the single-thread-CUDA invariant); with the opt-in
+        off it runs inline on this task's (event-loop) thread, where there is no
+        worker forward to race.
+
+        Designed to run as a server-lifespan background task (started in
+        fastapi_service.lifespan, cancelled on shutdown). It loops forever, so a
+        caller must cancel the asyncio task to stop it. ``interval_s`` defaults to
+        the ``RWKV_GPU_CLEANUP_INTERVAL_S`` env (60s); an explicit value is used
+        by tests.
+        """
+        if interval_s is None:
+            try:
+                interval_s = float(
+                    os.environ.get(
+                        self._GPU_CLEANUP_INTERVAL_ENV,
+                        str(self._GPU_CLEANUP_INTERVAL_DEFAULT),
+                    )
+                )
+            except (TypeError, ValueError):
+                interval_s = self._GPU_CLEANUP_INTERVAL_DEFAULT
+            # Guard the env/default path against a misconfigured ~0 interval
+            # spinning the cleanup hot; an explicit interval_s (as used by
+            # tests) is honored as-is.
+            interval_s = max(0.5, interval_s)
+
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                await self._offload_gpu(self._cleanup_cuda_memory)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A cleanup failure must never kill the background task (which
+                # would silently re-introduce unbounded allocator-cache growth).
+                logger.warning(
+                    "[PeriodicGpuCleanup] cleanup iteration failed: %s", exc
+                )
 
     async def acquire_prefill_permit(
         self, request_bsz: int, request_label: str = "", cancel_token=None

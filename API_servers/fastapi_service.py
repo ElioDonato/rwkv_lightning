@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from contextlib import suppress
 from threading import Lock
 
 from fastapi import FastAPI, Request
@@ -17,6 +18,7 @@ from API_servers.router import (
     v1_router,
     v2_router,
 )
+from infer import inference_deps
 from infer.embed_aggregator import EmbedAggregator
 
 
@@ -39,9 +41,24 @@ def create_app(engine, password=None):
         aggregator = EmbedAggregator(engine.model, engine.tokenizer)
         app.state.embed_aggregator = aggregator
         aggregator.start()
+
+        # Single low-frequency background GPU cache cleanup (item 1): replaces
+        # the per-request torch.cuda.empty_cache() calls removed from the :8081
+        # decode hot path. Runs InferenceEngine.run_periodic_gpu_cleanup at a
+        # fixed cadence (RWKV_GPU_CLEANUP_INTERVAL_S, default 60s), routed
+        # through the offload seam. Only spawned when CUDA is present (on a
+        # CPU box _cleanup_cuda_memory is an early no-op, so a perpetual
+        # sleeping task would be pure noise).
+        cleanup_task = None
+        if inference_deps.get_torch().cuda.is_available():
+            cleanup_task = asyncio.create_task(engine.run_periodic_gpu_cleanup())
         try:
             yield
         finally:
+            if cleanup_task is not None:
+                cleanup_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await cleanup_task
             await aggregator.stop()
 
     app = FastAPI(lifespan=lifespan)

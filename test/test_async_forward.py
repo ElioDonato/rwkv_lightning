@@ -340,7 +340,8 @@ def test_engine_shutdown_flips_executor_disabled_and_post_shutdown_runs_inline()
     assert ran_on[-1] == caller
 
 
-# -- Finding 1: cleanup (_cleanup_cuda_memory) moves to the worker when enabled
+# -- Finding 1 (item 1): per-request _cleanup_cuda_memory is REMOVED; the single
+# low-frequency cleanup lives on a background task routed through the seam.
 
 def _record_cleanup_thread():
     """Return a (list, fn) pair: fn shadows engine._cleanup_cuda_memory to
@@ -358,34 +359,54 @@ def _record_cleanup_thread():
     return threads, _record
 
 
-def test_big_batch_cleanup_offloaded_to_worker_when_enabled():
-    """Finding 1: big_batch_stream's finally cleanup (_cleanup_cuda_memory, a
-    CUDA-touching op) must run on the single worker thread under the opt-in --
-    never on the event-loop thread worrying about a worker forward in flight."""
-    threads, record = _record_cleanup_thread()
-    engine = _make_engine(enabled=True)
-    engine._cleanup_cuda_memory = record
-    caller = threading.get_ident()
+def test_big_batch_no_per_request_cleanup_both_modes():
+    """Item 1: big_batch_stream's finally + step-interval cleanup
+    (_cleanup_cuda_memory, a CUDA-touching synchronize+empty_cache) has been
+    removed -- a request must NOT trigger per-request cleanup in either mode.
+    Only the single low-frequency background task
+    (InferenceEngine.run_periodic_gpu_cleanup) issues empty_cache now."""
+    for enabled in (False, True):
+        threads, record = _record_cleanup_thread()
+        engine = _make_engine(enabled=enabled)
+        engine._cleanup_cuda_memory = record
 
-    _collect(engine, max_length=4)
+        _collect(engine, max_length=4)
 
-    assert threads, "finally cleanup must have run"
-    assert threads[0] != caller, "opt-in: cleanup must run on the worker thread"
-    engine.shutdown()
+        assert threads == [], (
+            "no per-request _cleanup_cuda_memory may run (item 1); "
+            f"got {len(threads)} call(s) with enabled={enabled}"
+        )
+        if enabled:
+            engine.shutdown()
 
 
-def test_big_batch_cleanup_stays_on_loop_when_default_off():
-    """Findings 1: with the opt-in off, cleanup stays on the (calling) event-loop
-    thread exactly as before -- only the opt-in path ever moves it."""
-    threads, record = _record_cleanup_thread()
-    engine = _make_engine(enabled=False)
-    engine._cleanup_cuda_memory = record
-    caller = threading.get_ident()
+@pytest.mark.anyio
+async def test_periodic_gpu_cleanup_runs_through_seam():
+    """Item 1 replacement: the ONE background cleanup
+    (InferenceEngine.run_periodic_gpu_cleanup) invokes _cleanup_cuda_memory on a
+    cadence. Under the opt-in it must run on the single GPU-worker thread (the
+    seam), never on the event loop; default-off it runs inline. Cancelling the
+    task stops the loop."""
+    # enabled: cleanup goes through offload -> worker thread
+    for enabled in (False, True):
+        threads, record = _record_cleanup_thread()
+        engine = _make_engine(enabled=enabled)
+        engine._cleanup_cuda_memory = record
+        caller = threading.get_ident()
 
-    _collect(engine, max_length=4)
+        task = asyncio.create_task(engine.run_periodic_gpu_cleanup(interval_s=0.01))
+        await asyncio.sleep(0.05)  # allow >=1 interval to elapse
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-    assert threads, "finally cleanup must have run"
-    assert threads[0] == caller, "default-off: cleanup must stay on the loop thread"
+        assert threads, "periodic cleanup must have fired"
+        if enabled:
+            assert threads[0] != caller, "opt-in: cleanup must run on the worker thread"
+        else:
+            assert threads[0] == caller, "default-off: cleanup must run on the loop thread"
+        if enabled:
+            engine.shutdown()
 
 
 # -- Findings 1 + 4: batch_infer_stream sampler-init thread + no_grad re-entry

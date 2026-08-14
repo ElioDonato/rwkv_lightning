@@ -95,9 +95,6 @@ class BigBatchMixin:
                 # tensors and the active_indices mapping shrink.
                 active_indices = list(range(batch_size))
 
-                step_count = 0
-                cleanup_interval = 100
-
                 while not all(finished) and max_length > 0:
                     self._raise_if_cancelled(cancel_token)
 
@@ -125,7 +122,6 @@ class BigBatchMixin:
                     del prev_out
 
                     max_length -= 1
-                    step_count += 1
 
                     contents_to_send = [""] * batch_size
                     finish_reasons = [None] * batch_size
@@ -235,13 +231,6 @@ class BigBatchMixin:
                                     newly_freed, permit_box[0], request_label="/big_batch/completions"
                                 )
 
-                    if step_count % cleanup_interval == 0:
-                        # empty_cache/synchronize are CUDA calls that must NOT
-                        # run on the event-loop thread while the worker has a
-                        # forward in flight (single-thread-CUDA). Route them
-                        # through the same seam as the forwards.
-                        await self._offload_gpu(self._cleanup_cuda_memory)
-
                 remaining_contents = [""] * batch_size
                 for i in range(batch_size):
                     flushed = self._flush_stop_state(
@@ -292,9 +281,11 @@ class BigBatchMixin:
                 del token_buffers
             if new_tokens is not None:
                 del new_tokens
-            # empty_cache is a CUDA call; keep it off the event-loop thread
-            # under the opt-in (same seam the forwards already use).
-            await self._offload_gpu(self._cleanup_cuda_memory)
+            # Per-request cleanup removed (item 1): rely on CUDA's allocator
+            # cache reuse plus one low-frequency background task
+            # (InferenceEngine.run_periodic_gpu_cleanup), instead of the old
+            # finally _cleanup_cuda_memory (a synchronize + empty_cache on this
+            # decode hot path).
 
         yield "data: [DONE]\n\n"
 

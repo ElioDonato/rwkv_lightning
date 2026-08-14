@@ -211,8 +211,15 @@ class BatchInferenceMixin:
         finally:
             if state is not None:
                 del state
+            # Per-request cuda.empty_cache() intentionally removed (item 1): the
+            # CUDA allocator caches freed blocks for reuse between requests, and a
+            # single low-frequency background task drains any accumulation
+            # (see InferenceEngine.run_periodic_gpu_cleanup). A per-request
+            # torch.cuda.empty_cache() was itself a blocking sync in this hot
+            # path, so dropping it is the fix, not a cleanup optimization. Bare
+            # gc.collect() (non-CUDA, already on the anyio threadpool for this
+            # blocking core) is kept to preserve Python-reference cleanup.
             gc.collect()
-            inference_deps.get_torch().cuda.empty_cache()
 
     # -- Shared streaming decode core (with compaction + SSE) ---------------
 
@@ -330,18 +337,12 @@ class BatchInferenceMixin:
         finally:
             if state is not None:
                 del state
-
-            # empty_cache/gc are CUDA-touching cleanup; route them through the
-            # same seam so they never run on the event-loop thread while the
-            # worker has a forward in flight. Default-off runs this inline,
-            # preserving the exact original cleanup (no added synchronize -- use
-            # a closure mirroring the raw calls, not _cleanup_cuda_memory which
-            # would add a cuda.synchronize() to the default path).
-            def _cleanup():
-                inference_deps.get_torch().cuda.empty_cache()
-                gc.collect()
-
-            await self._offload_gpu(_cleanup)
+            # Per-request empty_cache removed (item 1): rely on CUDA's allocator
+            # cache reuse between requests plus ONE low-frequency background
+            # cleanup (InferenceEngine.run_periodic_gpu_cleanup). There is no
+            # cleanup closure here -- the per-request torch.cuda.empty_cache()
+            # (previously routed through the offload seam) was the blocking sync
+            # cost being removed from this hot path.
 
         yield "data: [DONE]\n\n"
 
@@ -531,8 +532,8 @@ class BatchInferenceMixin:
             # truncated at max_tokens -- see commit fixing that bug.
             return [generated_text], [finish_reason]
         finally:
+            # Per-request empty_cache removed (item 1), see run_periodic_gpu_cleanup.
             gc.collect()
-            inference_deps.get_torch().cuda.empty_cache()
 
     async def batch_infer_stream_state(
         self,
@@ -651,14 +652,7 @@ class BatchInferenceMixin:
                 logger.info(f"[RESPONSE] /state/chat/completions state[2]: {state[2]}")
 
             del state
-
-            # empty_cache/gc are CUDA-touching cleanup; keep them off the
-            # event-loop thread under the opt-in (see _batch_decode_streaming).
-            def _cleanup():
-                inference_deps.get_torch().cuda.empty_cache()
-                gc.collect()
-
-            await self._offload_gpu(_cleanup)
+            # Per-request empty_cache removed (item 1); see _batch_decode_streaming.
 
         yield "data: [DONE]\n\n"
 
