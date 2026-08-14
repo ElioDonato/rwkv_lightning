@@ -20,6 +20,7 @@ from API_servers.router import (
 )
 from infer import inference_deps
 from infer.embed_aggregator import EmbedAggregator
+from infer.fuse_aggregator import ChatFuseAggregator
 
 
 def create_app(engine, password=None):
@@ -42,6 +43,16 @@ def create_app(engine, password=None):
         app.state.embed_aggregator = aggregator
         aggregator.start()
 
+        # Opt-in decode combine-queue for /openai/v1/chat/completions
+        # (RWKV_FUSE_CHAT_BATCH, default-off -- item 3). Attached to app.state so
+        # openai_routes can route concurrent chat requests through it (fused
+        # multi-row big_batch_stream decodes under the opt-in; the route uses the
+        # original single_infer path when disabled). start() is a no-op while
+        # disabled; stopped (any queued rows ended) on shutdown.
+        fuse = ChatFuseAggregator(engine)
+        app.state.chat_fuse_aggregator = fuse
+        fuse.start()
+
         # Single low-frequency background GPU cache cleanup (item 1): replaces
         # the per-request torch.cuda.empty_cache() calls removed from the :8081
         # decode hot path. Runs InferenceEngine.run_periodic_gpu_cleanup at a
@@ -59,6 +70,7 @@ def create_app(engine, password=None):
                 cleanup_task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
                     await cleanup_task
+            await fuse.stop()
             await aggregator.stop()
 
     app = FastAPI(lifespan=lifespan)

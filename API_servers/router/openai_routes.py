@@ -2,19 +2,24 @@ import logging
 
 logger = logging.getLogger("api.openai")
 
+import asyncio
 import json
 import os
 import time
+from contextlib import suppress
 from typing import Any
 
 from fastapi import APIRouter, Request
+from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from infer.cancellation import CancellationToken, InferenceCancelled, PrefillBszLimitExceeded
 from state_manager.state_pool import get_state_manager
 
 from API_servers.router.common import (
+    SSE_HEADERS,
     check_openai_auth as common_check_openai_auth,
+    cleanup_disconnect_watcher,
     client_closed_response,
     emit_finish_reason_chunk,
     extract_bearer_token as common_extract_bearer_token,
@@ -23,6 +28,7 @@ from API_servers.router.common import (
     prefill_bsz_limit_response,
     prefill_sse_response,
     reserve_prefill_capacity,
+    watch_disconnect,
 )
 from API_servers.router.schemas import ChatRequest
 
@@ -178,16 +184,13 @@ extract_bearer_token = common_extract_bearer_token
 check_openai_auth = common_check_openai_auth
 
 
-async def stream_openai_chunks(
-    engine,
-    req,
-    prompt_formatted: str,
-    response_id: str,
-    created: int,
-    model_name: str,
-    cancel_token: CancellationToken,
-    prefix_cache_manager=None,
-):
+async def _relay_openai_stream(stream, response_id, created, model_name, cancel_token):
+    """Relay an opaque SSE chunk stream (single_infer_stream or a fuse-aggregator
+    stream -- both index-0, ``data: ...`` lines, ending with [DONE] for the
+    solo path / silent end-for-fused) into OpenAI chat.completion.chunk packets,
+    re-stamping id/created/model and emitting the finish chunk + [DONE].
+    Closing the stream (aclose) is owned here so both solo and fused paths
+    release the row uniformly."""
     emitted_finish_reason = False
     start_chunk = {
         "id": response_id,
@@ -197,21 +200,6 @@ async def stream_openai_chunks(
         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
     }
     yield f"data: {json.dumps(start_chunk, ensure_ascii=False)}\n\n"
-
-    stream = engine.single_infer_stream(
-        prompt=prompt_formatted,
-        max_length=req.max_tokens,
-        temperature=req.temperature,
-        top_k=req.top_k,
-        top_p=req.top_p,
-        alpha_presence=req.alpha_presence,
-        alpha_frequency=req.alpha_frequency,
-        alpha_decay=req.alpha_decay,
-        stop_tokens=req.stop_tokens,
-        chunk_size=req.chunk_size,
-        prefix_cache_manager=prefix_cache_manager,
-        cancel_token=cancel_token,
-    )
 
     try:
         async for item in stream:
@@ -264,6 +252,91 @@ async def stream_openai_chunks(
         yield "data: [DONE]\n\n"
 
 
+async def stream_openai_chunks(
+    engine,
+    req,
+    prompt_formatted: str,
+    response_id: str,
+    created: int,
+    model_name: str,
+    cancel_token: CancellationToken,
+    prefix_cache_manager=None,
+):
+    stream = engine.single_infer_stream(
+        prompt=prompt_formatted,
+        max_length=req.max_tokens,
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+        alpha_presence=req.alpha_presence,
+        alpha_frequency=req.alpha_frequency,
+        alpha_decay=req.alpha_decay,
+        stop_tokens=req.stop_tokens,
+        chunk_size=req.chunk_size,
+        prefix_cache_manager=prefix_cache_manager,
+        cancel_token=cancel_token,
+    )
+    async for item in _relay_openai_stream(stream, response_id, created, model_name, cancel_token):
+        yield item
+
+
+async def collect_fuse_nonstream(fuse_stream) -> tuple[str, str]:
+    """Accumulate a fuse stream into (text, finish_reason) for non-stream chat.
+    The fuse stream carries content deltas and a finish chunk in the same
+    format single_infer_stream emits, so accumulation reproduces the exact text
+    and finish reason a non-stream single_infer call would have produced."""
+    text_parts = []
+    finish_reason = "length"
+    async for item in fuse_stream:
+        payload = extract_sse_payload(item)
+        if payload is None or payload == "[DONE]":
+            continue
+        try:
+            chunk_payload = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        choices = chunk_payload.get("choices") or []
+        if not choices:
+            continue
+        fr = choices[0].get("finish_reason")
+        if fr is not None:
+            finish_reason = fr
+        content = choices[0].get("delta", {}).get("content")
+        if content:
+            text_parts.append(content)
+    return "".join(text_parts), finish_reason
+
+
+def fuse_sse_response(request: Request, stream_gen, cancel_token: CancellationToken):
+    """StreamingResponse for the fuse path. Unlike prefill_sse_response it does
+    NOT own a prefill-admission permit -- the ChatFuseAggregator owns the fused
+    batch's permit. It only watches for client disconnect (cancelling the token
+    the relay checks) and closes the fuse stream via the relay generator's
+    finally."""
+
+    async def body():
+        watcher = asyncio.create_task(watch_disconnect(request, cancel_token))
+        try:
+            async for chunk in stream_gen:
+                if cancel_token.is_cancelled():
+                    break
+                yield chunk
+        finally:
+            await cleanup_disconnect_watcher(watcher)
+            if cancel_token.is_cancelled():
+                # On disconnect the relay's finally closes the fuse stream (drops
+                # just this row); if the relay was left mid-iteration above, force
+                # its aclose so the row is released promptly.
+                with suppress(asyncio.CancelledError, Exception):
+                    await stream_gen.aclose()
+
+    return StreamingResponse(
+        body(),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
+
+
 @router.get("/openai/v1/models")
 async def openai_list_models(request: Request):
     engine = request.app.state.engine
@@ -300,6 +373,69 @@ async def openai_chat_completions(request: Request):
         created = int(time.time())
         model_name = os.path.basename(f"{engine.args.MODEL_NAME}")
         prefix_cache_manager = get_state_manager() if req.use_prefix_cache else None
+
+        # Opt-in decode combine-queue (CHAT_FUSE): when enabled, route the
+        # request through the ChatFuseAggregator (solo head-fire or fused
+        # multi-row big_batch_stream decode) instead of the per-request
+        # single_infer path. The aggregator owns the batch's prefill-admission
+        # permit, so these branches do NOT use reserve_prefill_capacity /
+        # prefill_sse_response. When disabled, the original path is used
+        # unchanged (byte-identical).
+        fuse = getattr(request.app.state, "chat_fuse_aggregator", None)
+        if fuse is not None and fuse.enabled:
+            cancel_token = CancellationToken()
+            fuse_stream = await fuse.submit(
+                prompt_formatted,
+                req.max_tokens,
+                req.temperature,
+                req.stop_tokens,
+                req.chunk_size,
+            )
+            if req.stream:
+                stream = _relay_openai_stream(
+                    fuse_stream, response_id, created, model_name, cancel_token
+                )
+                return fuse_sse_response(request, stream, cancel_token)
+
+            collect_task = asyncio.create_task(collect_fuse_nonstream(fuse_stream))
+            watcher = asyncio.create_task(watch_disconnect(request, cancel_token))
+            pending = set()
+            try:
+                done, pending = await asyncio.wait(
+                    {collect_task, watcher}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if collect_task not in done:
+                    # watcher finished -> client disconnected
+                    collect_task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await collect_task
+                    await fuse_stream.aclose()
+                    raise InferenceCancelled("request disconnected")
+                result_text, finish_reason = await collect_task
+            finally:
+                for t in pending:
+                    t.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    for t in pending:
+                        await t
+
+            message, response_finish_reason = build_openai_message_response(
+                result_text, finish_reason, body
+            )
+            return {
+                "id": response_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": message,
+                        "finish_reason": response_finish_reason,
+                    }
+                ],
+                "usage": build_openai_usage(engine.tokenizer, prompt_formatted, result_text),
+            }
 
         if req.stream:
             cancel_token = CancellationToken()
