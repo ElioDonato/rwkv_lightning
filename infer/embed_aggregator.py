@@ -27,8 +27,16 @@ Design
   (``_HARD_CEILING_DEFAULT``) instead of unbounded accumulation, so a whole
   window burst is never packed into one un-isolated VRAM spike against a
   co-resident :8081 chat. The cap never rejects a pending HEAD job: one that
-  alone exceeds the cap is admitted as its own batch and left to
-  ``embed_texts``' own sub-batching to keep bounded.
+  alone exceeds the cap is still admitted and run. In capped mode
+  ``embed_texts``' own sub-batching keeps an oversized HEAD within its
+  model-level budget; in no-cap mode the aggregator sub-chunks the lone
+  job's texts itself (see ``_embed_texts_bounded``) so no single
+  ``embed_texts`` call exceeds the hard ceiling either way.
+
+After a scheduler crash (a non-cancel failure in the scheduler logic), the
+scheduler nulls ``self._task`` so a later ``submit()`` re-starts it via the
+idempotent ``start()`` and warns once -- the feature self-heals instead of
+silently degrading to inline serial embedding with no re-start.
 
 Exactness
 ---------
@@ -88,9 +96,10 @@ _WINDOW_MS_DEFAULT = 10
 # embed_texts call with a single empty_cache -- no per-request VRAM isolation
 # against a co-resident :8081 chat on the same GPU. embed_texts would happily
 # swallow the entire window; this bounds the aggregated batch so the shared
-# batch never grows unbounded. embed_texts' own sub-batching keeps even an
-# oversized lone job within its model-level budget, so this only needs to be a
-# sane per-shared-batch ceiling, not a per-request limit.
+# batch never grows unbounded. In capped mode embed_texts' own sub-batching
+# keeps even an oversized lone job within its model-level budget; in no-cap
+# mode the aggregator sub-chunks the job's texts to this ceiling (see
+# ``_embed_texts_bounded``), so every embed_texts call stays within it.
 _HARD_CEILING_DEFAULT = 64
 
 
@@ -168,6 +177,10 @@ class EmbedAggregator:
         # to the in-flight batch, so failing only ``_pending`` would orphan them.
         self._inflight_batch = None
         self._next_request_id = 0
+        # One-time "scheduler was dead, re-started" warning (Finding 3): after a
+        # crash self._fail_pending shuts the scheduler off (self._task=None) and
+        # the submit() re-start path warns at most once, not on every request.
+        self._dead_warned = False
 
     @property
     def enabled(self) -> bool:
@@ -210,10 +223,28 @@ class EmbedAggregator:
         identical to the pre-feature route. Enabled: enqueues the request and
         returns once the scheduler has embedded it in a shared batch.
         """
-        if not self._enabled or self._task is None:
-            # Default-off path and the defensive "not started" fallback: never
-            # hold a future that nothing will resolve.
+        if not self._enabled:
+            # Default-off path: never hold a future that nothing will resolve.
             return embed_texts(self._model, self._tokenizer, texts, normalize=True)
+        if self._task is None:
+            # Scheduler task missing while aggregation is on: either it was never
+            # started (route init should have done so) or it DIED from a
+            # non-cancel crash (the except handler nulls self._task). Rather than
+            # silently degrade to inline serial embedding (correct results, but
+            # the feature silently off with no re-start), re-invoke the
+            # idempotent start() so this request is served by a live scheduler.
+            self.start()
+            if self._task is None:
+                # start() was still a no-op (e.g. aggregation became disabled);
+                # fall back to the inline embed so this request still completes.
+                return embed_texts(self._model, self._tokenizer, texts, normalize=True)
+            if not self._dead_warned:
+                self._dead_warned = True
+                logger.warning(
+                    "[EmbedAggregate] scheduler task was absent while enabled; "
+                    "re-started it before serving request -- batching restored. "
+                    "If this recurs, a prior scheduler crash was the cause."
+                )
         loop = asyncio.get_running_loop()
         job = _EmbedJob(self._next_request_id, texts, loop)
         self._next_request_id += 1
@@ -229,14 +260,32 @@ class EmbedAggregator:
         aggregated batch is never VRAM-unbounded even in the model's "no cap"
         (max_prefill_bsz<=0) mode -- a whole window burst never collapses into
         ONE un-isolated embed_texts call. An explicit ``max_bsz`` override
-        (tests) wins unconditionally."""
+        (tests) wins unconditionally, and an override <= 0 means "no cap" too,
+        so it maps to the hard ceiling just like the model's 0."""
         if self._max_bsz is not None:
             cap = int(self._max_bsz)
         else:
             cap = int(getattr(self._model, "max_prefill_bsz", 0) or 0)
-            if cap <= 0:
-                cap = _HARD_CEILING_DEFAULT
-        return cap if cap > 0 else None
+        # ANY cap <= 0 -- the model's "no cap" OR an explicit override <= 0 --
+        # collapses to the hard ceiling. _cap() must ALWAYS yield a positive
+        # int: a None/<=0 cap would hand _fill_batch / the window drain an
+        # unbounded aggregate window (never breaks, never bounded).
+        if cap <= 0:
+            cap = _HARD_CEILING_DEFAULT
+        return cap
+
+    def _no_cap_mode(self) -> bool:
+        """True when the batching-cap source is genuinely absent: the model's
+        ``max_prefill_bsz <= 0`` and (if overridden) the override itself is
+        ``<= 0``. Only here does ``embed_texts`` collapse its WHOLE input into
+        a single batched prefill (``embedding.py`` does
+        ``max_bsz = max(1, len(non_empty))``), so ``_run_batch`` must sub-chunk
+        a lone job's own texts itself to keep every shared-batch call within
+        the hard ceiling; capped mode already has embed_texts' own
+        ``max_prefill_bsz`` sub-batching to lean on."""
+        if self._max_bsz is not None:
+            return int(self._max_bsz) <= 0
+        return int(getattr(self._model, "max_prefill_bsz", 0) or 0) <= 0
 
     def _fill_batch(self, batch, cap):
         """Pop pending jobs into ``batch`` (FIFO) up to the total-text cap.
@@ -316,7 +365,7 @@ class EmbedAggregator:
                 # and resolves its futures: a shutdown cancel is only delivered
                 # here between windows, never mid-batch.
                 self._inflight_batch = None
-                self._run_batch(batch)
+                self._run_batch(batch, cap)
         except asyncio.CancelledError:
             # Scheduled shutdown: resolve every job that has not yet been run --
             # both the still-queued ``_pending`` jobs and any jobs already
@@ -344,13 +393,20 @@ class EmbedAggregator:
                 RuntimeError(f"embed aggregator scheduler failed: {exc}")
             )
             self._task = None
-            raise
+            # Deliberately do NOT re-raise: with ``self._task`` already nulled
+            # there is nothing left to retrieve, so re-raising would just leave
+            # an "exception was never retrieved" warning in the event loop for
+            # nobody to read. The failure was already surfaced to every waiting
+            # caller via their futures (-> per-request 500s), and the next
+            # ``submit()`` re-starts the scheduler via ``start()`` instead of
+            # silently degrading to inline serial embedding.
 
-    def _run_batch(self, batch):
-        """Embed the admitted jobs' texts in ONE ``embed_texts`` call over the
-        concatenated list, then split the per-text vectors back per-request by
-        each job's own text count and resolve its future. Synchronous (no
-        await): a shutdown cancel lands between batches, never mid-batch.
+    def _run_batch(self, batch, cap):
+        """Embed the admitted jobs' texts (sub-chunked per ``_embed_texts_bounded``
+        so no single ``embed_texts`` call exceeds the cap), then split the
+        per-text vectors back per-request by each job's own text count and
+        resolve its future. Synchronous (no await): a shutdown cancel lands
+        between batches, never mid-batch.
 
         ``embed_texts`` is atomic over its input, so a failure fails the whole
         concatenated batch; each job in it gets its OWN copy of the exception
@@ -366,7 +422,7 @@ class EmbedAggregator:
             # Stays on the event-loop thread, exactly as the pre-feature route
             # ran embed_texts (Mod A's offload seam does not cover the embed
             # path; this preserves the existing single-thread-CUDA posture).
-            vectors = embed_texts(self._model, self._tokenizer, texts, normalize=True)
+            vectors = self._embed_texts_bounded(texts, cap)
         except BaseException as exc:
             logger.error("[EmbedAggregate] window of %d request(s) failed: %s",
                          len(batch), exc)
@@ -380,6 +436,38 @@ class EmbedAggregator:
             if not job.future.done():
                 job.future.set_result(vectors[pos:pos + job.n_texts])
             pos += job.n_texts
+
+    def _embed_texts_bounded(self, texts, cap):
+        """Embed ``texts`` (the concatenated window) into per-text vectors,
+        feeding each ``embed_texts`` call at most ``cap`` texts, and return all
+        vectors in input order.
+
+        In no-cap mode (``_no_cap_mode``) ``embed_texts`` collapses its WHOLE
+        input into a single batched prefill, so a lone oversized job (> the hard
+        ceiling) would otherwise slide past the aggregation ceiling as ONE giant
+        ``_embed_batch`` (the HEAD-always-admit rule hands it whole to
+        ``embed_texts``, which has no own cap to fall back on). Sub-chunking the
+        job's own texts into slices of at most the ceiling keeps every
+        shared-batch VRAM spike bounded. In capped mode ``embed_texts`` already
+        sub-batches internally at ``max_prefill_bsz``, so the window is fed
+        whole (ONE call), preserving the existing shared-batch composition
+        exactly.
+
+        Exactness / split-accounting are unaffected: every sub-slice runs the
+        exact same per-text math, so concatenating the per-slice results is
+        byte-identical to one call over the whole list, and ``_run_batch``
+        splits that concatenated result back per request by text count as if a
+        single call had been made."""
+        if not self._no_cap_mode():
+            return embed_texts(self._model, self._tokenizer, texts, normalize=True)
+        out = []
+        for i in range(0, len(texts), cap):
+            out.extend(
+                embed_texts(
+                    self._model, self._tokenizer, texts[i:i + cap], normalize=True
+                )
+            )
+        return out
 
     def _fail_pending(self, exc):
         # Fail both the still-queued jobs and any admitted-but-not-yet-embedded

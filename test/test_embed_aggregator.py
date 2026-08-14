@@ -346,5 +346,120 @@ async def test_no_cap_mode_bounds_aggregated_batch_by_hard_ceiling(fake):
     await agg.stop()
 
 
+# ---------------------------------------------------------------------------
+# Finding-1 (CR1/CR2 round 2): a lone oversized job in NO-CAP mode is sub-chunked.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_lone_oversized_job_no_cap_is_sub_chunked(fake):
+    """Finding-1 regression: ONE job carrying more texts than the hard ceiling,
+    in no-cap mode (model.max_prefill_bsz=0, no explicit override), must be fed
+    to embed_texts in MULTIPLE calls each <= the ceiling (embed_texts would
+    otherwise collapse its whole input into one giant _embed_batch, bypassing
+    the ceiling via the HEAD-always-admit rule) -- AND its per-request result
+    must come back as ONE intact vector list in original order (split accounting
+    preserved across the sub-chunk boundaries)."""
+    ceiling = agg_mod._HARD_CEILING_DEFAULT
+    n_texts = ceiling * 3 + 7
+    big = [f"txt-{i}" for i in range(n_texts)]
+    agg = EmbedAggregator(_FakeModel(), None, enabled=True, window_ms=0)
+    agg.start()
+
+    result = await agg.submit(big)  # a single job with n_texts >> ceiling
+
+    # Per-request result still one intact list, original order, full length.
+    assert len(result) == n_texts
+    assert result == [_vec(t) for t in big]
+    # No single embed_texts call exceeds the ceiling, and the job's texts were
+    # sub-chunked across more than one call (proves Finding 1 is actually fixed,
+    # not just re-windowed).
+    assert fake.calls, "the oversized job must actually reach embed_texts"
+    assert len(fake.calls) > 1, "a lone oversized job must be sub-chunked"
+    assert all(len(c) <= ceiling for c in fake.calls)
+    assert sum(len(c) for c in fake.calls) == n_texts
+    # Split accounting: the texts fed across all sub-chunk calls reassemble the
+    # original request's text list in order (every text embedded exactly once,
+    # none dropped/duplicated/reordered across the chunk boundaries).
+    assert [t for call in fake.calls for t in call] == big
+    await agg.stop()
+
+
+# ---------------------------------------------------------------------------
+# Finding-2 (CR1/CR2 round 2): _cap() never returns None (override <= 0 bounded).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_override_zero_still_bounds_window_and_cap_not_none(fake):
+    """Finding-2 regression: an explicit max_bsz override <= 0 (here 0) must
+    NEVER make _cap() return None -- otherwise _fill_batch / the window drain
+    treats the aggregate window as unbounded and _run_batch would not bound
+    embed_texts. It must collide to the hard ceiling (positive int >= 1), so a
+    concurrent burst is still chunked into bounded embed_texts calls."""
+    ceiling = agg_mod._HARD_CEILING_DEFAULT
+    agg = EmbedAggregator(_FakeModel(), None, enabled=True, window_ms=0, max_bsz=0)
+
+    cap = agg._cap()
+    assert cap == ceiling, f"override 0 must map to the ceiling, got {cap!r}"
+    assert isinstance(cap, int) and cap >= 1
+
+    agg.start()
+    n_jobs = ceiling + 4  # more single-text jobs than one window's ceiling
+    futures = [agg.submit([f"o{i}"]) for i in range(n_jobs)]
+    results = await asyncio.gather(*futures)
+
+    assert all(len(r) == 1 for r in results)
+    assert len(results) == n_jobs
+    assert fake.calls
+    assert all(len(c) <= ceiling for c in fake.calls)
+    assert sum(len(c) for c in fake.calls) == n_jobs
+    assert len(fake.calls) > 1
+    await agg.stop()
+
+
+# ---------------------------------------------------------------------------
+# Finding-3 (CR1/CR2 round 2): a crashed scheduler is re-started on next submit.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.anyio
+async def test_submit_restarts_dead_scheduler(fake, monkeypatch):
+    """Finding-3 regression: after a non-cancel scheduler crash (self._task is
+    nulled by the except handler) the next submit() must re-start the scheduler
+    (via the idempotent start()) and be served by a FRESH task -- not silently
+    degraded to inline serial embedding with no re-start."""
+    real_fill = agg_mod.EmbedAggregator._fill_batch
+    stage = {"n": 0}
+
+    def crashing_fill(self, batch, cap):
+        stage["n"] += 1
+        if stage["n"] == 1:
+            raise RuntimeError("simulated scheduler crash")
+        return real_fill(self, batch, cap)
+
+    monkeypatch.setattr(agg_mod.EmbedAggregator, "_fill_batch", crashing_fill)
+
+    agg = EmbedAggregator(_FakeModel(), None, enabled=True, window_ms=0, max_bsz=10)
+    agg.start()
+
+    # First request drives the FIRST _fill_batch, which crashes the scheduler;
+    # the pending request is failed (per-request exception), never orphaned.
+    with pytest.raises(RuntimeError, match="simulated scheduler crash"):
+        await agg.submit(["boom"])
+    assert agg._task is None, "the crash must have nulled the scheduler task"
+
+    # Nothing was embedded yet (the crash happened before any embed_texts call).
+    assert fake.calls == []
+
+    # The next submit() must re-start the scheduler and be served by a fresh
+    # task, NOT silently degraded to inline serial embedding (which would skip
+    # the queue entirely and never touch fake.calls in the same batching shape).
+    result = await agg.submit(["hello"])
+    assert result == [_vec("hello")]
+    assert agg._task is not None, "submit() must have re-started the scheduler"
+    assert fake.calls == [["hello"]]
+    assert agg.pending_count == 0
+    await agg.stop()
+    assert agg._task is None
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
