@@ -9,7 +9,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
-from API_servers.router import openai_router, responses_router, state_router, v1_router, v2_router
+from API_servers.router import (
+    embedding_router,
+    openai_router,
+    responses_router,
+    state_router,
+    v1_router,
+    v2_router,
+)
 
 
 def create_app(engine, password=None):
@@ -54,5 +61,6 @@ def create_app(engine, password=None):
     app.include_router(state_router)
     app.include_router(openai_router)
     app.include_router(responses_router)
+    app.include_router(embedding_router)
 
     return app
