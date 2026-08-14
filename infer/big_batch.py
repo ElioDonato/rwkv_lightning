@@ -59,11 +59,22 @@ class BigBatchMixin:
             # worth knowing if this loop is ever refactored to persist state
             # across requests.
             with inference_deps.get_torch().no_grad():
-                state = self.model.generate_zero_state(batch_size)
-                encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
-                out = self._forward_batch_prompts_chunked(
-                    encoded_prompts, state, cancel_token=cancel_token
+                state = await self._offload_gpu(
+                    self.model.generate_zero_state, batch_size
                 )
+                encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
+
+                # Prefill is the first heavy GPU forward of the request; run it
+                # on the GPU-worker thread under the opt-in. The no_grad() re-entry
+                # mirrors this method's ambient no_grad scope (no_grad is safe
+                # across the async/thread boundary; inference_mode would NOT be).
+                def _gpu_prefill():
+                    with inference_deps.get_torch().no_grad():
+                        return self._forward_batch_prompts_chunked(
+                            encoded_prompts, state, cancel_token=cancel_token
+                        )
+
+                out = await self._offload_gpu(_gpu_prefill)
 
                 finished = [False] * batch_size
                 stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
@@ -89,20 +100,29 @@ class BigBatchMixin:
 
                 while not all(finished) and max_length > 0:
                     self._raise_if_cancelled(cancel_token)
-                    new_tokens_tensor = inference_deps.get_sampler_gumbel_batch()(
-                        logits=out, temp=temperature
-                    )
 
-                    # Feed the sampled tokens straight back into the model as a GPU tensor
-                    # (no host round-trip); the single .tolist() sync below is only for
-                    # stop-string detection, which needs plain Python ints.
+                    # One full GPU decode step -- sample a token from the current
+                    # logits, feed it straight back through the model, and pull the
+                    # tokens to CPU -- executed as a single unit on the GPU-worker
+                    # thread under the opt-in. Keeping sampling + forward_batch +
+                    # .tolist() together in ONE offload unit is what preserves the
+                    # single-thread-CUDA guarantee under concurrent requests: no
+                    # event-loop thread ever issues its own CUDA call (sampling is
+                    # a GPU op too) while the worker has a forward in flight.
+                    # no_grad() re-entry mirrors the ambient no_grad scope above.
                     prev_out = out
-                    out = self.model.forward_batch(new_tokens_tensor, state)
-                    del prev_out
 
-                    new_tokens = new_tokens_tensor.tolist()
-                    del new_tokens_tensor
-                    new_tokens_tensor = None
+                    def _gpu_decode_step():
+                        with inference_deps.get_torch().no_grad():
+                            new_tokens_tensor = inference_deps.get_sampler_gumbel_batch()(
+                                logits=out, temp=temperature
+                            )
+                            new_out = self.model.forward_batch(new_tokens_tensor, state)
+                            new_tokens = new_tokens_tensor.tolist()
+                            return new_out, new_tokens
+
+                    out, new_tokens = await self._offload_gpu(_gpu_decode_step)
+                    del prev_out
 
                     max_length -= 1
                     step_count += 1
@@ -192,9 +212,14 @@ class BigBatchMixin:
                         ]
                         if len(still_active_slots) < len(active_indices):
                             newly_freed = len(active_indices) - len(still_active_slots)
-                            state, out, active_indices = self._compact_active_rows(
-                                state, out, active_indices, still_active_slots
-                            )
+
+                            def _gpu_compact():
+                                with inference_deps.get_torch().no_grad():
+                                    return self._compact_active_rows(
+                                        state, out, active_indices, still_active_slots
+                                    )
+
+                            state, out, active_indices = await self._offload_gpu(_gpu_compact)
                             if permit_box and permit_box[0] is not None:
                                 # Give the freed row(s) back to the shared
                                 # prefill-admission budget right now, not at
@@ -211,7 +236,11 @@ class BigBatchMixin:
                                 )
 
                     if step_count % cleanup_interval == 0:
-                        self._cleanup_cuda_memory()
+                        # empty_cache/synchronize are CUDA calls that must NOT
+                        # run on the event-loop thread while the worker has a
+                        # forward in flight (single-thread-CUDA). Route them
+                        # through the same seam as the forwards.
+                        await self._offload_gpu(self._cleanup_cuda_memory)
 
                 remaining_contents = [""] * batch_size
                 for i in range(batch_size):
@@ -263,7 +292,9 @@ class BigBatchMixin:
                 del token_buffers
             if new_tokens is not None:
                 del new_tokens
-            self._cleanup_cuda_memory()
+            # empty_cache is a CUDA call; keep it off the event-loop thread
+            # under the opt-in (same seam the forwards already use).
+            await self._offload_gpu(self._cleanup_cuda_memory)
 
         yield "data: [DONE]\n\n"
 

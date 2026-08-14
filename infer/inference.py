@@ -6,6 +6,7 @@ import asyncio
 from collections import deque
 
 from infer import inference_deps
+from infer.async_forward import GpuAsyncExecutor
 from infer.batch_inference import BatchInferenceMixin
 from infer.big_batch import BigBatchMixin
 from infer.cancellation import InferenceCancelled, PrefillBszLimitExceeded
@@ -26,11 +27,54 @@ class InferenceEngine(
         self._prefill_reserved_bsz = 0
         self._prefill_next_ticket = 0
         self._prefill_condition = None
+        # OPT-IN OFF-by-default GPU-worker executor (see infer/async_forward.py).
+        # Owns the single GPU-worker thread that the async decode loops hand
+        # their blocking torch calls to when RWKV_ASYNC_FORWARD is enabled.
+        # While disabled it is a no-op pass-through so the default serving path
+        # is byte-identical to before this feature.
+        self._gpu_executor = GpuAsyncExecutor()
 
     def _get_prefill_condition(self):
         if self._prefill_condition is None:
             self._prefill_condition = asyncio.Condition()
         return self._prefill_condition
+
+    async def _offload_gpu(self, fn, *args, **kwargs):
+        """Funnel one blocking torch call through the single GPU-worker thread.
+
+        This is the event-loop -> single-worker handoff seam for Mod A. When the
+        opt-in (RWKV_ASYNC_FORWARD) is enabled, `fn` runs on the dedicated
+        GPU-worker thread (serialized to exactly one thread, see
+        infer/async_forward.GpuAsyncExecutor) and the event loop continues
+        servicing other requests while it awaits the result. When disabled
+        (the default), it runs `fn(*args, **kwargs)` inline on the calling
+        event-loop thread -- byte-identical to the pre-feature serving path, so
+        the opt-in can only be activated after measurement validates it.
+
+        Thread-safety note: the caller is responsible for keeping the decode
+        loop's *Python* bookkeeping on the event loop; only the GPU-touching
+        callables are handed here. The big_batch_stream path wraps its forwarded
+        closures in torch.no_grad() to mirror that method's ambient no_grad
+        scope (no_grad is safe across the async/thread boundary, whereas
+        torch.inference_mode is thread-local and must NOT be relied on here).
+
+        SCOPE OF THE GUARANTEE: the single-CUDA-thread invariant applies only
+        to the offloaded STREAMING decode paths that funnel every GPU unit
+        (prefill, each sampling+forward+decode step, sampler init, cleanup)
+        through this seam -- big_batch_stream, _batch_decode_streaming, and the
+        single/state streaming endpoints. Under the opt-in NO CUDA op runs on
+        the event-loop thread while the worker is active. It is intentionally
+        NOT a global "single CUDA thread" claim: the blocking non-streaming
+        cores (_batch_decode_blocking behind batch_generate/batch_generate_v2,
+        plus batch_generate_state) execute on Starlette's anyio threadpool and
+        are NOT routed through this seam (their cleanup/sampler-init too), so
+        their CUDA calls live on a separate, pool-managed thread. See
+        infer/async_forward.GpuAsyncExecutor for the same boundary.
+        """
+        executor = self._gpu_executor
+        if executor.enabled:
+            return await executor.offload(fn, *args, **kwargs)
+        return fn(*args, **kwargs)
 
     async def acquire_prefill_permit(
         self, request_bsz: int, request_label: str = "", cancel_token=None
@@ -195,6 +239,7 @@ class InferenceEngine(
             condition.notify_all()
 
     def shutdown(self):
-        # No engine-owned resources currently require explicit teardown.
+        # Release the opt-in GPU-worker thread if it was ever started (a no-op
+        # when RWKV_ASYNC_FORWARD was off, since no executor/thread exists).
         # Kept as a stable hook since app.py calls engine.shutdown() on exit.
-        pass
+        self._gpu_executor.shutdown()
