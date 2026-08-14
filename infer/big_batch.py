@@ -236,7 +236,11 @@ class BigBatchMixin:
                                 )
 
                     if step_count % cleanup_interval == 0:
-                        self._cleanup_cuda_memory()
+                        # empty_cache/synchronize are CUDA calls that must NOT
+                        # run on the event-loop thread while the worker has a
+                        # forward in flight (single-thread-CUDA). Route them
+                        # through the same seam as the forwards.
+                        await self._offload_gpu(self._cleanup_cuda_memory)
 
                 remaining_contents = [""] * batch_size
                 for i in range(batch_size):
@@ -288,7 +292,9 @@ class BigBatchMixin:
                 del token_buffers
             if new_tokens is not None:
                 del new_tokens
-            self._cleanup_cuda_memory()
+            # empty_cache is a CUDA call; keep it off the event-loop thread
+            # under the opt-in (same seam the forwards already use).
+            await self._offload_gpu(self._cleanup_cuda_memory)
 
         yield "data: [DONE]\n\n"
 

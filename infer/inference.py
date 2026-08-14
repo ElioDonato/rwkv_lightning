@@ -57,6 +57,19 @@ class InferenceEngine(
         closures in torch.no_grad() to mirror that method's ambient no_grad
         scope (no_grad is safe across the async/thread boundary, whereas
         torch.inference_mode is thread-local and must NOT be relied on here).
+
+        SCOPE OF THE GUARANTEE: the single-CUDA-thread invariant applies only
+        to the offloaded STREAMING decode paths that funnel every GPU unit
+        (prefill, each sampling+forward+decode step, sampler init, cleanup)
+        through this seam -- big_batch_stream, _batch_decode_streaming, and the
+        single/state streaming endpoints. Under the opt-in NO CUDA op runs on
+        the event-loop thread while the worker is active. It is intentionally
+        NOT a global "single CUDA thread" claim: the blocking non-streaming
+        cores (_batch_decode_blocking behind batch_generate/batch_generate_v2,
+        plus batch_generate_state) execute on Starlette's anyio threadpool and
+        are NOT routed through this seam (their cleanup/sampler-init too), so
+        their CUDA calls live on a separate, pool-managed thread. See
+        infer/async_forward.GpuAsyncExecutor for the same boundary.
         """
         executor = self._gpu_executor
         if executor.enabled:

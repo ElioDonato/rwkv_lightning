@@ -241,10 +241,15 @@ class BatchInferenceMixin:
                 # as a single unit on the GPU-worker thread under the opt-in, so
                 # the event-loop thread never issues its own CUDA call while the
                 # worker has a forward in flight (single-thread-CUDA guarantee).
+                # no_grad() re-entry mirrors big_batch_stream's closures (no_grad
+                # is thread-boundary-safe; inference_mode is thread-local and is
+                # NOT used here) so the offloaded closures behave identically in
+                # both modes instead of silently differing.
                 def _gpu_decode_step():
-                    new_tokens_tensor = sampler.sample(out)
-                    new_out = self.model.forward_batch(new_tokens_tensor, state).float()
-                    new_tokens = new_tokens_tensor.tolist()
+                    with inference_deps.get_torch().no_grad():
+                        new_tokens_tensor = sampler.sample(out)
+                        new_out = self.model.forward_batch(new_tokens_tensor, state).float()
+                        new_tokens = new_tokens_tensor.tolist()
                     return new_out, new_tokens
 
                 out, new_tokens = await self._offload_gpu(_gpu_decode_step)
@@ -292,10 +297,11 @@ class BatchInferenceMixin:
                     still_active = [p for p in range(n_active) if p not in set(newly_finished_positions)]
                     if still_active:
                         def _gpu_compact():
-                            idx_t = torch.tensor(still_active, device=out.device, dtype=torch.long)
-                            new_out = out[idx_t]
-                            sampler.compact(idx_t)
-                            new_state = [state[0][:, :, idx_t], state[1][:, idx_t], state[2][idx_t]]
+                            with inference_deps.get_torch().no_grad():
+                                idx_t = torch.tensor(still_active, device=out.device, dtype=torch.long)
+                                new_out = out[idx_t]
+                                sampler.compact(idx_t)
+                                new_state = [state[0][:, :, idx_t], state[1][:, idx_t], state[2][idx_t]]
                             return new_out, new_state
 
                         out, state = await self._offload_gpu(_gpu_compact)
@@ -324,8 +330,18 @@ class BatchInferenceMixin:
         finally:
             if state is not None:
                 del state
-            inference_deps.get_torch().cuda.empty_cache()
-            gc.collect()
+
+            # empty_cache/gc are CUDA-touching cleanup; route them through the
+            # same seam so they never run on the event-loop thread while the
+            # worker has a forward in flight. Default-off runs this inline,
+            # preserving the exact original cleanup (no added synchronize -- use
+            # a closure mirroring the raw calls, not _cleanup_cuda_memory which
+            # would add a cuda.synchronize() to the default path).
+            def _cleanup():
+                inference_deps.get_torch().cuda.empty_cache()
+                gc.collect()
+
+            await self._offload_gpu(_cleanup)
 
         yield "data: [DONE]\n\n"
 
@@ -375,11 +391,19 @@ class BatchInferenceMixin:
         batch_size = len(prompts)
         vocab_size = self.model.args.vocab_size
         torch = inference_deps.get_torch()
-        sampler = _V2BatchSampler(
-            batch_size, vocab_size, device="cuda", dtype=torch.float32,
-            temperature=temperature, top_k=top_k, top_p=top_p,
-            alpha_presence=alpha_presence, alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
-        )
+
+        # Sampler construction allocates CUDA state (setup_rand kernels /
+        # torch.zeros on device="cuda"); route it through the seam so it never
+        # runs on the event-loop thread while the worker is active under the
+        # opt-in. Default-off runs it inline (byte-identical).
+        def _make_sampler():
+            return _V2BatchSampler(
+                batch_size, vocab_size, device="cuda", dtype=torch.float32,
+                temperature=temperature, top_k=top_k, top_p=top_p,
+                alpha_presence=alpha_presence, alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
+            )
+
+        sampler = await self._offload_gpu(_make_sampler)
         async for chunk in self._batch_decode_streaming(prompts, sampler, max_length, stop_tokens, chunk_size, cancel_token,
                                                         prefix_cache_manager=prefix_cache_manager):
             yield chunk
@@ -427,11 +451,19 @@ class BatchInferenceMixin:
     ):
         batch_size = len(prompts)
         vocab_size = self.model.args.vocab_size
-        sampler = _V1BatchSampler(
-            batch_size, vocab_size, device="cuda",
-            temperature=temperature, top_k=top_k, top_p=top_p,
-            alpha_presence=alpha_presence, alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
-        )
+
+        # Sampler construction allocates CUDA state (setup_rand kernels /
+        # torch.zeros on device="cuda"); route it through the seam so it never
+        # runs on the event-loop thread while the worker is active under the
+        # opt-in. Default-off runs it inline (byte-identical).
+        def _make_sampler():
+            return _V1BatchSampler(
+                batch_size, vocab_size, device="cuda",
+                temperature=temperature, top_k=top_k, top_p=top_p,
+                alpha_presence=alpha_presence, alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
+            )
+
+        sampler = await self._offload_gpu(_make_sampler)
         async for chunk in self._batch_decode_streaming(prompts, sampler, max_length, stop_tokens, chunk_size, cancel_token,
                                                         prefix_cache_manager=prefix_cache_manager):
             yield chunk
@@ -528,8 +560,16 @@ class BatchInferenceMixin:
             out = await self._offload_gpu(
                 self._forward_tokens_chunked, tokens, state, cancel_token=cancel_token
             )
-            sample_rand_states = inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1)
-            penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
+            # setup_rand (CUDA RNG-state alloc kernel) + penalty-tensor cuda-alloc
+            # are CUDA ops; route them through the seam so they never run on the
+            # event-loop thread while the worker is active under the opt-in.
+            def _sampler_init():
+                return (
+                    inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1),
+                    inference_deps.get_torch().zeros(1, out.size(-1), device=out.device),
+                )
+
+            sample_rand_states, penalties = await self._offload_gpu(_sampler_init)
 
             stop_state = self._create_stop_state(stop_tokens)
             buffered_tokens = 0
@@ -542,17 +582,18 @@ class BatchInferenceMixin:
                     out = out.unsqueeze(0)
 
                 def _gpu_sample():
-                    return inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                        out,
-                        penalties,
-                        sample_rand_states,
-                        alpha_presence,
-                        alpha_frequency,
-                        alpha_decay,
-                        temperature,
-                        top_k,
-                        top_p,
-                    ).tolist()
+                    with inference_deps.get_torch().no_grad():
+                        return inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                            out,
+                            penalties,
+                            sample_rand_states,
+                            alpha_presence,
+                            alpha_frequency,
+                            alpha_decay,
+                            temperature,
+                            top_k,
+                            top_p,
+                        ).tolist()
 
                 new_tokens = await self._offload_gpu(_gpu_sample)
 
@@ -610,8 +651,14 @@ class BatchInferenceMixin:
                 logger.info(f"[RESPONSE] /state/chat/completions state[2]: {state[2]}")
 
             del state
-            inference_deps.get_torch().cuda.empty_cache()
-            gc.collect()
+
+            # empty_cache/gc are CUDA-touching cleanup; keep them off the
+            # event-loop thread under the opt-in (see _batch_decode_streaming).
+            def _cleanup():
+                inference_deps.get_torch().cuda.empty_cache()
+                gc.collect()
+
+            await self._offload_gpu(_cleanup)
 
         yield "data: [DONE]\n\n"
 
@@ -643,8 +690,16 @@ class BatchInferenceMixin:
                 prefix_cache_manager=prefix_cache_manager,
                 cancel_token=cancel_token,
             )
-            sample_rand_states = inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1)
-            penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
+            # setup_rand (CUDA RNG-state alloc kernel) + penalty-tensor cuda-alloc
+            # are CUDA ops; route them through the seam so they never run on the
+            # event-loop thread while the worker is active under the opt-in.
+            def _sampler_init():
+                return (
+                    inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1),
+                    inference_deps.get_torch().zeros(1, out.size(-1), device=out.device),
+                )
+
+            sample_rand_states, penalties = await self._offload_gpu(_sampler_init)
 
             while max_length > 0:
                 self._raise_if_cancelled(cancel_token)
@@ -652,17 +707,18 @@ class BatchInferenceMixin:
                 logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
 
                 def _gpu_sample():
-                    return inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                        logits_reshaped,
-                        penalties,
-                        sample_rand_states,
-                        alpha_presence,
-                        alpha_frequency,
-                        alpha_decay,
-                        temperature,
-                        top_k,
-                        top_p,
-                    ).tolist()
+                    with inference_deps.get_torch().no_grad():
+                        return inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                            logits_reshaped,
+                            penalties,
+                            sample_rand_states,
+                            alpha_presence,
+                            alpha_frequency,
+                            alpha_decay,
+                            temperature,
+                            top_k,
+                            top_p,
+                        ).tolist()
 
                 new_tokens = await self._offload_gpu(_gpu_sample)
 
@@ -716,8 +772,16 @@ class BatchInferenceMixin:
             stop_state = self._create_stop_state(stop_tokens)
             buffered_tokens = 0
             text_buffer = ""
-            sample_rand_states = inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1)
-            penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
+            # setup_rand (CUDA RNG-state alloc kernel) + penalty-tensor cuda-alloc
+            # are CUDA ops; route them through the seam so they never run on the
+            # event-loop thread while the worker is active under the opt-in.
+            def _sampler_init():
+                return (
+                    inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1),
+                    inference_deps.get_torch().zeros(1, out.size(-1), device=out.device),
+                )
+
+            sample_rand_states, penalties = await self._offload_gpu(_sampler_init)
 
             while max_length > 0:
                 self._raise_if_cancelled(cancel_token)
@@ -725,17 +789,18 @@ class BatchInferenceMixin:
                 logits_reshaped = out.unsqueeze(0) if out.dim() == 1 else out
 
                 def _gpu_sample():
-                    return inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                        logits_reshaped,
-                        penalties,
-                        sample_rand_states,
-                        alpha_presence,
-                        alpha_frequency,
-                        alpha_decay,
-                        temperature,
-                        top_k,
-                        top_p,
-                    ).tolist()
+                    with inference_deps.get_torch().no_grad():
+                        return inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                            logits_reshaped,
+                            penalties,
+                            sample_rand_states,
+                            alpha_presence,
+                            alpha_frequency,
+                            alpha_decay,
+                            temperature,
+                            top_k,
+                            top_p,
+                        ).tolist()
 
                 new_tokens = await self._offload_gpu(_gpu_sample)
 
@@ -791,7 +856,13 @@ class BatchInferenceMixin:
         finally:
             if state is not None:
                 del state
-            inference_deps.get_torch().cuda.empty_cache()
-            gc.collect()
+
+            # empty_cache/gc are CUDA-touching cleanup; keep them off the
+            # event-loop thread under the opt-in (see _batch_decode_streaming).
+            def _cleanup():
+                inference_deps.get_torch().cuda.empty_cache()
+                gc.collect()
+
+            await self._offload_gpu(_cleanup)
 
         yield "data: [DONE]\n\n"

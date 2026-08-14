@@ -272,5 +272,189 @@ def test_big_batch_both_modes_produce_valid_sse_streams():
         assert chunks[-1] == "data: [DONE]\n\n", "stream must terminate with [DONE]"
 
 
+# ---------------------------------------------------------------------------
+# CR1 regressions: (1) no CUDA op may run on the event-loop thread while the
+# worker is active under the opt-in (cleanup/_cleanup_cuda_memory + sampler
+# init/setup_rand were left on the loop by the original diff); (2) shutdown()
+# must disable the executor so nothing ever falls through to the loop's DEFAULT
+# multi-thread executor; (4) offloaded batch_inference decode closures must
+# re-enter torch.no_grad() in BOTH modes (no mode-dependent asymmetry).
+# ---------------------------------------------------------------------------
+
+
+# -- Finding 2: shutdown() must disable, and post-shutdown offload stays safe --
+
+@pytest.mark.anyio
+async def test_shutdown_sets_enabled_false_and_post_shutdown_offload_runs_inline():
+    """shutdown() must flip _enabled off (exposed via `enabled`) AND release the
+    executor, so that any post-shutdown offload() NEVER reaches the loop's default
+    multi-thread ThreadPoolExecutor (which would re-open multi-threaded CUDA).
+    The post-shutdown offload must run inline on the caller, proving no new
+    executor/thead is used."""
+    executor = GpuAsyncExecutor(enabled=True)
+    assert executor.enabled is True
+
+    first = []
+    await executor.offload(lambda: first.append(threading.get_ident()) or "worker")
+
+    executor.shutdown()
+    assert executor.enabled is False, "shutdown must flip enabled off"
+    assert executor._executor is None, "shutdown must release the worker"
+
+    caller = threading.get_ident()
+    after = []
+    result = await executor.offload(
+        lambda: after.append(threading.get_ident()) or 42
+    )
+    assert result == 42
+    # Runs inline on the caller -> cannot have gone to any executor.
+    assert after == [caller], (
+        "post-shutdown offload must run inline, never on the loop's DEFAULT executor"
+    )
+
+
+def test_engine_shutdown_flips_executor_disabled_and_post_shutdown_runs_inline():
+    """engine.shutdown() (the hook app.py calls) must leave _gpu_executor
+    disabled and running inline, so a shutdown engine never submits to a
+    default multi-thread executor either."""
+    engine = _make_engine(enabled=True)
+    assert engine._gpu_executor.enabled is True
+
+    caller = threading.get_ident()
+    ran_on = []
+
+    async def _main():
+        # exercise one real worker offload before shutdown
+        await engine._offload_gpu(lambda: ran_on.append(threading.get_ident()))
+        engine.shutdown()
+        assert engine._gpu_executor.enabled is False, "engine.shutdown must disable"
+        result = await engine._offload_gpu(
+            lambda: ran_on.append(threading.get_ident()) or 7
+        )
+        assert result == 7
+
+    asyncio.run(_main())
+    # Only the pre-shutdown offload left the event loop; the post-shutdown one
+    # must have run inline on the caller thread.
+    assert ran_on[0] != caller
+    assert ran_on[-1] == caller
+
+
+# -- Finding 1: cleanup (_cleanup_cuda_memory) moves to the worker when enabled
+
+def _record_cleanup_thread():
+    """Return a (list, fn) pair: fn shadows engine._cleanup_cuda_memory to
+    record the thread id it runs on and mirrors the real static's CPU-safe
+    behavior (gc.collect(); on CPU cuda.is_available() is False so it returns
+    before any synchronize/empty_cache)."""
+    import gc
+
+    threads = []
+
+    def _record():
+        threads.append(threading.get_ident())
+        gc.collect()
+
+    return threads, _record
+
+
+def test_big_batch_cleanup_offloaded_to_worker_when_enabled():
+    """Finding 1: big_batch_stream's finally cleanup (_cleanup_cuda_memory, a
+    CUDA-touching op) must run on the single worker thread under the opt-in --
+    never on the event-loop thread worrying about a worker forward in flight."""
+    threads, record = _record_cleanup_thread()
+    engine = _make_engine(enabled=True)
+    engine._cleanup_cuda_memory = record
+    caller = threading.get_ident()
+
+    _collect(engine, max_length=4)
+
+    assert threads, "finally cleanup must have run"
+    assert threads[0] != caller, "opt-in: cleanup must run on the worker thread"
+    engine.shutdown()
+
+
+def test_big_batch_cleanup_stays_on_loop_when_default_off():
+    """Findings 1: with the opt-in off, cleanup stays on the (calling) event-loop
+    thread exactly as before -- only the opt-in path ever moves it."""
+    threads, record = _record_cleanup_thread()
+    engine = _make_engine(enabled=False)
+    engine._cleanup_cuda_memory = record
+    caller = threading.get_ident()
+
+    _collect(engine, max_length=4)
+
+    assert threads, "finally cleanup must have run"
+    assert threads[0] == caller, "default-off: cleanup must stay on the loop thread"
+
+
+# -- Findings 1 + 4: batch_infer_stream sampler-init thread + no_grad re-entry
+
+def test_batch_infer_stream_sampler_init_and_decode_no_grad():
+    """Finding 1 + 4, both modes:
+    - sampler construction (setup_rand / cuda-alloc, the CUDA ops the seam must
+      funnel) must run on the worker thread when enabled, and on the calling
+      (event-loop) thread when default-off;
+    - the offloaded _gpu_decode_step closure must re-enter torch.no_grad() in
+      BOTH modes (no mode-dependent asymmetry), asserted by observing
+      torch.is_grad_enabled() inside sampler.sample.
+    Uses a fake _V1BatchSampler (CPU, no CUDA alloc) so this is hermetic; the
+    real sampler's setup_rand genuinely needs a CUDA device and is excised here.
+    """
+    from types import SimpleNamespace
+
+    import infer.batch_inference as batch_mod
+
+    init_threads = []
+    grad_flags = []
+
+    class _FakeV1Sampler:
+        """CPU-only stand-in: __init__ records its thread (setup_rand/cuda-alloc
+        would be the CUDA ops here); sample() is a greedy argmax that records
+        whether no_grad was re-entered by the enclosing decode closure."""
+
+        def __init__(self, batch_size, vocab_size, device, temperature,
+                     top_k, top_p, alpha_presence, alpha_frequency, alpha_decay):
+            init_threads.append(threading.get_ident())
+
+        def sample(self, logits):
+            grad_flags.append(torch.is_grad_enabled())
+            return logits.argmax(dim=-1, keepdim=True)
+
+        def compact(self, idx_t):
+            pass
+
+    for enabled in (False, True):
+        init_threads.clear()
+        grad_flags.clear()
+        engine = _make_engine(enabled=enabled)
+        engine.model.args = SimpleNamespace(vocab_size=engine.model.vocab)
+        batch_mod._V1BatchSampler = _FakeV1Sampler
+
+        async def _run():
+            async for _ in engine.batch_infer_stream(
+                prompts=["hello", "world"], max_length=4
+            ):
+                pass
+
+        caller = threading.get_ident()
+        asyncio.run(_run())
+
+        assert init_threads, "sampler init must have run"
+        if enabled:
+            assert init_threads[0] != caller, (
+                "opt-in: sampler init (setup_rand/cuda-alloc) must run on the worker"
+            )
+        else:
+            assert init_threads[0] == caller, (
+                "default-off: sampler init must stay on the calling thread"
+            )
+
+        assert grad_flags, "decode path must have sampled"
+        assert all(not g for g in grad_flags), (
+            "offloaded decode closure must re-enter no_grad in both modes"
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
