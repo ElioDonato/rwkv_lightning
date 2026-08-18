@@ -312,7 +312,14 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
 
 void cuda_forward_seq(int B, int T, int C, int H, F *state, F *r, F *w, F *k, F *v, F *a, F *b, F *y, int *elapsed_t){
     assert(H * _N_ == C);
-    kernel_forward_w0_fp16_dither_seq<<<B * H, _N_>>>(B, T, C, H, state, r, w, k, v, a, b, y, elapsed_t);
+    // Must launch on the CURRENT CUDA stream (like cuda_forward_one below):
+    // previously this seq/batch kernel used the implicit legacy stream, which
+    // made it run on a DIFFERENT stream than every other op when captured in a
+    // CUDA graph, so graph replay diverged. Launching on the current stream is
+    // a no-op for eager execution (current == default) and is what makes the
+    // decode step capturable.
+    auto stream = at::cuda::getCurrentCUDAStream();
+    kernel_forward_w0_fp16_dither_seq<<<B * H, _N_, 0, stream>>>(B, T, C, H, state, r, w, k, v, a, b, y, elapsed_t);
 }
 
 void cuda_forward_one(int B, int C, int H, F *state, F *r, F *w, F *k, F *v, F *a, F *b, F *y, int *elapsed_t){
