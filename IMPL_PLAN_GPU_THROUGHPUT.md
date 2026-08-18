@@ -217,8 +217,21 @@ Disjoint files per track; working-tree edits only; full-gate then ONE coordinato
 - Correctness: temp=0-crash fixed; e2e clean; per-row==batchwide equivalence validated on GPU
   (s1 test); full suite 153 passed.
 
-## Remaining
-- **Phase 5** (CUDA-graph capture of the full decode step, per-size graph pool) — unstarted;
-  the kernel stream blocker is already fixed in 3b, so the prerequisite is in place.
-- Optional: an inline-solo head-fire to scrape solo TTFT toward ~13 ms (still above the strict gate;
-  low priority given acceptance).
+## Phase 5 measured outcome (real GPU) — COMPLETE
+- `5373618` phase5/sA `CudaGraphForward` (per-size graph pool 1/2/4/8, static buffers, eager
+  sampling/.tolist() outside capture, default-off `RWKV_CUDA_GRAPH`). GPU graph-vs-eager
+  byte-identical (argmax identical, deterministic); full suite green (1 known-flaky real-GPU test
+  confirmed flaky).
+- Measured (dynamic + graph, opt-in): **N=8 431.7 tok/s** vs 344–363 dynamic-only vs 84.3 baseline
+  = **~5.1× baseline**. Warm solo per-token 11.4 ms (slightly better than dynamic-only ~13 ms),
+  TTFT ~37 ms. Only cost is a one-time ~1.3 s graph capture on the process's first decode (amortized,
+  opt-in only). So CUDA-graph capture on this model DID pay off on top of dynamic batching.
+
+## Final combined opt-in result
+`RWKV_DYNAMIC_BATCH=1 RWKV_CUDA_GRAPH=1` => N=8 throughput ~5.1× baseline (431 vs 84.3 tok/s),
+solo byte-identical unless enabled; per-token solo broadly unchanged/faster. All flags default OFF.
+
+## Remaining / deferred
+- An inline-solo head-fire to scrape solo TTFT toward ~13 ms (still above the strict gate) — low
+  priority given acceptance of the opt-in trade.
+- Unifying sampler *values*, opt-in auto-enable, pipelining — deferred per "Decisions deferred".
