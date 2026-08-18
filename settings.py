@@ -171,6 +171,16 @@ class Settings:
             "dynamic-batch fused-row hard ceiling per decode batch",
         )
 
+        # -- CUDA-graph decode forward (opt-in, Phase 5) -----------------------
+        # Replay model.forward_batch as a per-size CUDA graph to cut host launch
+        # overhead on the decode step. Default-off: the graph module is inert and
+        # the dynamic decoder calls the raw forward_batch, byte-identical to the
+        # pre-Phase-5 path.
+        self.cuda_graph_decode = self._get_bool(
+            env, "RWKV_CUDA_GRAPH", False,
+            "opt-in CUDA-graph replay of the decode forward",
+        )
+
     # -- typed environment accessors ------------------------------------------
     @staticmethod
     def _get_str(env, name: str, default: Optional[str], what: str) -> Optional[str]:
