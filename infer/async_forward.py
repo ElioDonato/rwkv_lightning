@@ -1,28 +1,22 @@
 import asyncio
 import logging
-import os
 from concurrent.futures import ThreadPoolExecutor
+
+from settings import settings
 
 logger = logging.getLogger("infer.async_forward")
 
 # Default OFF: the heavy synchronous GPU forward stays on the uvicorn event-loop
-# thread, byte-identical to the pre-feature serving path. Only when
-# RWKV_ASYNC_FORWARD is set to a nonzero value are the blocking torch calls
-# handed to the single GPU-worker thread -- an opt-in, default-off mechanism to
-# be validated against live GPU occupancy before it is promoted to default.
-_ASYNC_FORWARD_ENV = "RWKV_ASYNC_FORWARD"
-_ASYNC_FORWARD_DEFAULT = "0"
+# thread, byte-identical to the pre-feature serving path. Only when the knob is
+# enabled (settings.async_forward, backed by the RWKV_ASYNC_FORWARD env var -- the
+# same name as before, now sourced from the central settings module) are the
+# blocking torch calls handed to the single GPU-worker thread -- an opt-in,
+# default-off mechanism to be validated against live GPU occupancy before it is
+# promoted to default.
 
 
 def _async_forward_enabled() -> bool:
-    raw = os.environ.get(_ASYNC_FORWARD_ENV, _ASYNC_FORWARD_DEFAULT)
-    try:
-        return int(raw) != 0
-    except (TypeError, ValueError):
-        logger.warning(
-            f"[AsyncForward] invalid {_ASYNC_FORWARD_ENV}={raw!r}, treating as off"
-        )
-        return False
+    return settings.async_forward
 
 
 def _invoke(fn, args, kwargs):
@@ -66,7 +60,8 @@ class GpuAsyncExecutor:
     thread either, which is the hazard this executor exists to prevent). See
     infer/inference._offload_gpu for the same boundary note.
 
-    Default-off: while disabled (RWKV_ASYNC_FORWARD unset/0) offload() runs the
+    Default-off: while disabled (settings.async_forward False, i.e. the
+    RWKV_ASYNC_FORWARD env var unset/0) offload() runs the
     callable directly on the calling (event-loop) thread and never spins up a
     worker thread, so the default serving path is byte-identical to before this
     feature. The executor object is created eagerly (cheap; it spawns no thread
@@ -74,11 +69,14 @@ class GpuAsyncExecutor:
     """
 
     def __init__(self, enabled=None):
-        # enabled=None resolves from RWKV_ASYNC_FORWARD at construction time so
-        # tests can pin the mode deterministically regardless of env.
+        # enabled=None resolves from settings.async_forward at construction time
+        # (env var RWKV_ASYNC_FORWARD) so tests can pin the mode deterministically
+        # regardless of env.
         self._enabled = _async_forward_enabled() if enabled is None else bool(enabled)
         self._executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu-forward")
+            ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=settings.async_forward_thread_name
+            )
             if self._enabled
             else None
         )

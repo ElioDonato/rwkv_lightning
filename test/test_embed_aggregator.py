@@ -37,6 +37,7 @@ except OSError as exc:
     pytest.skip(f"CUDA environment not configured: {exc}", allow_module_level=True)
 
 from infer.embed_aggregator import EmbedAggregator
+from settings import settings
 
 
 @pytest.fixture
@@ -325,7 +326,7 @@ async def test_no_cap_mode_bounds_aggregated_batch_by_hard_ceiling(fake):
     and no explicit override, the collected burst must be chunked into
     embed_texts calls each bounded by the hard ceiling -- never one huge
     un-isolated shared batch against a co-resident :8081 chat."""
-    ceiling = agg_mod._HARD_CEILING_DEFAULT
+    ceiling = settings.embed_hard_ceiling
     assert ceiling > 0
     agg = EmbedAggregator(_FakeModel(), None, enabled=True, window_ms=0)
     agg.start()
@@ -360,7 +361,7 @@ async def test_lone_oversized_job_no_cap_is_sub_chunked(fake):
     would itself sub-batch at the same constant) -- AND its per-request result
     must come back as ONE intact vector list in original order (split accounting
     preserved across the sub-chunk boundaries)."""
-    ceiling = agg_mod._HARD_CEILING_DEFAULT
+    ceiling = settings.embed_hard_ceiling
     n_texts = ceiling * 3 + 7
     big = [f"txt-{i}" for i in range(n_texts)]
     agg = EmbedAggregator(_FakeModel(), None, enabled=True, window_ms=0)
@@ -396,7 +397,7 @@ async def test_override_zero_still_bounds_window_and_cap_not_none(fake):
     treats the aggregate window as unbounded and _run_batch would not bound
     embed_texts. It must collide to the hard ceiling (positive int >= 1), so a
     concurrent burst is still chunked into bounded embed_texts calls."""
-    ceiling = agg_mod._HARD_CEILING_DEFAULT
+    ceiling = settings.embed_hard_ceiling
     agg = EmbedAggregator(_FakeModel(), None, enabled=True, window_ms=0, max_bsz=0)
 
     cap = agg._cap()

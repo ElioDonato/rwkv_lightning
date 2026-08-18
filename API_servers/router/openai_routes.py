@@ -32,6 +32,8 @@ from API_servers.router.common import (
 )
 from API_servers.router.schemas import ChatRequest
 
+from settings import settings
+
 
 router = APIRouter()
 
@@ -152,16 +154,16 @@ def build_internal_chat_request(body: dict, prompt: str) -> dict:
         "contents": [prompt],
         "messages": body.get("messages", []),
         "system": body.get("system"),
-        "max_tokens": body.get("max_tokens", 4096),
+        "max_tokens": body.get("max_tokens", settings.chat_max_tokens_default),
         "stop_tokens": body.get("stop_tokens", ["\nUser:"]),
         "temperature": body.get("temperature", 1.0),
-        "top_k": body.get("top_k", 20),
-        "top_p": body.get("top_p", 0.6),
+        "top_k": body.get("top_k", settings.fuse_sampler_top_k),
+        "top_p": body.get("top_p", settings.fuse_sampler_top_p),
         "stream": stream,
         "pad_zero": body.get("pad_zero", False),
-        "alpha_presence": body.get("alpha_presence", 1),
-        "alpha_frequency": body.get("alpha_frequency", 0.1),
-        "alpha_decay": body.get("alpha_decay", 0.996),
+        "alpha_presence": body.get("alpha_presence", settings.fuse_sampler_alpha_presence),
+        "alpha_frequency": body.get("alpha_frequency", settings.fuse_sampler_alpha_frequency),
+        "alpha_decay": body.get("alpha_decay", settings.fuse_sampler_alpha_decay),
         "enable_think": body.get("enable_think", False),
         "chunk_size": chunk_size,
         "password": body.get("password"),
@@ -394,7 +396,7 @@ async def openai_chat_completions(request: Request):
             # is served by the aggregator's faithful SOLO path (matching
             # fuse=OFF). Prefix caching per se is served by the solo path, not
             # the fused path.
-            fuse_prefix_cache = body.get("use_prefix_cache", False)
+            fuse_prefix_cache = body.get("use_prefix_cache", settings.fuse_prefix_cache_default)
             fuse_prefix_cache_manager = get_state_manager() if fuse_prefix_cache else None
             cancel_token = CancellationToken()
             fuse_stream = await fuse.submit(

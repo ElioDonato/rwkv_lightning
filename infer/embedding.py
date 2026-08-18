@@ -18,7 +18,7 @@ Design notes
   sequence length, like all RWKV forward passes) and frees it on exit. A
   single ``torch.cuda.empty_cache()`` is issued once per batched request
   (not per text) -- per-text cache thrash was killing GPU occupancy.
-* Hidden dimension = ``model.n_embd`` (2560 for the 2.9b g1i checkpoint).
+* Hidden dimension = ``model.n_embd`` (the deployed model's embedding width).
 
 Batching
 --------
@@ -29,11 +29,12 @@ and the chat prefill already use (``RWKV_x070_TMix_seq_batch`` /
 equal-length chunks that mirror ``_forward_batch_prompts_chunked``. Every
 column of every chunk is a real token (all active rows advance exactly
 ``step`` each pass), so there is zero padding waste; the chunk step is bounded
-by ``prefill_chunk_size`` (256) and per-call batch size by
-``max_prefill_bsz`` so a co-resident :8081 chat on the same 24GB GPU is not
-starved of VRAM. A sequence's embedding is captured the moment the chunk that
-consumes its *remaining* tokens runs -- because every active row in a chunk
-has equal length, that is always its true last token, never a padded slot.
+by ``prefill_chunk_size`` (configurable via ``RWKV_PREFILL_CHUNK_SIZE``) and
+per-call batch size by ``max_prefill_bsz`` so a co-resident chat server on the
+same GPU is not starved of VRAM. A sequence's embedding is captured the moment
+the chunk that consumes its *remaining* tokens runs -- because every active
+row in a chunk has equal length, that is always its true last token, never a
+padded slot.
 
 Numerical equivalence: this is a throughput-only change. A single non-empty
 text keeps the exact pre-MOD single-sequence loop (``_embed_single``), so the
@@ -51,22 +52,13 @@ logger = logging.getLogger("infer.embedding")
 import torch
 from torch.nn import functional as F
 
+from settings import settings
 from infer.rwkv_batch.rwkv7 import (
     RWKV_x070_CMix_seq,
     RWKV_x070_CMix_seq_batch,
     RWKV_x070_TMix_seq,
     RWKV_x070_TMix_seq_batch,
 )
-
-# Hard ceiling (texts) applied to a sub-batch when the model carries no
-# max_prefill_bsz cap (attribute absent or <= 0). Single source of truth:
-# infer.embed_aggregator imports it from here (that module already imports
-# embed_texts from this one, so importing back is acyclic), so the two can
-# never diverge. Without a cap, "no cap / 0 cap" must never mean "whole request
-# in one batch" (a lone oversized request could otherwise spike VRAM on a GPU
-# co-resident with live :8081 chat) -- cap each sub-batch here instead.
-_HARD_CEILING_DEFAULT = 64
-
 
 def _embed_single(model, z, tokens, device):
     """Return the pre-``ln_out`` final-token hidden state ``[n_embd]`` for one
@@ -153,7 +145,7 @@ def _embed_batch(model, z, token_lists, device):
     pos = [0] * bsz
     out = [None] * bsz
     state = model.generate_zero_state(bsz)
-    chunk_size = int(getattr(model, "prefill_chunk_size", 256))
+    chunk_size = int(getattr(model, "prefill_chunk_size", settings.prefill_chunk_size))
 
     while True:
         active = [i for i in range(bsz) if pos[i] < lengths[i]]
@@ -258,15 +250,14 @@ def embed_texts(model, tokenizer, texts, normalize=True, device="cuda"):
 
     if non_empty:
         # Multi-text is batched in sub-batches of at most `max_bsz`, so a single
-        # huge request can't blow VRAM on a GPU shared with live :8081 chat. The
-        # cap is the model's throttled max-prefill-batch estimate, which already
-        # accounts for currently free VRAM; a lone text (or the trailing
+        # huge request can't blow VRAM on a GPU shared with a live chat server.
+        # The cap is the model's throttled max-prefill-batch estimate, which
+        # already accounts for currently free VRAM; a lone text (or the trailing
         # remainder sub-batch of size 1) instead takes the exact pre-MOD
         # single-sequence loop for a byte-identical result. Divide the request
         # into sub-batches first so every unit runs through the same finalize.
-        max_bsz = max(
-            1, int(getattr(model, "max_prefill_bsz", 0) or _HARD_CEILING_DEFAULT)
-        )
+        max_bsz = max(1, int(getattr(model, "max_prefill_bsz", 0)
+                            or settings.embed_hard_ceiling))
         sub_batches = [non_empty[i:i + max_bsz] for i in range(0, len(non_empty), max_bsz)]
 
         for sub in sub_batches:
