@@ -87,11 +87,11 @@ async def chat_completions(request: Request):
             cancel_token=cancel_token,
             prefix_cache_manager=prefix_cache_manager,
         )
-        return prefill_sse_response(request, stream, cancel_token, len(req.contents))
+        return prefill_sse_response(request, stream, cancel_token, len(req.contents), engine=engine)
 
     try:
         cancel_token = CancellationToken()
-        async with reserve_prefill_capacity(request, len(req.contents), cancel_token=cancel_token):
+        async with reserve_prefill_capacity(request, len(req.contents), cancel_token=cancel_token, engine=engine):
             results, finish_reasons = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate,
@@ -152,7 +152,7 @@ async def batch_translate(request: Request):
 
     try:
         cancel_token = CancellationToken()
-        async with reserve_prefill_capacity(request, len(prompts), cancel_token=cancel_token):
+        async with reserve_prefill_capacity(request, len(prompts), cancel_token=cancel_token, engine=engine):
             translated_texts, _ = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate,
@@ -224,11 +224,11 @@ async def fim_completions(request: Request):
             chunk_size=req.chunk_size,
             cancel_token=cancel_token,
         )
-        return prefill_sse_response(request, stream, cancel_token, len(prompts))
+        return prefill_sse_response(request, stream, cancel_token, len(prompts), engine=engine)
 
     try:
         cancel_token = CancellationToken()
-        async with reserve_prefill_capacity(request, len(prompts), cancel_token=cancel_token):
+        async with reserve_prefill_capacity(request, len(prompts), cancel_token=cancel_token, engine=engine):
             results, finish_reasons = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate,
@@ -305,5 +305,6 @@ async def big_batch_completions(request: Request):
     )
     return prefill_sse_response(
         request, stream, cancel_token, len(prompts),
+        engine=engine,
         on_permit=lambda permit: permit_box.__setitem__(0, permit),
     )

@@ -94,13 +94,13 @@ async def state_chat_completions(request: Request):
                 async for chunk in inner_stream:
                     yield chunk
 
-        return prefill_sse_response(request, locked_stream(), cancel_token, 1)
+        return prefill_sse_response(request, locked_stream(), cancel_token, 1, engine=engine)
 
     # Non-streaming: hold lock for the entire inference
     async with session_lock(session_id):
         try:
             cancel_token = CancellationToken()
-            async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
+            async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token, engine=engine):
                 results, finish_reasons = await run_sync_with_disconnect_watch(
                     request,
                     engine.batch_generate_state,
@@ -247,13 +247,13 @@ async def multi_state_chat_completions(request: Request):
                         state_manager.put_state(new_session_id, state)
                         logger.info(f"[RESPONSE] /multi_state/chat/completions state[2]: {state[2]}")
 
-        return prefill_sse_response(request, stream_with_dialogue_idx(), cancel_token, 1)
+        return prefill_sse_response(request, stream_with_dialogue_idx(), cancel_token, 1, engine=engine)
 
     # Non-streaming: hold lock for the entire inference
     async with session_lock(session_index):
         try:
             cancel_token = CancellationToken()
-            async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
+            async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token, engine=engine):
                 results, finish_reasons = await run_sync_with_disconnect_watch(
                     request,
                     engine.batch_generate_state,

@@ -561,10 +561,10 @@ async def openai_chat_completions(request: Request):
                 cancel_token,
                 prefix_cache_manager,
             )
-            return prefill_sse_response(request, stream, cancel_token, 1)
+            return prefill_sse_response(request, stream, cancel_token, 1, engine=engine)
 
         cancel_token = CancellationToken()
-        async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
+        async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token, engine=engine):
             result_text, finish_reason = await engine.single_infer(
                 prompt=prompt_formatted,
                 max_length=req.max_tokens,

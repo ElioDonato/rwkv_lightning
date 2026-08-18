@@ -59,6 +59,11 @@ class EngineSlot:
         self.is_default = default_id
         self.path = cfg["path"]
         self.inference_engine = cfg.get("engine", "fp16")
+        if self.inference_engine not in ("fp16", "gemlite", "cutlass"):
+            raise ValueError(
+                f"model {self.id!r}: unsupported engine {self.inference_engine!r} "
+                "(expected fp16/gemlite/cutlass)"
+            )
         self.vram_bytes = _estimate_vram_bytes(cfg)
 
         # Filled in by ModelManager.load().

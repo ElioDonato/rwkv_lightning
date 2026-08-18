@@ -151,16 +151,18 @@ async def resolve_slot(request, model_field=None, role=None):
     return slot
 
 
-def _default_engine(request):
-    """Synchronous default-slot engine for the prefill/permit accounting
-    helpers. These track overall capacity and are invoked around decode, where
-    the loop must not (re)start aggregators via ensure_wired(); stateless /
-    model-less requests use the default model anyway. Returns ``app.state``
-    engine when no ModelManager exists (shim path)."""
+def _default_engine(request, engine=None):
+    """Resolve the engine for prefill/permit admission. An explicit ``engine``
+    (the per-request slot's engine) wins; otherwise the default-slot engine.
+    Returns None when the default model is not resident (unloaded) -- the
+    admission helpers treat None as "skip accounting" rather than crash, so
+    serving a NON-default model after the default is unloaded still works."""
+    if engine is not None:
+        return engine
     manager = getattr(request.app.state, "model_manager", None)
     if manager is None:
         return request.app.state.engine
-    return manager.get_slot(manager.default_id).engine
+    return manager.get_slot(manager.default_id).engine  # may be None
 
 
 def normalize_state_prompts(prompts: list[str], reuse_existing_state: bool) -> list[str]:
@@ -254,24 +256,26 @@ async def cleanup_disconnect_watcher(
 
 @asynccontextmanager
 async def reserve_prefill_capacity(
-    request: Request, request_bsz: int, cancel_token: CancellationToken | None = None
+    request: Request, request_bsz: int, cancel_token: CancellationToken | None = None,
+    engine=None,
 ):
-    engine = _default_engine(request)
+    engine = _default_engine(request, engine)
     queue_cancel_token = cancel_token or CancellationToken()
     watcher = asyncio.create_task(watch_disconnect(request, queue_cancel_token))
     permit = None
     try:
-        permit = await engine.acquire_prefill_permit(
-            request_bsz=request_bsz,
-            request_label=str(request.url.path),
-            cancel_token=queue_cancel_token,
-        )
-        if queue_cancel_token.is_cancelled():
-            raise InferenceCancelled("request disconnected while queued")
-        yield permit
+        if engine is not None:
+            permit = await engine.acquire_prefill_permit(
+                request_bsz=request_bsz,
+                request_label=str(request.url.path),
+                cancel_token=queue_cancel_token,
+            )
+            if queue_cancel_token.is_cancelled():
+                raise InferenceCancelled("request disconnected while queued")
+        yield permit  # None when no engine (unloaded default) -> no admission accounting
     finally:
         await cleanup_disconnect_watcher(watcher)
-        if permit is not None:
+        if permit is not None and engine is not None:
             await engine.release_prefill_permit(
                 request_bsz=request_bsz,
                 request_label=str(request.url.path),
@@ -333,12 +337,14 @@ async def _cleanup_prefill_stream_response(
     finally:
         permit = stream_state.get("permit")
         if permit is not None:
-            await _default_engine(request).release_prefill_permit(
-                request_bsz=request_bsz,
-                request_label=str(request.url.path),
-                ticket=permit["ticket"],
-                permit=permit,
-            )
+            release_engine = stream_state.get("engine")  # the admitting engine
+            if release_engine is not None:
+                await release_engine.release_prefill_permit(
+                    request_bsz=request_bsz,
+                    request_label=str(request.url.path),
+                    ticket=permit["ticket"],
+                    permit=permit,
+                )
             stream_state["permit"] = None
         stream_state["cleanup_done"] = True
 
@@ -368,13 +374,15 @@ def prefill_sse_response(
     cancel_token: CancellationToken,
     request_bsz: int,
     on_permit=None,
+    engine=None,
 ):
-    engine = _default_engine(request)
+    engine = _default_engine(request, engine)
     stream_state = {
         "permit": None,
         "watcher": None,
         "cleanup_task": None,
         "cleanup_done": False,
+        "engine": engine,  # the admitting engine; used by the background release
     }
 
     async def body():
@@ -382,21 +390,22 @@ def prefill_sse_response(
             stream_state["watcher"] = asyncio.create_task(
                 watch_disconnect(request, cancel_token)
             )
-            stream_state["permit"] = await engine.acquire_prefill_permit(
-                request_bsz=request_bsz,
-                request_label=str(request.url.path),
-                cancel_token=cancel_token,
-            )
-            if on_permit is not None:
-                # Lets a caller that pre-created the streaming generator (before
-                # admission was possible -- the generator itself doesn't start
-                # executing until iterated below) hand the now-acquired permit
-                # into that generator's own closure, e.g. so
-                # big_batch_stream's decode-time row compaction can call
-                # engine.release_prefill_capacity() against this exact permit
-                # as individual rows finish, instead of only releasing the
-                # full reservation at the very end of the whole request.
-                on_permit(stream_state["permit"])
+            if engine is not None:
+                stream_state["permit"] = await engine.acquire_prefill_permit(
+                    request_bsz=request_bsz,
+                    request_label=str(request.url.path),
+                    cancel_token=cancel_token,
+                )
+                if on_permit is not None:
+                    # Lets a caller that pre-created the streaming generator (before
+                    # admission was possible -- the generator itself doesn't start
+                    # executing until iterated below) hand the now-acquired permit
+                    # into that generator's own closure, e.g. so
+                    # big_batch_stream's decode-time row compaction can call
+                    # engine.release_prefill_capacity() against this exact permit
+                    # as individual rows finish, instead of only releasing the
+                    # full reservation at the very end of the whole request.
+                    on_permit(stream_state["permit"])
             if cancel_token.is_cancelled():
                 raise InferenceCancelled("request disconnected while queued")
 

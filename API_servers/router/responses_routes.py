@@ -290,12 +290,12 @@ async def create_response(request: Request):
                     yield f"data: {json.dumps(done_event, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
 
-            return prefill_sse_response(request, response_stream(), cancel_token, 1)
+            return prefill_sse_response(request, response_stream(), cancel_token, 1, engine=engine)
 
         # Non-streaming path.
         async with lock_ctx:
             cancel_token = CancellationToken()
-            async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
+            async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token, engine=engine):
                 state = prev_state if is_continuation else engine.model.generate_zero_state(0)
                 texts, _finish_reasons = await run_sync_with_disconnect_watch(
                     request,

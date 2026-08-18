@@ -67,9 +67,14 @@ def create_app(model_manager, password=None):
                 cleanup_task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
                     await cleanup_task
-            await dyn.stop()
-            await fuse.stop()
-            await aggregator.stop()
+            # Per-model decode schedulers wired on the default slot (embed, fuse,
+            # dynamic batch) -- gracefully drain them on shutdown.
+            for _agg in (default.dynamic, default.fuse, default.embed):
+                if _agg is not None:
+                    try:
+                        await _agg.stop()
+                    except Exception:  # pragma: no cover - best-effort teardown
+                        pass
 
     app = FastAPI(lifespan=lifespan)
     # RWKV_CORS_ORIGINS: comma-separated allowlist, e.g. "http://localhost:3000,https://app.example.com"

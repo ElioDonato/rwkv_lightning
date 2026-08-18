@@ -124,7 +124,7 @@ def main():
     def cleanup_at_exit():
         logger.info("Persisting all states to database...")
         shutdown_state_manager()
-        engine.shutdown()
+        asyncio.run(manager.shutdown())
         logger.info("All states persisted to database.")
 
     signal.signal(signal.SIGINT, cleanup_handler)
