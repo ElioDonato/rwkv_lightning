@@ -288,6 +288,61 @@ def test_bounded_probe_async_warm(monkeypatch):
             state_pool.StateCacheManager._instance = None
 
 
+def test_adaptive_off_rejects_short_prefix():
+    """B default-off: a sub-1024 prefix (no fixed bucket) is rejected by
+    put_prefix_state exactly as before, preserving byte-identity until
+    RWKV_PREFIX_ADAPTIVE is enabled."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _reset_manager(os.path.join(tmpdir, "ada_off.db"))
+        manager = state_pool.StateCacheManager()
+        try:
+            st = torch.zeros(2, dtype=torch.float32)
+            assert manager.put_prefix_state(_tokens(300, 7), [st]) is False
+            assert manager.prefix_entry_index == {}
+        finally:
+            manager.db_conn.close()
+            state_pool.StateCacheManager._instance = None
+
+
+def test_adaptive_on_stores_l2_only_and_matches(monkeypatch):
+    """B: with RWKV_PREFIX_ADAPTIVE on, a short (sub-1024) prefix is stored as an
+    L2-only checkpoint keyed by its exact length, and match_prefix_state
+    recovers it for a later request sharing that prefix. It never lands in the
+    SQLite prefix_cache (no fixed hash column), which is the documented
+    retention tradeoff (lost on restart/L2 eviction)."""
+    monkeypatch.setattr(settings_module.settings, "prefix_adaptive", True)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _reset_manager(os.path.join(tmpdir, "ada_on.db"))
+        manager = state_pool.StateCacheManager()
+        try:
+            toks = _tokens(300, 7)
+            st = [torch.zeros(2, dtype=torch.float32)]
+            assert manager.put_prefix_state(toks, st) is True
+
+            key = state_pool._prefix_key("", state_pool._serialize_token_ids(tuple(toks)))
+            assert key in manager.prefix_entry_index
+            assert key in manager.prefix_l2_cache[300]
+            # not persisted to disk (L2-only)
+            with manager.db_lock:
+                manager.db_cursor.execute(
+                    "SELECT COUNT(*) FROM prefix_cache WHERE state_id = ?", (key,))
+                assert manager.db_cursor.fetchone()[0] == 0
+
+            # a later request with this exact prefix matches via the trie
+            hit = manager.match_prefix_state(toks, device="cpu")
+            assert hit is not None and hit["bucket_len"] == 300
+            assert hit["matched_tokens"] == 300
+
+            # a prompt whose prefix EXTENDS this short checkpoint resumes from it
+            extended = list(toks) + _tokens(50, 9001)
+            hit2 = manager.match_prefix_state(extended, device="cpu")
+            assert hit2 is not None and hit2["matched_tokens"] == 300
+        finally:
+            manager.io_executor.shutdown(wait=True)
+            manager.db_conn.close()
+            state_pool.StateCacheManager._instance = None
+
+
 def test_sweeper_start_stop_lifecycle():
     """A3c: start_sweeper spawns a handle; stop_sweeper clears it so a
     subsequent flush_all (which closes the connection) won't race it."""

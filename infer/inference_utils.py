@@ -237,4 +237,22 @@ class InferenceUtilsMixin:
             matched_tokens = 0
             cache_source = None
 
+        # B (RWKV_PREFIX_ADAPTIVE): the fixed buckets start at 1024, so a short
+        # prompt (<1024) never gets a checkpoint and is fully re-prefilled on
+        # every repeat/multi-turn continuation. When adaptive is on and we
+        # actually advanced the prefix, store a checkpoint at the FULL computed
+        # length (L2-only) so an identical or prefix-extension prompt next time
+        # matches via the trie and resumes from here instead of re-prefilling.
+        if (
+            prefix_cache_manager is not None
+            and len(encoded_prompt) > matched_tokens
+        ):
+            try:
+                from settings import settings as _settings
+                adaptive = bool(getattr(_settings, "prefix_adaptive", False))
+            except Exception:
+                adaptive = False
+            if adaptive:
+                prefix_cache_manager.put_prefix_state(encoded_prompt, state, out)
+
         return encoded_prompt, state, out, matched_tokens, cache_source

@@ -363,9 +363,14 @@ class StateCacheManager:
                 # keep the back-compat alias pointing at the default model's trie
                 self.prefix_trie = trie
 
-        if persist:
+        if persist and entry.bucket_len in PREFIX_CACHE_BUCKETS:
             self.io_executor.submit(self._persist_prefix_task, entry)
-        if evicted_entry is not None:
+        # An ADAPTIVE-length entry (see put_prefix_state) is L2-only: it has no
+        # matching fixed prefix_hash_<bucket> column to be persisted under, and a
+        # persisted NULL-hash row would be unreachable+wasteful -- so it is never
+        # persisted, on insert OR on eviction (documented retention tradeoff:
+        # adaptive checkpoints are lost on restart / after L2 eviction).
+        if evicted_entry is not None and evicted_entry.bucket_len in PREFIX_CACHE_BUCKETS:
             self.io_executor.submit(self._persist_prefix_task, evicted_entry)
 
     def put_state(self, session_id: str, state: List[torch.Tensor], model=None):
@@ -474,7 +479,8 @@ class StateCacheManager:
     ) -> bool:
         token_tuple = tuple(prefix_tokens)
         bucket_len = len(token_tuple)
-        if bucket_len not in PREFIX_CACHE_BUCKETS:
+        fixed = bucket_len in PREFIX_CACHE_BUCKETS
+        if not fixed and not self._prefix_adaptive_enabled():
             return False
 
         entry = PrefixCacheEntry(
@@ -488,9 +494,23 @@ class StateCacheManager:
             last_updated=time.time(),
             model=model or "",
         )
+        # Fixed buckets persist to SQLite as before. Adaptive lengths (B,
+        # RWKV_PREFIX_ADAPTIVE) are L2-only -- L2/trie matches recover them for
+        # the next request, but they have no fixed hash column to be indexed by
+        # on disk and are dropped on eviction/restart (retention tradeoff).
         with self.cache_lock:
-            self._store_prefix_entry_locked(entry, persist=True)
+            self._store_prefix_entry_locked(entry, persist=fixed)
         return True
+
+    @staticmethod
+    def _prefix_adaptive_enabled() -> bool:
+        """Lazy settings read (same pattern as _prefix_disk_async_enabled) so
+        the state core stays importable without the server settings module."""
+        try:
+            from settings import settings as _settings
+            return bool(getattr(_settings, "prefix_adaptive", False))
+        except Exception:
+            return False
 
     def _load_prefix_entry_from_db_locked(
         self,
