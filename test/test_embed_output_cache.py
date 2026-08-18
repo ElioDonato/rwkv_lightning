@@ -155,3 +155,19 @@ def test_no_fingerprint_disables_cache_safely(fake_collector, cache_on):
     assert agg._embed_with_cache(["q"]) == [_vec("q")]
     assert agg._embed_with_cache(["q"]) == [_vec("q")]
     assert fake_collector.calls == [["q"], ["q"]]
+
+
+def test_miss_path_returns_fresh_copies_no_cache_corruption(fake_collector, cache_on):
+    """SF-3 regression: on a cache MISS, mutating the returned vector must NOT
+    corrupt the cache entry, and duplicate rows in one request must NOT alias
+    each other (each row is a fresh list)."""
+    agg = _agg(cache_on, enabled=False, ns="nsX")
+    out = agg._embed_with_cache(["dup", "dup", "other"])
+    assert fake_collector.calls == [["dup", "other"]]  # dedup embedded once
+    assert out == [_vec("dup"), _vec("dup"), _vec("other")]
+    # the two 'dup' rows are DIFFERENT list objects (no aliasing)
+    assert out[0] is not out[1]
+    # mutating one returned row must not corrupt the cached entry
+    out[0].append(999.0)
+    hit = agg._embed_with_cache(["dup"])
+    assert hit[0] == _vec("dup"), "cache entry must not reflect the mutation"

@@ -205,8 +205,22 @@ class InferenceUtilsMixin:
             state = self.model.generate_zero_state(0)
 
         if prefix_cache_manager is not None:
+            buckets = getattr(prefix_cache_manager, "prefix_l2_cache", {})
+            # Snapshot the (now dynamically-growing) adaptive bucket-key set under
+            # the pool lock so a concurrent add/evict of an adaptive-length bucket
+            # can't raise "dictionary changed size during iteration" on another
+            # request thread.
+            try:
+                _lock = prefix_cache_manager.cache_lock
+            except AttributeError:
+                _lock = None
+            if _lock is not None:
+                with _lock:
+                    bucket_keys = list(buckets.keys())
+            else:
+                bucket_keys = list(buckets.keys())
             bucket_checkpoints = [
-                bucket for bucket in getattr(prefix_cache_manager, "prefix_l2_cache", {}).keys()
+                bucket for bucket in bucket_keys
                 if matched_tokens < bucket <= len(encoded_prompt)
             ]
             bucket_checkpoints.sort()

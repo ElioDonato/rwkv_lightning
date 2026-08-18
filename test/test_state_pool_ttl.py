@@ -361,3 +361,23 @@ def test_sweeper_start_stop_lifecycle():
         finally:
             manager.db_conn.close()
             state_pool.StateCacheManager._instance = None
+
+
+def test_empty_prefix_rejected_no_root_terminal(monkeypatch):
+    """B-1 regression: putting an EMPTY prefix (length 0) must be rejected -- it
+    would create a root terminal in the trie that makes every later match (even
+    one sharing no tokens) resolve to it at matched_len 0 (a silent wrong-state
+    serve)."""
+    monkeypatch.setattr(settings_module.settings, "prefix_adaptive", True)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _reset_manager(os.path.join(tmpdir, "a3b_empty.db"))
+        manager = state_pool.StateCacheManager()
+        try:
+            st = torch.zeros(2, dtype=torch.float32)
+            assert manager.put_prefix_state([], [st]) is False
+            # a non-empty prompt with NO stored prefix must NOT resolve to a state
+            assert manager.match_prefix_state([5, 6, 7], device="cpu") is None
+        finally:
+            manager.io_executor.shutdown(wait=True)
+            manager.db_conn.close()
+            state_pool.StateCacheManager._instance = None

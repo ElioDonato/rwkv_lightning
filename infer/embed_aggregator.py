@@ -493,9 +493,12 @@ class EmbedAggregator:
             fresh = embed_texts(self._model, self._tokenizer, list(uniq), normalize=True)
             for i in miss_idx:
                 t = texts[i]
-                vec = fresh[uniq[t]]
-                cached[i] = vec
-                self._cache.put((self._cache_ns, t, True), vec)
+                # A FRESH copy per row: the returned vector is never the object we
+                # store, so a downstream caller mutating its result can neither
+                # corrupt the shared cache entry nor alias another duplicate row.
+                out = list(fresh[uniq[t]])
+                cached[i] = out
+                self._cache.put((self._cache_ns, t, True), list(out))
         return cached
 
     def _fail_pending(self, exc):

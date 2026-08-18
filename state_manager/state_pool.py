@@ -354,14 +354,30 @@ class StateCacheManager:
                 self.prefix_trie = trie
 
         if persist and entry.bucket_len in PREFIX_CACHE_BUCKETS:
-            self.io_executor.submit(self._persist_prefix_task, entry)
+            self._submit_persist(self._persist_prefix_task, entry)
         # An ADAPTIVE-length entry (see put_prefix_state) is L2-only: it has no
         # matching fixed prefix_hash_<bucket> column to be persisted under, and a
         # persisted NULL-hash row would be unreachable+wasteful -- so it is never
         # persisted, on insert OR on eviction (documented retention tradeoff:
         # adaptive checkpoints are lost on restart / after L2 eviction).
         if evicted_entry is not None and evicted_entry.bucket_len in PREFIX_CACHE_BUCKETS:
-            self.io_executor.submit(self._persist_prefix_task, evicted_entry)
+            self._submit_persist(self._persist_prefix_task, evicted_entry)
+        # Prune an ADAPTIVE bucket key that just became empty, so the number of
+        # distinct-length bucket keys (which adaptive checkpoints create) doesn't
+        # grow without bound as requests come and go with different prompt
+        # lengths. Fixed-bucket keys are always present by construction.
+        if evicted_entry is not None and evicted_entry.bucket_len not in PREFIX_CACHE_BUCKETS:
+            if not bucket_cache:
+                self.prefix_l2_cache.pop(evicted_entry.bucket_len, None)
+
+    def _submit_persist(self, task, *args):
+        """Submit a persist task off the event loop, tolerating a shutdown race
+        (io_executor already shut down by flush_all) so a late in-flight request
+        never crashes on ``cannot schedule new futures after shutdown``."""
+        try:
+            self.io_executor.submit(task, *args)
+        except RuntimeError:
+            pass  # executing during/after shutdown -- persist is best-effort
 
     def put_state(self, session_id: str, state: List[torch.Tensor], model=None):
         """
@@ -394,7 +410,7 @@ class StateCacheManager:
                 if len(self.l2_cache) > L2_CAPACITY:
                     l2_evicted_id, l2_evicted_state_cpu = self.l2_cache.popitem(last=False)
 
-                    self.io_executor.submit(self._persist_task, l2_evicted_id, l2_evicted_state_cpu)
+                    self._submit_persist(self._persist_task, l2_evicted_id, l2_evicted_state_cpu)
 
     def get_state(self, session_id: str, model=None) -> Optional[List[torch.Tensor]]:
 
@@ -469,6 +485,11 @@ class StateCacheManager:
     ) -> bool:
         token_tuple = tuple(prefix_tokens)
         bucket_len = len(token_tuple)
+        # An empty prefix would create a ROOT terminal in the trie, making every
+        # later match (even one sharing no tokens) resolve to it at matched_len 0
+        # -- a silent wrong-state serve. Never store empty checkpoints.
+        if bucket_len == 0:
+            return False
         fixed = bucket_len in PREFIX_CACHE_BUCKETS
         if not fixed and not self._prefix_adaptive_enabled():
             return False
@@ -794,6 +815,19 @@ class StateCacheManager:
         now = time.time()
         with self.db_lock:
             try:
+                # A range DELETE on `last_updated` without a leading index scans
+                # the WHOLE table -- on a long-running, bloated rwkv_sessions.db
+                # that stalls every db_lock user (the request-path disk reads) for
+                # the duration, recreating the exact event-loop stall this sweep
+                # exists to fix. Build the index lazily here (off the event loop,
+                # only when a sweep actually runs) so the DELETE is O(index).
+                self.db_conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sessions_last_updated "
+                    "ON sessions(last_updated)")
+                self.db_conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_prefix_last_updated "
+                    "ON prefix_cache(last_updated)")
+                self.db_conn.commit()
                 if ttl_s and ttl_s > 0:
                     cutoff = now - ttl_s
                     self.db_cursor.execute(
