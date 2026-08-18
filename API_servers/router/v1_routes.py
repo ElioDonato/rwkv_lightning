@@ -16,6 +16,7 @@ from API_servers.router.common import (
     prefill_bsz_limit_response,
     prefill_sse_response,
     reserve_prefill_capacity,
+    resolve_slot,
     run_sync_with_disconnect_watch,
 )
 from API_servers.router.openai_routes import format_openai_prompt
@@ -44,7 +45,8 @@ def create_translation_prompt(source_lang, target_lang, text):
 
 @router.get("/v1/models")
 async def list_models(request: Request):
-    engine = request.app.state.engine
+    slot = await resolve_slot(request)
+    engine = slot.engine
     model_name = engine.args.MODEL_NAME.split("/")[-1]
     return {
         "object": "list",
@@ -54,7 +56,6 @@ async def list_models(request: Request):
 
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
     req, parse_error = parse_request_model(ChatRequest, body)
@@ -64,6 +65,9 @@ async def chat_completions(request: Request):
     auth_error = check_password(req.password, password)
     if auth_error is not None:
         return auth_error
+
+    slot = await resolve_slot(request, body.get("model"))
+    engine = slot.engine
 
     prefix_cache_manager = get_state_manager() if req.use_prefix_cache else None
 
@@ -83,11 +87,11 @@ async def chat_completions(request: Request):
             cancel_token=cancel_token,
             prefix_cache_manager=prefix_cache_manager,
         )
-        return prefill_sse_response(request, stream, cancel_token, len(req.contents))
+        return prefill_sse_response(request, stream, cancel_token, len(req.contents), engine=engine)
 
     try:
         cancel_token = CancellationToken()
-        async with reserve_prefill_capacity(request, len(req.contents), cancel_token=cancel_token):
+        async with reserve_prefill_capacity(request, len(req.contents), cancel_token=cancel_token, engine=engine):
             results, finish_reasons = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate,
@@ -128,7 +132,6 @@ async def chat_completions(request: Request):
 
 @router.post("/translate/v1/batch-translate")
 async def batch_translate(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
     req, parse_error = parse_request_model(TranslateRequest, body)
@@ -139,6 +142,9 @@ async def batch_translate(request: Request):
     if auth_error:
         return auth_error
 
+    slot = await resolve_slot(request, body.get("model"))
+    engine = slot.engine
+
     prompts = [
         create_translation_prompt(req.source_lang, req.target_lang, text)
         for text in req.text_list
@@ -146,7 +152,7 @@ async def batch_translate(request: Request):
 
     try:
         cancel_token = CancellationToken()
-        async with reserve_prefill_capacity(request, len(prompts), cancel_token=cancel_token):
+        async with reserve_prefill_capacity(request, len(prompts), cancel_token=cancel_token, engine=engine):
             translated_texts, _ = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate,
@@ -186,7 +192,6 @@ async def batch_translate(request: Request):
 
 @router.post("/FIM/v1/batch-FIM")
 async def fim_completions(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
     req, parse_error = parse_request_model(ChatRequest, body)
@@ -196,6 +201,9 @@ async def fim_completions(request: Request):
     auth_error = check_password(req.password, password)
     if auth_error is not None:
         return auth_error
+
+    slot = await resolve_slot(request, body.get("model"))
+    engine = slot.engine
 
     prompts = []
     for prefix, suffix in zip(req.prefix, req.suffix):
@@ -216,11 +224,11 @@ async def fim_completions(request: Request):
             chunk_size=req.chunk_size,
             cancel_token=cancel_token,
         )
-        return prefill_sse_response(request, stream, cancel_token, len(prompts))
+        return prefill_sse_response(request, stream, cancel_token, len(prompts), engine=engine)
 
     try:
         cancel_token = CancellationToken()
-        async with reserve_prefill_capacity(request, len(prompts), cancel_token=cancel_token):
+        async with reserve_prefill_capacity(request, len(prompts), cancel_token=cancel_token, engine=engine):
             results, finish_reasons = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate,
@@ -260,7 +268,6 @@ async def fim_completions(request: Request):
 
 @router.post("/big_batch/completions")
 async def big_batch_completions(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
     req, parse_error = parse_request_model(ChatRequest, body)
@@ -270,6 +277,9 @@ async def big_batch_completions(request: Request):
     auth_error = check_password(req.password, password)
     if auth_error is not None:
         return auth_error
+
+    slot = await resolve_slot(request, body.get("model"))
+    engine = slot.engine
 
     if req.chats:
         prompts = [format_openai_prompt(chat, req.enable_think) for chat in req.chats]
@@ -295,5 +305,6 @@ async def big_batch_completions(request: Request):
     )
     return prefill_sse_response(
         request, stream, cancel_token, len(prompts),
+        engine=engine,
         on_permit=lambda permit: permit_box.__setitem__(0, permit),
     )

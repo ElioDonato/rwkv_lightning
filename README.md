@@ -1,6 +1,54 @@
 # rwkv_lightning 🕊️ ⚡
 RWKV Batch infer backend Base on [Albatross](https://github.com/BlinkDL/Albatross) 🕊️ and [fastapi](https://github.com/fastapi/fastapi)
 - Thanks to [Rapid-Sampling](https://github.com/Triang-jyed-driung/Rapid-Sampling) Kernel From [Triang-jyed-driung](https://github.com/Triang-jyed-driung), it also have native HIP kerel compatible with ROCm😎
+
+## 🔀 What this fork adds (differences from upstream)
+
+This is an actively-developed fork that hardens the serving path and adds major
+capabilities on top of the upstream RWKV-Vibe server. Everything is opt-in and
+**off by default**, so the out-of-the-box behavior matches upstream byte-for-byte;
+you flip env vars / flags to turn on the new features.
+
+**GPU throughput & utilization**
+- **Dynamic decode batching** — `RWKV_DYNAMIC_BATCH=1`: merges concurrent, even
+  *heterogeneous*, chat requests into one shared multi-row decode with per-row
+  sampling (`sample_batch_per_row`). Measured **~4–5× concurrent tokens/s** on a
+  single 3090 Ti vs the bsz-1 baseline; flat scaling to N=128 clients.
+- **CUDA-graph decode** — `RWKV_CUDA_GRAPH=1`: replays `forward_batch` as a CUDA
+  graph (per-size pool, static buffers) to cut per-token host launch overhead.
+  Requires the fork's fix that launches the seq/batch WKV kernel on the current
+  CUDA stream (upstream's omits it, which blocked graph capture).
+- **Process-wide CUDA serialization** — one global lock guarantees only one thread
+  is ever inside CUDA, so the (also opt-in) async GPU-worker offload
+  (`RWKV_ASYNC_FORWARD`) is safe to enable even with the blocking/embed paths.
+- Aggregated embedding prefill (`RWKV_EMBED_AGGREGATE`) and code cleanups /
+  allocation dedup throughout.
+
+**Multi-model serving (one process, many models)**
+- Declare a catalog in `models.json` (`app.py --models-config models.json`):
+  arbitrary RWKV `.pth` checkpoints, identified by an `id` (e.g. two different
+  2.9b models, or a 2.9b + 7.2b).
+- Requests pick a model with the OpenAI `model` field; models **load lazily** on
+  first use and can **co-exist in VRAM** (limited by the card).
+- Designate an **embed model** (`--embed-model` / JSON `embed_model`) so the
+  `/embedding` endpoints use one model while chat/state use the default.
+- **Auth-gated runtime admin API**: `GET /admin/models`,
+  `POST /admin/models/load|unload|unload_all` (free VRAM, LRU-evict under
+  `RWKV_MAX_RESIDENT_BYTES`).
+- `/openai/v1/models` lists the whole catalog with resident/default status.
+
+**Universal env-driven configuration**
+- A single `settings.py` reads every tuning knob from env vars (`RWKV_*`) with
+  defaults added — ports, host, model path, auth, batch/window/ceiling sizes,
+  sampler defaults — so nothing machine-specific is hardcoded. See
+  *Server tuning env vars* below.
+- `embedding_run.sh` serves the head-less embedding endpoint; `env.sh` carries
+  local model/auth values (kept out of git).
+
+Continue with the install/setup instructions below; for the fork-specific
+endpoints and multi-model quick start, see
+[*Fork additions quick start*](#fork-additions-quick-start).
+
 ## Install requirements
 **For Nvidia CUDA**
 ```bash
@@ -723,3 +771,64 @@ curl -N -X POST http://localhost:8081/v1/responses \
 - `store`: whether to store state for multi-turn (default `true`)
 
 **Response format** matches the OpenAI spec: `output[]` array with typed message items, `usage` stats, and a `resp_...` ID for chaining.
+
+---
+
+## Fork additions quick start
+
+Everything here is a fork addition (see the *What this fork adds* section at the top).
+
+### Embedding endpoints (head-less)
+Serve embeddings from any model without a WebUI:
+```bash
+# /embedding            -> "project-compatible" shape (top-level list of vectors)
+# /v1/embeddings        -> OpenAI-compatible shape
+curl http://localhost:8000/embedding -H 'Content-Type: application/json' \
+  -d '{"input": "hello world"}'
+```
+Optional aggregating prefill batching: `RWKV_EMBED_AGGREGATE=1`.
+
+### Multi-model serving
+Declare a catalog (`models.json`) and start the server, then pick models by id on
+every request; models load lazily on first use and can co-reside in VRAM:
+```bash
+# models.json
+# { "models": [
+#     {"id":"small","path":"models/rwkv7-2.9b.pth"},
+#     {"id":"big",  "path":"models/rwkv7-7.2b.pth"}
+#   ] }
+app.py --models-config models.json
+```
+- `POST /openai/v1/chat/completions {"model":"big", ...}` serves the 7.2b; omit or
+  use an unknown `model` to get the default (first-declared, or `--default-model`).
+- **Embed-vs-chat split:** set `--embed-model <id>` (or `"embed_model"` in the
+  JSON) so `/embedding` & `/v1/embeddings` use that model while chat/state use the
+  default; an explicit `model` field still overrides.
+- **Runtime management** (bearer-auth, same password as the serving routes):
+  ```bash
+  GET  /admin/models                      # catalog + residency + VRAM footprint
+  POST /admin/models/load   {"id":"big"}  # load now
+  POST /admin/models/unload {"id":"big"}  # stop using + free VRAM
+  POST /admin/models/unload_all
+  ```
+- Cap resident VRAM with `RWKV_MAX_RESIDENT_BYTES=<bytes>`; the least-recently-used
+  non-default model is evicted automatically to make room.
+- `GET /openai/v1/models` lists the whole catalog with `resident`/`default` flags.
+
+The single-model path is unchanged (`app.py --model-path models/<file>.pth`) and
+behaves byte-for-byte like upstream.
+
+### Performance flags (all opt-in, all default-off)
+| Env | What it does |
+|-----|--------------|
+| `RWKV_DYNAMIC_BATCH` | merge concurrent heterogeneous chat requests into one shared multi-row decode (~4–5× concurrent throughput) |
+| `RWKV_CUDA_GRAPH` | replay the decode forward as a CUDA graph (needs the fork's stream fix) |
+| `RWKV_ASYNC_FORWARD` | offload the heavy GPU forward to a single worker thread |
+| `RWKV_FUSE_CHAT_BATCH` | older combine-queue for homogeneous chat requests |
+| `RWKV_EMBED_AGGREGATE` | batched embedding prefill |
+| `RWKV_MAX_RESIDENT_BYTES` | multi-model VRAM budget -> LRU eviction |
+| `RWKV_EMBED_MODEL` | model id/`id` used by the embedding endpoints by default |
+
+Every configurable knob (ports, host, model path, auth, batch/window/ceiling
+sizes, sampler defaults, ...) is centralized in `settings.py`, read from
+`RWKV_*` env vars with defaults.

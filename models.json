@@ -1,0 +1,14 @@
+{
+  "models": [
+    {
+      "id": "small",
+      "path": "models/rwkv7-g1i-2.9b-20260805-ctx16384.pth",
+      "engine": "fp16"
+    },
+    {
+      "id": "big",
+      "path": "models/rwkv7-g1i-7.2b-20260805-ctx16384.pth",
+      "engine": "fp16"
+    }
+  ]
+}

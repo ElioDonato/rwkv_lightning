@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
 from API_servers.router import (
+    admin_router,
     embedding_router,
     openai_router,
     responses_router,
@@ -19,13 +20,16 @@ from API_servers.router import (
     v2_router,
 )
 from infer import inference_deps
-from infer.embed_aggregator import EmbedAggregator
-from infer.fuse_aggregator import ChatFuseAggregator
-from infer.dynamic_batch import DynamicBatchDecoder
 from settings import settings
 
 
-def create_app(engine, password=None):
+def create_app(model_manager, password=None):
+    # Default engine + its per-model aggregators are wired exactly as the old
+    # single-model create_app did, so with one model nothing changes. Phase B
+    # extends per-model wiring to every loaded engine via app.state.model_manager.
+    default = model_manager.get_slot(model_manager.default_id)
+    engine = default.engine
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger = logging.getLogger("uvicorn.error")
@@ -36,35 +40,15 @@ def create_app(engine, password=None):
             methods = ",".join(sorted(route.methods - {"HEAD", "OPTIONS"}))
             logger.info("  %-20s %s", methods, route.path)
 
-        # Opt-in embed aggregation worker (RWKV_EMBED_AGGREGATE, default-off).
-        # Attached to app.state so the embedding routes route concurrent
-        # /embedding requests through it (shared GPU batches under the opt-in;
-        # byte-identical inline embed_texts when off). Started here, and
-        # stopped (resolving any still-queued requests) when the app shuts down.
-        aggregator = EmbedAggregator(engine.model, engine.tokenizer)
-        app.state.embed_aggregator = aggregator
-        aggregator.start()
-
-        # Opt-in decode combine-queue for /openai/v1/chat/completions
-        # (RWKV_FUSE_CHAT_BATCH, default-off -- item 3). Attached to app.state so
-        # openai_routes can route concurrent chat requests through it (fused
-        # multi-row big_batch_stream decodes under the opt-in; the route uses the
-        # original single_infer path when disabled). start() is a no-op while
-        # disabled; stopped (any queued rows ended) on shutdown.
-        fuse = ChatFuseAggregator(engine)
-        app.state.chat_fuse_aggregator = fuse
-        fuse.start()
-
-        # Opt-in dynamic decode batching for /openai/v1/chat/completions
-        # (RWKV_DYNAMIC_BATCH, default-off -- Phase 4 sub-step 2). Attached to
-        # app.state so openai_routes can route concurrent chat requests through
-        # it (ANY request -- per-row-sampled multi-row shared decode under the
-        # opt-in; the route uses the original single_infer path when disabled,
-        # byte-identical to today). start() is a no-op while disabled; stopped
-        # (pending rows ended + permit capacity released) on shutdown.
-        dyn = DynamicBatchDecoder(engine)
-        app.state.chat_dynamic_decoder = dyn
-        dyn.start()
+        # Per-model decode machinery for the default engine, started on the running
+        # loop (builds + starts the embed/fuse/dynamic-batch aggregators on this
+        # slot; idempotent). app.state.* keep the historical names so routes that
+        # still read them fall back to the default; the per-request dispatch
+        # resolves the per-model slot via app.state.model_manager.
+        default.ensure_wired()
+        app.state.embed_aggregator = default.embed
+        app.state.chat_fuse_aggregator = default.fuse
+        app.state.chat_dynamic_decoder = default.dynamic
 
         # Single low-frequency background GPU cache cleanup (item 1): replaces
         # the per-request torch.cuda.empty_cache() calls removed from the :8081
@@ -83,9 +67,14 @@ def create_app(engine, password=None):
                 cleanup_task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
                     await cleanup_task
-            await dyn.stop()
-            await fuse.stop()
-            await aggregator.stop()
+            # Per-model decode schedulers wired on the default slot (embed, fuse,
+            # dynamic batch) -- gracefully drain them on shutdown.
+            for _agg in (default.dynamic, default.fuse, default.embed):
+                if _agg is not None:
+                    try:
+                        await _agg.stop()
+                    except Exception:  # pragma: no cover - best-effort teardown
+                        pass
 
     app = FastAPI(lifespan=lifespan)
     # RWKV_CORS_ORIGINS: comma-separated allowlist, e.g. "http://localhost:3000,https://app.example.com"
@@ -99,6 +88,7 @@ def create_app(engine, password=None):
     )
 
     app.state.engine = engine
+    app.state.model_manager = model_manager
     app.state.password = password
     app.state.dialogue_idx_lock = Lock()
     app.state.dialogue_idx_counters = {}
@@ -116,5 +106,6 @@ def create_app(engine, password=None):
     app.include_router(openai_router)
     app.include_router(responses_router)
     app.include_router(embedding_router)
+    app.include_router(admin_router)
 
     return app

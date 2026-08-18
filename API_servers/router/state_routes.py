@@ -20,6 +20,7 @@ from API_servers.router.common import (
     prefill_bsz_limit_response,
     prefill_sse_response,
     reserve_prefill_capacity,
+    resolve_slot,
     run_sync_with_disconnect_watch,
     session_lock,
 )
@@ -31,7 +32,6 @@ router = APIRouter()
 
 @router.post("/state/chat/completions")
 async def state_chat_completions(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
     req, parse_error = parse_request_model(ChatRequest, body)
@@ -47,6 +47,9 @@ async def state_chat_completions(request: Request):
     auth_error = check_password(req.password, password)
     if auth_error is not None:
         return auth_error
+
+    slot = await resolve_slot(request)
+    engine = slot.engine
 
     prompts = req.contents
     state_manager = get_state_manager()
@@ -91,13 +94,13 @@ async def state_chat_completions(request: Request):
                 async for chunk in inner_stream:
                     yield chunk
 
-        return prefill_sse_response(request, locked_stream(), cancel_token, 1)
+        return prefill_sse_response(request, locked_stream(), cancel_token, 1, engine=engine)
 
     # Non-streaming: hold lock for the entire inference
     async with session_lock(session_id):
         try:
             cancel_token = CancellationToken()
-            async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
+            async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token, engine=engine):
                 results, finish_reasons = await run_sync_with_disconnect_watch(
                     request,
                     engine.batch_generate_state,
@@ -149,7 +152,6 @@ async def state_chat_completions(request: Request):
 @router.post("/multi_state/chat/completions")
 async def multi_state_chat_completions(request: Request):
     app_state = request.app.state
-    engine = app_state.engine
     password = app_state.password
     body = await request.json()
     req, parse_error = parse_request_model(ChatRequest, body)
@@ -159,6 +161,9 @@ async def multi_state_chat_completions(request: Request):
     auth_error = check_password(req.password, password)
     if auth_error is not None:
         return auth_error
+
+    slot = await resolve_slot(request)
+    engine = slot.engine
 
     if "dialogue_idx" not in body:
         return json_response(400, {"error": "Missing dialogue_idx parameter"})
@@ -242,13 +247,13 @@ async def multi_state_chat_completions(request: Request):
                         state_manager.put_state(new_session_id, state)
                         logger.info(f"[RESPONSE] /multi_state/chat/completions state[2]: {state[2]}")
 
-        return prefill_sse_response(request, stream_with_dialogue_idx(), cancel_token, 1)
+        return prefill_sse_response(request, stream_with_dialogue_idx(), cancel_token, 1, engine=engine)
 
     # Non-streaming: hold lock for the entire inference
     async with session_lock(session_index):
         try:
             cancel_token = CancellationToken()
-            async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
+            async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token, engine=engine):
                 results, finish_reasons = await run_sync_with_disconnect_watch(
                     request,
                     engine.batch_generate_state,

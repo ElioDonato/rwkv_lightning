@@ -28,6 +28,7 @@ from API_servers.router.common import (
     prefill_bsz_limit_response,
     prefill_sse_response,
     reserve_prefill_capacity,
+    resolve_slot,
     watch_disconnect,
 )
 from API_servers.router.schemas import ChatRequest
@@ -347,22 +348,42 @@ async def openai_list_models(request: Request):
     if auth_error is not None:
         return auth_error
 
-    model_name = os.path.basename(f"{engine.args.MODEL_NAME}")
-    return {
-        "object": "list",
-        "data": [{"id": model_name, "object": "model", "owned_by": "rwkv_lightning"}],
-    }
+    manager = getattr(request.app.state, "model_manager", None)
+    if manager is not None:
+        # Multi-model: list every declared model (resident or not).
+        data = [
+            {
+                "id": m["id"],
+                "object": "model",
+                "owned_by": "rwkv_lightning",
+                "resident": m["resident"],
+                "default": m["default"],
+            }
+            for m in manager.known_models()
+        ] or [
+            {
+                "id": os.path.basename(f"{engine.args.MODEL_NAME}"),
+                "object": "model",
+                "owned_by": "rwkv_lightning",
+            }
+        ]
+    else:
+        model_name = os.path.basename(f"{engine.args.MODEL_NAME}")
+        data = [{"id": model_name, "object": "model", "owned_by": "rwkv_lightning"}]
+    return {"object": "list", "data": data}
 
 
 @router.post("/openai/v1/chat/completions")
 async def openai_chat_completions(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
     try:
         body = await request.json()
         auth_error = check_openai_auth(request, body, password)
         if auth_error is not None:
             return auth_error
+
+        slot = await resolve_slot(request, body.get("model"))
+        engine = slot.engine
 
         prompt = extract_openai_prompt(body)
         if not prompt and not (body.get("messages") or []):
@@ -383,7 +404,7 @@ async def openai_chat_completions(request: Request):
         # permit, so these branches do NOT use reserve_prefill_capacity /
         # prefill_sse_response. When disabled, the original path is used
         # unchanged (byte-identical).
-        fuse = getattr(request.app.state, "chat_fuse_aggregator", None)
+        fuse = slot.fuse
         # Opt-in DYNAMIC decode batching (RWKV_DYNAMIC_BATCH, Phase 4 sub-step
         # 2): when enabled it takes precedence and routes EVERY chat request
         # through the DynamicBatchDecoder -- a shared multi-row decode with
@@ -391,7 +412,7 @@ async def openai_chat_completions(request: Request):
         # row keeps its own sampler controls). When disabled this branch is
         # skipped, so behavior is byte-identical to today (the original
         # single_infer path, or the fuse path below when that flag is on).
-        dyn = getattr(request.app.state, "chat_dynamic_decoder", None)
+        dyn = slot.dynamic
         if dyn is not None and dyn.enabled:
             cancel_token = CancellationToken()
             dyn_stream = await dyn.submit(
@@ -540,10 +561,10 @@ async def openai_chat_completions(request: Request):
                 cancel_token,
                 prefix_cache_manager,
             )
-            return prefill_sse_response(request, stream, cancel_token, 1)
+            return prefill_sse_response(request, stream, cancel_token, 1, engine=engine)
 
         cancel_token = CancellationToken()
-        async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token):
+        async with reserve_prefill_capacity(request, 1, cancel_token=cancel_token, engine=engine):
             result_text, finish_reason = await engine.single_infer(
                 prompt=prompt_formatted,
                 max_length=req.max_tokens,

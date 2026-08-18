@@ -7,7 +7,7 @@ import time
 
 from fastapi import APIRouter, Request
 
-from API_servers.router.common import check_openai_auth, json_response
+from API_servers.router.common import check_openai_auth, json_response, resolve_slot
 from infer.embedding import embed_texts, embedding_dim
 
 router = APIRouter()
@@ -38,7 +38,6 @@ async def project_embedding(request: Request):
 
 
 async def _embed_hander(request: Request, openai_shape: bool):
-    engine = request.app.state.engine
     password = request.app.state.password
 
     try:
@@ -52,6 +51,9 @@ async def _embed_hander(request: Request, openai_shape: bool):
     except ValueError as exc:
         return json_response(400, {"error": str(exc)})
 
+    slot = await resolve_slot(request, body.get("model"), role="embed")
+    engine = slot.engine
+
     model_name = engine.args.MODEL_NAME.split("/")[-1]
 
     try:
@@ -64,7 +66,7 @@ async def _embed_hander(request: Request, openai_shape: bool):
         # RWKV_EMBED_AGGREGATE is explicitly enabled. Falling back to the direct
         # call keeps this route functional on an app that never created the
         # aggregator (e.g. an isolated test harness).
-        aggregator = getattr(request.app.state, "embed_aggregator", None)
+        aggregator = slot.embed
         if aggregator is not None:
             vectors = await aggregator.submit(texts)
         else:

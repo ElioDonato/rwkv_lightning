@@ -10,6 +10,7 @@ from API_servers.router.common import (
     prefill_bsz_limit_response,
     prefill_sse_response,
     reserve_prefill_capacity,
+    resolve_slot,
     run_sync_with_disconnect_watch,
 )
 from API_servers.router.schemas import ChatRequest
@@ -28,7 +29,6 @@ class V2ChatRequest(ChatRequest):
 
 @router.post("/v2/chat/completions")
 async def chat_completions_v2(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
     req, parse_error = parse_request_model(V2ChatRequest, body)
@@ -38,6 +38,9 @@ async def chat_completions_v2(request: Request):
     auth_error = check_password(req.password, password)
     if auth_error is not None:
         return auth_error
+
+    slot = await resolve_slot(request, body.get("model"))
+    engine = slot.engine
 
     prefix_cache_manager = get_state_manager() if req.use_prefix_cache else None
 
@@ -57,11 +60,11 @@ async def chat_completions_v2(request: Request):
             cancel_token=cancel_token,
             prefix_cache_manager=prefix_cache_manager,
         )
-        return prefill_sse_response(request, stream, cancel_token, len(req.contents))
+        return prefill_sse_response(request, stream, cancel_token, len(req.contents), engine=engine)
 
     try:
         cancel_token = CancellationToken()
-        async with reserve_prefill_capacity(request, len(req.contents), cancel_token=cancel_token):
+        async with reserve_prefill_capacity(request, len(req.contents), cancel_token=cancel_token, engine=engine):
             results, finish_reasons = await run_sync_with_disconnect_watch(
                 request,
                 engine.batch_generate_v2,
