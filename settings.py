@@ -181,6 +181,77 @@ class Settings:
             "opt-in CUDA-graph replay of the decode forward",
         )
 
+        # -- extensive caching (all opt-in, default-OFF) ----------------------
+        # Every new cache below is keyed by a checkpoint fingerprint via
+        # ``cache_namespace(slot)`` (see API_servers/router/common.py) so a
+        # runtime model reload / checkpoint swap can never serve a stale entry.
+        # Single-model behavior is byte-identical unless a knob is enabled.
+
+        # A3c: background TTL / max-row sweep + VACUUM of the state DB, so
+        # rwkv_sessions.db / prefix_cache stop growing unbounded. Master gate
+        # MUST be on before the TTL/interval knobs have any effect (a nonzero
+        # TTL alone would otherwise auto-start a DB-mutating sweeper with no
+        # explicit opt-in). Sweeps run on the background io_executor thread and
+        # never on the asyncio event loop.
+        self.cache_sweep = self._get_bool(
+            env, "RWKV_CACHE_SWEEP", False,
+            "opt-in background DB sweep (TTL/cap/VACUUM)",
+        )
+        self.prefix_cache_ttl_s = self._get_float(
+            env, "RWKV_PREFIX_CACHE_TTL_S", 86400.0,
+            "prefix_cache/sessions TTL for the sweep (s; 0 = never expire)",
+        )
+        self.prefix_cache_max_rows = self._get_int(
+            env, "RWKV_PREFIX_CACHE_MAX_ROWS", 0,
+            "max prefix_cache rows before sweep evicts oldest (0 = unlimited)",
+        )
+        self.cache_sweep_interval_s = self._get_float(
+            env, "RWKV_CACHE_SWEEP_INTERVAL_S", 3600.0,
+            "DB sweep cadence (s)",
+        )
+
+        # A3b: off-gated replacement for the hot-path synchronous DB prefix
+        # lookups. ON -> a single bounded disk probe (largest plausible bucket
+        # <= prompt length) plus a background warm of the other buckets, instead
+        # of up to 8 synchronous SELECTs on the request thread. OFF (default)
+        # keeps the historical per-request disk fallback byte-identical.
+        self.prefix_disk_async = self._get_bool(
+            env, "RWKV_PREFIX_DISK_ASYNC", False,
+            "opt-in single-probe + background-warm prefix disk fallback",
+        )
+
+        # A1: embedding output LRU (deterministic pure function of (model,text)).
+        self.embed_cache = self._get_bool(
+            env, "RWKV_EMBED_CACHE", False,
+            "opt-in embedding output LRU",
+        )
+        self.embed_cache_capacity = self._get_int(
+            env, "RWKV_EMBED_CACHE_CAPACITY", 4096,
+            "embedding output LRU entry cap",
+        )
+
+        # A6: tokenize-encode memoization (pure function of (model,text)).
+        self.encode_cache = self._get_bool(
+            env, "RWKV_ENCODE_CACHE", False,
+            "opt-in tokenizer encode memoization",
+        )
+        self.encode_cache_capacity = self._get_int(
+            env, "RWKV_ENCODE_CACHE_CAPACITY", 8192,
+            "tokenizer encode memo entry cap",
+        )
+
+        # B: adaptive short-prompt prefix reuse (relax the fixed bucket gate).
+        self.prefix_adaptive = self._get_bool(
+            env, "RWKV_PREFIX_ADAPTIVE", False,
+            "opt-in adaptive short-prompt prefix checkpointing",
+        )
+
+        # C: turn-level state reuse on raw /v1 + /v2 (content turn-hash).
+        self.turn_state_reuse = self._get_bool(
+            env, "RWKV_TURN_STATE_REUSE", False,
+            "opt-in content-addressed multi-turn state reuse (raw /v1+/v2 only)",
+        )
+
     # -- typed environment accessors ------------------------------------------
     @staticmethod
     def _get_str(env, name: str, default: Optional[str], what: str) -> Optional[str]:

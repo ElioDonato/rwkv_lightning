@@ -168,6 +168,25 @@ def model_namespace(slot):
     return slot.id
 
 
+def cache_namespace(slot):
+    """Checkpoint-aware key for the OPT-IN caches (A1 embed LRU, A6 encode memo,
+    C turn-reuse). Unlike ``model_namespace`` (which returns None for the default
+    model -- a deliberate no-op for the state core), this ALWAYS resolves to a
+    fingerprint that changes when a model is (re)loaded from a checkpoint, so a
+    new opt-in cache can never serve a stale vector / tokenization / recurrent
+    state on the single-default-model serving box, even after a runtime model
+    reload without a process restart. Handles the _DefaultSlotShim (no path)."""
+    name = getattr(slot, "id", "default")
+    path = getattr(slot, "path", None)
+    if path:
+        try:
+            st = os.stat(path)
+            return f"{name}:{st.st_size}:{st.st_mtime_ns}"
+        except OSError:
+            pass
+    return name
+
+
 def _default_engine(request, engine=None):
     """Resolve the engine for prefill/permit admission. An explicit ``engine``
     (the per-request slot's engine) wins; otherwise the default-slot engine.

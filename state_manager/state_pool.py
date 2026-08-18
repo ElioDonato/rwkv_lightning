@@ -23,6 +23,11 @@ DB_PATH = "rwkv_sessions.db"  # infinite cold state pool HaHa!
 PREFIX_CACHE_BUCKETS = (1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192)
 PREFIX_CACHE_BUCKET_CAPACITY = 16
 PREFIX_HASH_COLUMNS = tuple(f"prefix_hash_{bucket}" for bucket in PREFIX_CACHE_BUCKETS)
+# After this many evictions the prefix trie's stale terminals (from evicted
+# entries, which are NOT deleted from the radix trie) accumulate enough that a
+# bounded full rebuild is worth it. Evictions are the only source of staleness;
+# plain inserts add clean terminals and never trigger a rebuild.
+TRIE_REBUILD_CHURN = 32
 
 
 def _serialize_token_ids(tokens: List[int] | Tuple[int, ...]) -> str:
@@ -190,6 +195,8 @@ class StateCacheManager:
         self.prefix_tries: Dict[str, _CompressedTrie] = {}
         self.prefix_trie = _CompressedTrie()  # back-compat alias for the default model
         self.prefix_tries[""] = self.prefix_trie
+        # Evictions since the last full trie rebuild (see TRIE_REBUILD_CHURN).
+        self._prefix_trie_churn = 0
         
         self.cache_lock = threading.RLock()
         
@@ -201,6 +208,9 @@ class StateCacheManager:
         
         self.io_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db_writer")
         
+        # Background DB sweeper (A3c); None until start_sweeper() is called.
+        self._sweep_stop = None
+        self._sweep_thread = None
         self._initialized = True
         logger.info(f"[StatePool] Initialized. L1: {L1_CAPACITY}, L2: {L2_CAPACITY}, "
             f"Prefix L2: {len(PREFIX_CACHE_BUCKETS)}x{PREFIX_CACHE_BUCKET_CAPACITY}, DB: {DB_PATH}")
@@ -319,9 +329,10 @@ class StateCacheManager:
             self.prefix_tries.setdefault(entry.model, _CompressedTrie()).insert(
                 entry.prefix_tokens, entry.state_id
             )
+        self._prefix_trie_churn = 0
 
     def _store_prefix_entry_locked(self, entry: PrefixCacheEntry, persist: bool):
-        bucket_cache = self.prefix_l2_cache[entry.bucket_len]
+        bucket_cache = self.prefix_l2_cache.setdefault(entry.bucket_len, OrderedDict())
         if entry.state_id in bucket_cache:
             del bucket_cache[entry.state_id]
         bucket_cache[entry.state_id] = entry
@@ -331,8 +342,26 @@ class StateCacheManager:
         if len(bucket_cache) > PREFIX_CACHE_BUCKET_CAPACITY:
             _, evicted_entry = bucket_cache.popitem(last=False)
             self.prefix_entry_index.pop(evicted_entry.state_id, None)
+            # The evicted terminal is NOT deleted from the radix trie (it has
+            # no delete op) -- its state_id becomes stale. match_prefix_state's
+            # ``entry = prefix_entry_index.get(state_id)`` guard turns a stale
+            # terminal into a harmless no-op miss (the entry was persisted and
+            # is still reachable via the disk fallback), never a wrong value.
+            self._prefix_trie_churn += 1
 
-        self._rebuild_prefix_trie()
+        # Incremental trie insert: an O(1) amortized child-insert keeps the
+        # shared insert path (both put_prefix_state and the disk-load path call
+        # this) from forcing an O(n) full rebuild on every single insert. A
+        # bounded full rebuild runs only once enough EVICTIONS have left stale
+        # terminals behind (evictions are the sole source of staleness).
+        if self._prefix_trie_churn >= TRIE_REBUILD_CHURN:
+            self._rebuild_prefix_trie()
+        else:
+            trie = self.prefix_tries.setdefault(entry.model, _CompressedTrie())
+            trie.insert(entry.prefix_tokens, entry.state_id)
+            if entry.model == "":
+                # keep the back-compat alias pointing at the default model's trie
+                self.prefix_trie = trie
 
         if persist:
             self.io_executor.submit(self._persist_prefix_task, entry)
@@ -544,6 +573,13 @@ class StateCacheManager:
                         "cache_source": "l2_ram",
                     }
 
+        # Disk fallback. Default (RWKV_PREFIX_DISK_ASYNC off) keeps the
+        # historical loop below: up to 8 synchronous SQLite SELECTs on the
+        # request thread, byte-identical. With the knob ON, replace that with a
+        # single bounded probe + background warm (see _bounded_prefix_disk_probe).
+        if self._prefix_disk_async_enabled():
+            return self._bounded_prefix_disk_probe(token_tuple, device, model)
+
         for bucket in reversed(PREFIX_CACHE_BUCKETS):
             if len(token_tuple) < bucket:
                 continue
@@ -569,6 +605,74 @@ class StateCacheManager:
 
         return None
 
+    @staticmethod
+    def _prefix_disk_async_enabled() -> bool:
+        """Lazy settings read so the state core stays importable without the
+        server settings module; a missing import (isolated harness) means the
+        historical (off) behavior is used."""
+        try:
+            from settings import settings as _settings
+            return bool(getattr(_settings, "prefix_disk_async", False))
+        except Exception:
+            return False
+
+    def _bounded_prefix_disk_probe(
+        self,
+        token_tuple: Tuple[int, ...],
+        device: str,
+        model: Optional[str],
+    ) -> Optional[dict]:
+        """A3b (RWKV_PREFIX_DISK_ASYNC): replace the up-to-8 synchronous disk
+        probes with ONE bounded read at the largest plausible bucket <= prompt
+        length, then warm any smaller matching bucket in the background so the
+        NEXT request finds it in L2 (off the event loop). Recognized reduced
+        recall vs the full loop for a single request (only the largest bucket is
+        probed synchronously; smaller matches surface one request later via the
+        warm) -- a documented throughput-vs-recall tradeoff, opt-in only."""
+        candidate = None
+        for bucket in reversed(PREFIX_CACHE_BUCKETS):
+            if len(token_tuple) >= bucket:
+                candidate = bucket
+                break
+        if candidate is None:
+            return None
+
+        with self.cache_lock:
+            entry = self._load_prefix_entry_from_db_locked(token_tuple, candidate, model)
+        if entry is not None:
+            prompt_prefix_hashes = _build_prefix_hashes(token_tuple)
+            logger.info("[StatePool][PREFIX HIT][DISK] "
+                f"matched_tokens={candidate} "
+                f"bucket_len={entry.bucket_len} "
+                f"prompt_len={len(token_tuple)} "
+                f"state_id={entry.state_id[:160]} "
+                f"hash_{entry.bucket_len}={prompt_prefix_hashes.get(entry.bucket_len)} "
+                "-> load_to_l2")
+            return {
+                "state_id": entry.state_id,
+                "matched_tokens": candidate,
+                "bucket_len": entry.bucket_len,
+                "state": self._clone_to_device_state(entry.state_cpu, device),
+                "logits": self._clone_optional_tensor(entry.logits_cpu, device),
+                "cache_source": "disk",
+            }
+
+        def _warm_smaller_buckets():
+            # Recheck the candidate too: an entry may have been evicted from
+            # L2 while this warm was queued.
+            with self.cache_lock:
+                for bucket in sorted(PREFIX_CACHE_BUCKETS, reverse=True):
+                    if bucket >= candidate or len(token_tuple) < bucket:
+                        continue
+                    self._load_prefix_entry_from_db_locked(token_tuple, bucket, model)
+
+        try:
+            self.io_executor.submit(_warm_smaller_buckets)
+        except RuntimeError:
+            pass  # io_executor already shut down -> nothing to warm
+
+        return None
+
     def close_session(self, session_id: str, model=None):
 
         state_to_save = None
@@ -587,6 +691,7 @@ class StateCacheManager:
 
     def flush_all(self):
 
+        self.stop_sweeper()
         logger.info("[StatePool] Flushing all states to disk...")
         
         self.io_executor.shutdown(wait=True)
@@ -653,6 +758,96 @@ class StateCacheManager:
             self.db_cursor.execute("SELECT session_id, last_updated FROM sessions ORDER BY last_updated DESC")
             results = self.db_cursor.fetchall()
             return [(row[0], row[1]) for row in results]
+
+    def run_sweep(self, ttl_s: float = 0.0, max_rows: int = 0) -> Dict[str, int]:
+        """Prune the state DB: delete expired (older than ``ttl_s``) and, when
+        ``max_rows`` > 0, over-cap rows from ``sessions`` / ``prefix_cache``,
+        then ``VACUUM`` to reclaim the on-disk bloat that years of bare
+        ``INSERT OR REPLACE`` (without any removal) accumulate on a long-running
+        box. Runs entirely under ``db_lock``; a caller should run it on a
+        background thread so it never blocks the asyncio event loop (a slow
+        ``VACUUM`` on this DB is exactly the documented 20s-stall hazard).
+        Returns a summary dict. Pure no-op when ttl<=0 and max_rows<=0."""
+        detail = {"expired_sessions": 0, "expired_prefix": 0, "over_cap_prefix": 0}
+        if not (ttl_s and ttl_s > 0) and not (max_rows and max_rows > 0):
+            return detail
+        now = time.time()
+        with self.db_lock:
+            try:
+                if ttl_s and ttl_s > 0:
+                    cutoff = now - ttl_s
+                    self.db_cursor.execute(
+                        "DELETE FROM sessions WHERE last_updated < ?", (cutoff,))
+                    detail["expired_sessions"] = self.db_cursor.rowcount
+                    self.db_cursor.execute(
+                        "DELETE FROM prefix_cache WHERE last_updated < ?", (cutoff,))
+                    detail["expired_prefix"] = self.db_cursor.rowcount
+                if max_rows and max_rows > 0:
+                    self.db_cursor.execute("SELECT COUNT(*) FROM prefix_cache")
+                    if self.db_cursor.fetchone()[0] > max_rows:
+                        # keep the most-recent max_rows rows, evict the rest
+                        self.db_cursor.execute(
+                            "DELETE FROM prefix_cache WHERE state_id IN ("
+                            " SELECT state_id FROM prefix_cache"
+                            " ORDER BY last_updated DESC LIMIT -1 OFFSET ?)",
+                            (int(max_rows),))
+                        detail["over_cap_prefix"] = self.db_cursor.rowcount
+                self.db_conn.commit()
+                if detail["expired_sessions"] or detail["expired_prefix"] or detail["over_cap_prefix"]:
+                    # VACUUM must run outside any active transaction.
+                    self.db_cursor.execute("VACUUM")
+                    self.db_conn.commit()
+            except Exception as e:
+                logger.error(f"[StatePool] Sweep error: {e}")
+                self.db_conn.rollback()
+        if detail and (detail["expired_sessions"] or detail["expired_prefix"] or detail["over_cap_prefix"]):
+            logger.info(f"[StatePool] Sweep removed sessions={detail['expired_sessions']} "
+                        f"prefix={detail['expired_prefix']} over_cap={detail['over_cap_prefix']}")
+        return detail
+
+    def start_sweeper(self, interval_s: float, ttl_s: float = 0.0, max_rows: int = 0):
+        """Start a background daemon thread that runs :meth:`run_sweep` every
+        ``interval_s``. Caller (the app lifespan, gated on RWKV_CACHE_SWEEP==1)
+        must call :meth:`stop_sweeper` at shutdown so the thread joins before
+        ``flush_all`` closes the connection. Runs independent of the db_writer
+        thread (SQL is serialized against it by ``db_lock``)."""
+        self._sweep_stop = threading.Event()
+        self._sweep_interval = float(interval_s)
+        self._sweep_ttl = float(ttl_s)
+        self._sweep_max_rows = int(max_rows)
+
+        def _loop():
+            while not self._sweep_stop.wait(self._sweep_interval):
+                try:
+                    self.run_sweep(self._sweep_ttl, self._sweep_max_rows)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.error(f"[StatePool] sweeper iteration failed: {e}")
+
+        self._sweep_thread = threading.Thread(
+            target=_loop, name="state_db_sweeper", daemon=True,
+        )
+        self._sweep_thread.start()
+        logger.info(f"[StatePool] sweeper started: interval={interval_s}s "
+                    f"ttl={ttl_s}s max_rows={max_rows}")
+        return self
+
+    def stop_sweeper(self):
+        """Signal the sweeper thread to exit and join it (bounded by its
+        current interval, so a long-polling thread can't stall shutdown)."""
+        stop = getattr(self, "_sweep_stop", None)
+        thread = getattr(self, "_sweep_thread", None)
+        if stop is not None:
+            stop.set()
+        if thread is not None:
+            # If run_sweep is mid-execution (holding db_lock / running VACUUM)
+            # the join blocks until it finishes -- the caller must not hold
+            # db_lock when it calls this (flush_all does not).
+            thread.join(timeout=max(getattr(self, "_sweep_interval", 0.0), 5.0))
+            if thread.is_alive():
+                logger.warning("[StatePool] sweeper thread did not exit in time; "
+                               "draining after shutdown instead")
+        self._sweep_stop = None
+        self._sweep_thread = None
 
     def list_prefix_states_in_db(self) -> List[Tuple[str, int, float]]:
         """Full `ORDER BY last_updated` scan+sort over the entire prefix_cache

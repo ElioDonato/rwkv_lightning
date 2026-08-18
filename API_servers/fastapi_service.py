@@ -60,9 +60,30 @@ def create_app(model_manager, password=None):
         cleanup_task = None
         if inference_deps.get_torch().cuda.is_available():
             cleanup_task = asyncio.create_task(engine.run_periodic_gpu_cleanup())
+
+        # A3c: background state-DB sweep (RWKV_CACHE_SWEEP=1). Bounds the size
+        # of rwkv_sessions.db / prefix_cache (TTL + max-row cap + VACUUM) on
+        # the background io_executor thread, never the event loop. Off by
+        # default; the sweeper is drained in the finally below before the
+        # connection is closed by manager shutdown.
+        if settings.cache_sweep:
+            from state_manager.state_pool import get_state_manager
+            _sweeper = get_state_manager().start_sweeper(
+                settings.cache_sweep_interval_s,
+                settings.prefix_cache_ttl_s,
+                settings.prefix_cache_max_rows,
+            )
+        else:
+            _sweeper = None
+
         try:
             yield
         finally:
+            if _sweeper is not None:
+                try:
+                    _sweeper.stop_sweeper()
+                except Exception:  # pragma: no cover - best-effort teardown
+                    pass
             if cleanup_task is not None:
                 cleanup_task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
