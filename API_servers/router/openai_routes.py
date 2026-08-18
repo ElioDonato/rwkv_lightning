@@ -384,7 +384,76 @@ async def openai_chat_completions(request: Request):
         # prefill_sse_response. When disabled, the original path is used
         # unchanged (byte-identical).
         fuse = getattr(request.app.state, "chat_fuse_aggregator", None)
-        if fuse is not None and fuse.enabled:
+        # Opt-in DYNAMIC decode batching (RWKV_DYNAMIC_BATCH, Phase 4 sub-step
+        # 2): when enabled it takes precedence and routes EVERY chat request
+        # through the DynamicBatchDecoder -- a shared multi-row decode with
+        # per-row sampling that accepts ANY request (no homogeneity check, each
+        # row keeps its own sampler controls). When disabled this branch is
+        # skipped, so behavior is byte-identical to today (the original
+        # single_infer path, or the fuse path below when that flag is on).
+        dyn = getattr(request.app.state, "chat_dynamic_decoder", None)
+        if dyn is not None and dyn.enabled:
+            cancel_token = CancellationToken()
+            dyn_stream = await dyn.submit(
+                engine,
+                prompt_formatted,
+                req.max_tokens,
+                req.temperature,
+                req.stop_tokens,
+                req.chunk_size,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                alpha_presence=req.alpha_presence,
+                alpha_frequency=req.alpha_frequency,
+                alpha_decay=req.alpha_decay,
+                cancel_token=cancel_token,
+            )
+            if req.stream:
+                stream = _relay_openai_stream(
+                    dyn_stream, response_id, created, model_name, cancel_token
+                )
+                return fuse_sse_response(request, stream, cancel_token)
+
+            collect_task = asyncio.create_task(collect_fuse_nonstream(dyn_stream))
+            watcher = asyncio.create_task(watch_disconnect(request, cancel_token))
+            pending = set()
+            try:
+                done, pending = await asyncio.wait(
+                    {collect_task, watcher}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if collect_task not in done:
+                    # watcher finished -> client disconnected
+                    collect_task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await collect_task
+                    await dyn_stream.aclose()
+                    raise InferenceCancelled("request disconnected")
+                result_text, finish_reason = await collect_task
+            finally:
+                for t in pending:
+                    t.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    for t in pending:
+                        await t
+
+            message, response_finish_reason = build_openai_message_response(
+                result_text, finish_reason, body
+            )
+            return {
+                "id": response_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": message,
+                        "finish_reason": response_finish_reason,
+                    }
+                ],
+                "usage": build_openai_usage(engine.tokenizer, prompt_formatted, result_text),
+            }
+        elif fuse is not None and fuse.enabled:
             # Fusion-eligibility for prefix caching (CR1 HIGH-2): fuse=OFF (and
             # req.use_prefix_cache above) defaults use_prefix_cache=True, which
             # would make EVERY default chat request non-fusable (the fused path

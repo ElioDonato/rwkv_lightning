@@ -153,6 +153,24 @@ class Settings:
             "fuse: treat omitted use_prefix_cache as False",
         )
 
+        # -- dynamic decode batching (per-row-sampled shared decode) -----------
+        # Phase-4 sub-step 2: merge ANY concurrent chat requests into ONE shared
+        # multi-row decode with per-row sampling (RWKV_DYNAMIC_BATCH, default
+        # off). Rows join/leave as requests arrive/finish; each row keeps its own
+        # sampler controls + RNG. A burst is capped so it can never OOM a
+        # co-resident process. Default-off: no decoder activity, route unchanged.
+        self.dynamic_batch = self._get_bool(
+            env, "RWKV_DYNAMIC_BATCH", False, "opt-in dynamic multi-row decode batching"
+        )
+        self.dynamic_batch_window_ms = self._get_int(
+            env, "RWKV_DYNAMIC_BATCH_WINDOW_MS", 8,
+            "dynamic-batch gather window (ms)",
+        )
+        self.dynamic_batch_max_bsz = self._get_int(
+            env, "RWKV_DYNAMIC_BATCH_MAX_BSZ", 8,
+            "dynamic-batch fused-row hard ceiling per decode batch",
+        )
+
     # -- typed environment accessors ------------------------------------------
     @staticmethod
     def _get_str(env, name: str, default: Optional[str], what: str) -> Optional[str]:
