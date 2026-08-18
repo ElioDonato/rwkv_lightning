@@ -1,10 +1,47 @@
 import asyncio
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 from settings import settings
 
 logger = logging.getLogger("infer.async_forward")
+
+# ---------------------------------------------------------------------------
+# Process-wide CUDA serialization lock.
+#
+# Phase 2: the Mod A worker thread serializes the STREAMING decode units, but the
+# BLOCKING cores (_batch_decode_blocking / batch_generate_state, on Starlette's
+# threadpool) and the EMBED path (event-loop thread) each touch CUDA on their own
+# thread. Under RWKV_ASYNC_FORWARD that means two threads CAN be inside CUDA at
+# once -- the corruption/deadlock class this module exists to prevent. A single
+# process-wide reentrant lock closes that gap: EVERY CUDA-touching unit, whatever
+# its thread, acquires `cuda_guard()`, so at most one thread is ever in CUDA.
+#
+# RULES for callers:
+# * Acquire `cuda_guard()` ONLY around SYNCHRONOUS CUDA-touching work. Never hold
+#   it across an `await` -- waiting for the event loop while another thread awaits
+#   the lock can deadlock.
+# * Never use the lock to guard pure-CPU bookkeeping (tokenizer.decode, SSE
+#   assembly, per-token .tolist() reads are fine inside the unit).
+# * Reentrant (RLock): a unit may nest a guarded call on the SAME thread safely,
+#   but cross-thread the lock strictly serializes.
+# ---------------------------------------------------------------------------
+_CUDA_LOCK = threading.RLock()
+
+
+@contextmanager
+def cuda_guard():
+    """Serialize the guarded block against every other CUDA-touching unit in the
+    process (Mod A worker, blocking decode cores, embed path, periodic cleanup).
+    Reentrant on the calling thread; strictly mutual across threads."""
+    _CUDA_LOCK.acquire()
+    try:
+        yield
+    finally:
+        _CUDA_LOCK.release()
+
 
 # Default OFF: the heavy synchronous GPU forward stays on the uvicorn event-loop
 # thread, byte-identical to the pre-feature serving path. Only when the knob is
@@ -22,8 +59,11 @@ def _async_forward_enabled() -> bool:
 def _invoke(fn, args, kwargs):
     # Module-level helper so the worker thread executes the plain callable
     # without reconstructing it from a lambda -- keeps the submit path trivial
-    # and avoids any accidental closure/lambda capture at submit time.
-    return fn(*args, **kwargs)
+    # and avoids any accidental closure/lambda capture at submit time. Runs under
+    # the process-wide CUDA lock so the worker (Mod A) serializes against the
+    # blocking decode cores and the embed path on OTHER threads.
+    with cuda_guard():
+        return fn(*args, **kwargs)
 
 
 class GpuAsyncExecutor:
@@ -110,7 +150,11 @@ class GpuAsyncExecutor:
         if self._enabled and self._executor is not None:
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(self._executor, _invoke, fn, args, kwargs)
-        return fn(*args, **kwargs)
+        # Disabled (default) or after shutdown: run inline on this (event-loop)
+        # thread, under the process-wide CUDA lock, so even the default path
+        # serializes against the blocking cores / embed path running elsewhere.
+        with cuda_guard():
+            return fn(*args, **kwargs)
 
     def shutdown(self, wait=False):
         if self._executor is not None:

@@ -53,6 +53,7 @@ import torch
 from torch.nn import functional as F
 
 from settings import settings
+from infer.async_forward import cuda_guard
 from infer.rwkv_batch.rwkv7 import (
     RWKV_x070_CMix_seq,
     RWKV_x070_CMix_seq_batch,
@@ -260,30 +261,35 @@ def embed_texts(model, tokenizer, texts, normalize=True, device="cuda"):
                             or settings.embed_hard_ceiling))
         sub_batches = [non_empty[i:i + max_bsz] for i in range(0, len(non_empty), max_bsz)]
 
-        for sub in sub_batches:
-            if len(sub) == 1:
-                i, tokens = sub[0]
-                h = _embed_single(model, z, tokens, device)
-                h = F.layer_norm(
-                    h, (n_embd,), weight=z["ln_out.weight"], bias=z["ln_out.bias"]
-                )
-                if normalize:
-                    h = F.normalize(h, dim=0)
-                results[i] = h.cpu().float().tolist()
-                continue
+        # The embed forward runs on the event-loop thread (Mod A's offload seam
+        # does not cover the embed path), but it is a CUDA-touching unit -- so
+        # it must hold the process-wide CUDA lock to serialize against the
+        # streaming/blocking decoders when RWKV_ASYNC_FORWARD is enabled.
+        with cuda_guard():
+            for sub in sub_batches:
+                if len(sub) == 1:
+                    i, tokens = sub[0]
+                    h = _embed_single(model, z, tokens, device)
+                    h = F.layer_norm(
+                        h, (n_embd,), weight=z["ln_out.weight"], bias=z["ln_out.bias"]
+                    )
+                    if normalize:
+                        h = F.normalize(h, dim=0)
+                    results[i] = h.cpu().float().tolist()
+                    continue
 
-            hs = _embed_batch(model, z, [t for _, t in sub], device)
-            for (i, _), h in zip(sub, hs):
-                h = F.layer_norm(
-                    h, (n_embd,), weight=z["ln_out.weight"], bias=z["ln_out.bias"]
-                )
-                if normalize:
-                    h = F.normalize(h, dim=0)
-                results[i] = h.cpu().float().tolist()
-            del hs
+                hs = _embed_batch(model, z, [t for _, t in sub], device)
+                for (i, _), h in zip(sub, hs):
+                    h = F.layer_norm(
+                        h, (n_embd,), weight=z["ln_out.weight"], bias=z["ln_out.bias"]
+                    )
+                    if normalize:
+                        h = F.normalize(h, dim=0)
+                    results[i] = h.cpu().float().tolist()
+                del hs
 
-        # One empty_cache for the whole request (not per text).
-        torch.cuda.empty_cache()
+            # One empty_cache for the whole request (not per text).
+            torch.cuda.empty_cache()
 
     return results
 
