@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 
 from infer import inference_deps
 
@@ -9,6 +10,27 @@ from infer import inference_deps
 # in batch_inference.py.
 _DEFAULT_TEMPERATURE = 1.0
 
+# Per-row repetition-penalty sampler "no-op" defaults (only engaged when the
+# caller opts into per-row control via per_row_*). With these values the
+# batch_sampling_repetition_temperature_topk_topp op reduces to softmax(·/temp)
+# inverse-CDF sampling -- the per-row generalization of the temperature-only
+# default. penalties never accumulate because alpha_presence==alpha_frequency
+# ==0, and top_k=0/top_p=1.0 leave the full distribution in place.
+_DEFAULT_TOP_K = 0
+_DEFAULT_TOP_P = 1.0
+_DEFAULT_ALPHA_PRESENCE = 0.0
+_DEFAULT_ALPHA_FREQUENCY = 0.0
+_DEFAULT_ALPHA_DECAY = 1.0
+
+
+def _resolve_per_row(list_or_none, scalar, n):
+    """Return a length-``n`` list of per-row sampler scalars: the caller's
+    per-row list when one is provided, else ``scalar`` replicated for every
+    row (slot-indexed, re-filtered on compaction in big_batch_stream)."""
+    if list_or_none is None:
+        return [float(scalar)] * n
+    return [float(x) for x in list_or_none]
+
 
 class BigBatchMixin:
     async def big_batch_stream(
@@ -16,10 +38,21 @@ class BigBatchMixin:
         prompts,
         max_length=512,
         temperature=_DEFAULT_TEMPERATURE,
+        top_k=_DEFAULT_TOP_K,
+        top_p=_DEFAULT_TOP_P,
+        alpha_presence=_DEFAULT_ALPHA_PRESENCE,
+        alpha_frequency=_DEFAULT_ALPHA_FREQUENCY,
+        alpha_decay=_DEFAULT_ALPHA_DECAY,
         stop_tokens=("\nUser:",),
         chunk_size=32,
         cancel_token=None,
         permit_box=None,
+        per_row_temperatures=None,
+        per_row_top_k=None,
+        per_row_top_p=None,
+        per_row_alpha_presence=None,
+        per_row_alpha_frequency=None,
+        per_row_alpha_decay=None,
     ):
         # permit_box, if given, is a single-element mutable list populated by the
         # caller (see API_servers.router.common.prefill_sse_response's on_permit
@@ -38,9 +71,44 @@ class BigBatchMixin:
         state = None
         encoded_prompts = None
         out = None
+        penalties = None
+        rand_states = None
         finished = None
         new_tokens_tensor = None
         new_tokens = None
+
+        # Per-row sampling (Phase 4): when the caller opts in by passing any
+        # per_row_* list, each fused row is sampled with ITS OWN
+        # temperature/top_k/top_p/alpha_presence/alpha_frequency/alpha_decay and
+        # per-row penalty state via sample_batch_per_row (the per-row application
+        # of batch_sampling_repetition_temperature_topk_topp). Note the row
+        # lists and penalty/rand-state tensors are ALL slot-indexed and shrink
+        # together with `state`/`out` in _compact_active_rows as rows finish.
+        # When NO per_row_* is given (the default -- nothing opts into per-row
+        # control), the decode samples the whole batch with the existing
+        # temperature-only sampler_gumbel_batch exactly as before: byte-identical
+        # default behavior, and no penalty/RNG state is even allocated.
+        per_row_mode = any(
+            p is not None
+            for p in (
+                per_row_temperatures,
+                per_row_top_k,
+                per_row_top_p,
+                per_row_alpha_presence,
+                per_row_alpha_frequency,
+                per_row_alpha_decay,
+            )
+        )
+        row_temperatures = _resolve_per_row(per_row_temperatures, temperature, batch_size)
+        row_top_k = _resolve_per_row(per_row_top_k, top_k, batch_size)
+        row_top_p = _resolve_per_row(per_row_top_p, top_p, batch_size)
+        row_alpha_presence = _resolve_per_row(
+            per_row_alpha_presence, alpha_presence, batch_size
+        )
+        row_alpha_frequency = _resolve_per_row(
+            per_row_alpha_frequency, alpha_frequency, batch_size
+        )
+        row_alpha_decay = _resolve_per_row(per_row_alpha_decay, alpha_decay, batch_size)
 
         try:
             # NOTE: must be no_grad(), not inference_mode(). inference_mode()'s
@@ -72,13 +140,32 @@ class BigBatchMixin:
                 # on the GPU-worker thread under the opt-in. The no_grad() re-entry
                 # mirrors this method's ambient no_grad scope (no_grad is safe
                 # across the async/thread boundary; inference_mode would NOT be).
+                # In per-row mode we ALSO build that mode's per-row sampler state
+                # (RNG + zero penalty rows, fp32 logits) here, under the same
+                # offload unit, so no CUDA setup ever runs on the event-loop
+                # thread under the opt-in.
                 def _gpu_prefill():
                     with inference_deps.get_torch().no_grad():
-                        return self._forward_batch_prompts_chunked(
+                        out = self._forward_batch_prompts_chunked(
                             encoded_prompts, state, cancel_token=cancel_token
                         )
+                        if per_row_mode:
+                            torch = inference_deps.get_torch()
+                            out = out.float()
+                            rand_states = inference_deps.get_sample().setup_rand(
+                                random.randint(0, 2**63 - 1), batch_size
+                            )
+                            penalties = torch.zeros(
+                                batch_size, out.size(-1), device=out.device,
+                                dtype=out.dtype,
+                            )
+                            return out, penalties, rand_states
+                        return out
 
-                out = await self._offload_gpu(_gpu_prefill)
+                if per_row_mode:
+                    out, penalties, rand_states = await self._offload_gpu(_gpu_prefill)
+                else:
+                    out = await self._offload_gpu(_gpu_prefill)
 
                 finished = [False] * batch_size
                 stop_states = [self._create_stop_state(stop_tokens) for _ in range(batch_size)]
@@ -115,10 +202,28 @@ class BigBatchMixin:
 
                     def _gpu_decode_step():
                         with inference_deps.get_torch().no_grad():
-                            new_tokens_tensor = inference_deps.get_sampler_gumbel_batch()(
-                                logits=out, temp=temperature
-                            )
+                            if per_row_mode:
+                                new_tokens_tensor = inference_deps.get_sample_batch_per_row()(
+                                    out,
+                                    penalties,
+                                    rand_states,
+                                    row_temperatures,
+                                    row_top_k,
+                                    row_top_p,
+                                    row_alpha_presence,
+                                    row_alpha_frequency,
+                                    row_alpha_decay,
+                                )
+                            else:
+                                new_tokens_tensor = inference_deps.get_sampler_gumbel_batch()(
+                                    logits=out, temp=temperature
+                                )
                             new_out = self.model.forward_batch(new_tokens_tensor, state)
+                            if per_row_mode:
+                                # The repetition-penalty op requires fp32 logits
+                                # (the model feeds fp16), so keep the decode
+                                # tensor float32, matching the V1 path.
+                                new_out = new_out.float()
                             new_tokens = new_tokens_tensor.tolist()
                             return new_out, new_tokens
 
@@ -216,10 +321,23 @@ class BigBatchMixin:
                             def _gpu_compact():
                                 with inference_deps.get_torch().no_grad():
                                     return self._compact_active_rows(
-                                        state, out, active_indices, still_active_slots
+                                        state, out, active_indices, still_active_slots,
+                                        penalties=penalties, rand_states=rand_states,
                                     )
 
-                            state, out, active_indices = await self._offload_gpu(_gpu_compact)
+                            packed = await self._offload_gpu(_gpu_compact)
+                            state, out, active_indices, penalties, rand_states = packed
+                            # The per-row scalar lists are slot-indexed like the
+                            # GPU tensors; re-filter them to the survical slots
+                            # so the next _gpu_decode_step samples the right
+                            # rows (slot order must match the shrunk `out`).
+                            if per_row_mode:
+                                row_temperatures = [row_temperatures[s] for s in still_active_slots]
+                                row_top_k = [row_top_k[s] for s in still_active_slots]
+                                row_top_p = [row_top_p[s] for s in still_active_slots]
+                                row_alpha_presence = [row_alpha_presence[s] for s in still_active_slots]
+                                row_alpha_frequency = [row_alpha_frequency[s] for s in still_active_slots]
+                                row_alpha_decay = [row_alpha_decay[s] for s in still_active_slots]
                             if permit_box and permit_box[0] is not None:
                                 # Give the freed row(s) back to the shared
                                 # prefill-admission budget right now, not at
@@ -275,6 +393,10 @@ class BigBatchMixin:
                 del out
             if state is not None:
                 del state
+            if penalties is not None:
+                del penalties
+            if rand_states is not None:
+                del rand_states
             if encoded_prompts is not None:
                 del encoded_prompts
             if finished is not None:
@@ -290,10 +412,20 @@ class BigBatchMixin:
         yield "data: [DONE]\n\n"
 
     @staticmethod
-    def _compact_active_rows(state, out, active_indices, still_active_slots):
+    def _compact_active_rows(state, out, active_indices, still_active_slots,
+                             penalties=None, rand_states=None):
         """Shrink `state`/`out` down to only `still_active_slots` (positions
         within the *current* active batch, not original prompt indices), and
         return the correspondingly shrunk `active_indices` mapping.
+
+        In per-row sampling mode this also shrinks the slot-indexed per-row
+        sampler state -- `penalties` [B, vocab] and `rand_states` (the flat
+        byte tensor of B contiguous row-blocks from sample.setup_rand) -- to
+        the same surviving rows, so a finished row drops its penalty/RNG state
+        along with its GPU tensors and a row that persists keeps its own state
+        (the row-wise independence that makes per-row sampling exact). When in
+        the default (non-per-row) mode, `penalties`/`rand_states` are None and
+        the two returned values are None, matching how the caller stores them.
 
         Reuses the same active-index tensor-slicing pattern already proven
         correct in RWKV_x070.forward_batch's chunked-prefill path
@@ -311,4 +443,15 @@ class BigBatchMixin:
         ]
         new_out = out.index_select(0, idx).contiguous()
         new_active_indices = [active_indices[slot] for slot in still_active_slots]
-        return new_state, new_out, new_active_indices
+        new_penalties = None
+        new_rand_states = None
+        if penalties is not None:
+            new_penalties = penalties.index_select(0, idx).contiguous()
+        if rand_states is not None:
+            # rand_states is a flat byte tensor of `active_rows * rowsize`
+            # elements; each row's state is one contiguous `rowsize` block, so
+            # view as [rows, -1], gather the surviving blocks, flatten back.
+            new_rand_states = (
+                rand_states.view(len(active_indices), -1)[idx].contiguous().view(-1)
+            )
+        return new_state, new_out, new_active_indices, new_penalties, new_rand_states
