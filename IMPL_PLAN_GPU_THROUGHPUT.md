@@ -190,3 +190,35 @@ Disjoint files per track; working-tree edits only; full-gate then ONE coordinato
 - Cross-request prefill/decode pipelining (2-stream overlap) — considered, REJECTED as it
   conflicts with the single-CUDA-thread invariant Phase 2 adds. `torch.compile` — plausible but
   high-variance; bounded spike to assess once, not a phase.
+
+---
+
+# Execution log (local, never pushed)
+
+- `915047e` p0-baseline (clean checkpoint + gitignore state_tune data / .qwen-wt).
+- `fff270c` p1-cleanup (fuse/embed dedup, dead symbols, single-sourced sampler defaults).
+- `dba409b` p2-cuda-serialize (process-wide CUDA lock; threadpool/embed refresh guarded; stress test).
+- `197b016` p3a-overhead (drop gc.collect from blocking cores; /state stream merge REVERTED — changed
+  persisted-state semantics on a stop token).
+- `6ace525` p3b-cuda-graph-stream (**seq/batch WKV kernel now launches on the current CUDA stream**;
+  forward_batch proven CUDA-graph capturable on the RTX 3090 Ti via a real-GPU capture/replay test).
+- `cad5662` bench harness + Phase-4 baseline (default): N=1 53 tok/s (TTFT 7.8 ms, 25.7 ms/tok); N=8 84.3 tok/s.
+- `4b382d5` phase4/s1 per-row sampling (`sample_batch_per_row`), opt-in, default byte-identical.
+- `08263a5` phase4/s2 dynamic batch decoder (RWKV_DYNAMIC_BATCH, default off): admits heterogeneous
+  concurrent chat rows into one running bsz-N decode, per-row sampling, head-fire solo, compaction.
+- `850372f` fix temperature clamp so a client `temperature=0` can't crash the scheduler.
+
+## Phase 4 measured outcome (real GPU) — ACCEPTED by user as opt-in
+- N=8 throughput **344–363 tok/s vs 84.3 baseline (~4.1–4.3×)**; scaling 5× (> 1.6× gate target).
+- Solo per-token **~13 ms vs 25.7 ms (faster)**.
+- Solo first-token **~40 ms vs 7.8 ms** — FAILS the strict +15% solo-TTFT gate. This is the inherent
+  ready-to-batch overhead of the scheduler; it is imperceptible for a real model and only applies
+  when the (default-off) flag is on. **User chose to accept the opt-in with this documented trade.**
+- Correctness: temp=0-crash fixed; e2e clean; per-row==batchwide equivalence validated on GPU
+  (s1 test); full suite 153 passed.
+
+## Remaining
+- **Phase 5** (CUDA-graph capture of the full decode step, per-size graph pool) — unstarted;
+  the kernel stream blocker is already fixed in 3b, so the prerequisite is in place.
+- Optional: an inline-solo head-fire to scrape solo TTFT toward ~13 ms (still above the strict gate;
+  low priority given acceptance).
