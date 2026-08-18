@@ -103,8 +103,15 @@ class EngineSlot:
         from infer.embed_aggregator import EmbedAggregator
         from infer.fuse_aggregator import ChatFuseAggregator
         from infer.dynamic_batch import DynamicBatchDecoder
+        from API_servers.router.common import cache_namespace
 
-        self.embed = EmbedAggregator(self.engine.model, self.engine.tokenizer)
+        # A1: bind the checkpoint fingerprint (cache_namespace(slot), never
+        # None-for-default) into the embed aggregator so the embedding output
+        # LRU can never serve a stale vector after a runtime checkpoint reload.
+        self.embed = EmbedAggregator(
+            self.engine.model, self.engine.tokenizer,
+            cache_namespace_=cache_namespace(self),
+        )
         self.embed.start()
         self.fuse = ChatFuseAggregator(self.engine)
         self.fuse.start()
@@ -370,10 +377,20 @@ class ModelManager:
         """Synchronous load: construct the engine. Runs on a worker thread."""
         from model_load.model_loader import load_model_and_tokenizer
         from infer.inference import InferenceEngine
+        from settings import settings
 
         model, tokenizer, args, rocm = load_model_and_tokenizer(
             slot.path, slot.inference_engine
         )
+        # A6: opt-in tokenizer encode memoization (RWKV_ENCODE_CACHE). When off
+        # (default) tokenizer stays the original object => byte-identical, no
+        # identity swap; when on, encode() is memoized by checkpoint namespace.
+        if settings.encode_cache:
+            from API_servers.router.common import cache_namespace
+            from infer.encode_cache import CachedTokenizer
+            tokenizer = CachedTokenizer(
+                tokenizer, cache_namespace(slot), settings.encode_cache_capacity
+            )
         slot.model, slot.tokenizer, slot.args, slot.rocm_flag = (
             model, tokenizer, args, rocm
         )

@@ -88,6 +88,7 @@ import logging
 from collections import deque
 
 from settings import settings
+from infer.memo import MISS, BoundedLRU
 
 logger = logging.getLogger("infer.embed_aggregator")
 
@@ -133,7 +134,8 @@ class EmbedAggregator:
     single event-loop thread, exactly where the embed endpoint already runs.
     """
 
-    def __init__(self, model, tokenizer, *, enabled=None, window_ms=None, max_bsz=None):
+    def __init__(self, model, tokenizer, *, enabled=None, window_ms=None, max_bsz=None,
+                 cache_namespace_=None):
         self._model = model
         self._tokenizer = tokenizer
         # enabled=None resolves from settings at construction so tests pin the
@@ -143,6 +145,12 @@ class EmbedAggregator:
         # max_bsz=None resolves from the model's max_prefill_bsz (0 == no cap);
         # an explicit value overrides for deterministic tests.
         self._max_bsz = max_bsz
+        # A1: checkpoint fingerprint (from `cache_namespace(slot)`, NEVER
+        # None-for-default) gating the embedding output LRU. When the cache is
+        # enabled (RWKV_EMBED_CACHE) but no fingerprint is bound, the cache is a
+        # no-op -- so a stale vector can never be served after a checkpoint swap.
+        self._cache_ns = cache_namespace_
+        self._cache = BoundedLRU(settings.embed_cache_capacity) if settings.embed_cache else None
         self._pending = deque()  # of _EmbedJob, FIFO admission order
         self._wake = asyncio.Event()
         self._task = None
@@ -201,7 +209,7 @@ class EmbedAggregator:
         """
         if not self._enabled:
             # Default-off path: never hold a future that nothing will resolve.
-            return embed_texts(self._model, self._tokenizer, texts, normalize=True)
+            return self._embed_with_cache(texts)
         if self._task is None:
             # Scheduler task missing while aggregation is on: either it was never
             # started (route init should have done so) or it DIED from a
@@ -213,7 +221,7 @@ class EmbedAggregator:
             if self._task is None:
                 # start() was still a no-op (e.g. aggregation became disabled);
                 # fall back to the inline embed so this request still completes.
-                return embed_texts(self._model, self._tokenizer, texts, normalize=True)
+                return self._embed_with_cache(texts)
             if not self._dead_warned:
                 self._dead_warned = True
                 logger.warning(
@@ -441,15 +449,51 @@ class EmbedAggregator:
         splits that concatenated result back per request by text count as if a
         single call had been made."""
         if not self._no_cap_mode():
-            return embed_texts(self._model, self._tokenizer, texts, normalize=True)
+            return self._embed_with_cache(texts)
         out = []
         for i in range(0, len(texts), cap):
-            out.extend(
-                embed_texts(
-                    self._model, self._tokenizer, texts[i:i + cap], normalize=True
-                )
-            )
+            out.extend(self._embed_with_cache(texts[i:i + cap]))
         return out
+
+    def _embed_with_cache(self, texts):
+        """Embed ``texts`` into per-text vectors, honoring the opt-in embedding
+        output LRU (A1, RWKV_EMBED_CACHE):
+
+        * key = ``(cache_namespace_, text, normalize=True)`` -- the checkpoint
+          fingerprint (``cache_namespace(slot)``, never None-for-default) so a
+          runtime model reload / checkpoint swap starts the cache cold and can
+          never return a stale vector.
+        * Look up every text; embed ONLY the misses (each distinct miss text
+          once -- within-batch dedupe); splice the cached vectors back in input
+          order; store the fresh results.
+        * Disabled (default), or no fingerprint bound: exactly ``embed_texts``.
+
+        Embedding is a deterministic pure function of (model, text), so a cached
+        vector is byte-identical to recomputing it; splicing preserves the exact
+        per-text ordering ``embed_texts`` would return."""
+        if self._cache is None or self._cache_ns is None:
+            return embed_texts(self._model, self._tokenizer, texts, normalize=True)
+
+        keys = [(self._cache_ns, t, True) for t in texts]
+        cached = [None] * len(texts)
+        miss_idx = []
+        for i, key in enumerate(keys):
+            value = self._cache.get(key)
+            if value is MISS:
+                miss_idx.append(i)
+            else:
+                cached[i] = value
+        if miss_idx:
+            # embed each distinct miss text exactly once, then fan back out
+            # (dict.fromkeys dedupes while preserving first-occurrence order).
+            uniq = {t: i for i, t in enumerate(dict.fromkeys(texts[i] for i in miss_idx))}
+            fresh = embed_texts(self._model, self._tokenizer, list(uniq), normalize=True)
+            for i in miss_idx:
+                t = texts[i]
+                vec = fresh[uniq[t]]
+                cached[i] = vec
+                self._cache.put((self._cache_ns, t, True), vec)
+        return cached
 
     def _fail_pending(self, exc):
         # Fail both the still-queued jobs and any admitted-but-not-yet-embedded

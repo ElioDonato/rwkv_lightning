@@ -78,6 +78,12 @@ async def _embed_hander(request: Request, openai_shape: bool):
 
     dim = embedding_dim(engine.model)
 
+    # Compute the token count ONCE -- previously the identical
+    # ``sum(len(engine.tokenizer.encode(t)) for t in texts)`` was computed twice
+    # (once per of prompt_tokens/total_tokens), a 2x redundant encode of the
+    # whole batch on every request.
+    prompt_tokens = sum(len(engine.tokenizer.encode(t)) for t in texts)
+
     if openai_shape:
         data = [
             {"object": "embedding", "index": i, "embedding": vec}
@@ -88,8 +94,8 @@ async def _embed_hander(request: Request, openai_shape: bool):
             "data": data,
             "model": model_name,
             "usage": {
-                "prompt_tokens": sum(len(engine.tokenizer.encode(t)) for t in texts),
-                "total_tokens": sum(len(engine.tokenizer.encode(t)) for t in texts),
+                "prompt_tokens": prompt_tokens,
+                "total_tokens": prompt_tokens,
             },
         }
 
