@@ -811,8 +811,12 @@ app.py --models-config models.json
   POST /admin/models/unload {"id":"big"}  # stop using + free VRAM
   POST /admin/models/unload_all
   ```
-- Cap resident VRAM with `RWKV_MAX_RESIDENT_BYTES=<bytes>`; the least-recently-used
-  non-default model is evicted automatically to make room.
+- Cap concurrent models either by **VRAM** (`max_resident_bytes` in `models.json`,
+  or `RWKV_MAX_RESIDENT_BYTES` env = the models' weight+decode footprint, *not* the
+  CUDA cache) or by **count** (`max_resident_models` in `models.json` /
+  `RWKV_MAX_RESIDENT_MODELS` env): the least-recently-used non-default model is
+  evicted automatically to make room, and a load that still can't fit is refused
+  with a clear error (admin `load` returns `409`). The default model always loads.
 - `GET /openai/v1/models` lists the whole catalog with `resident`/`default` flags.
 
 The single-model path is unchanged (`app.py --model-path models/<file>.pth`) and

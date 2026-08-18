@@ -9,7 +9,7 @@ import asyncio
 
 import pytest
 
-from model_load.model_manager import ModelManager
+from model_load.model_manager import ModelCapacityError, ModelManager
 
 
 def _fake_load(marker_engine):
@@ -135,3 +135,32 @@ def test_shutdown_unloads_all(monkeypatch):
     assert m.resident_ids() == ["a", "b"]
     _run(m.shutdown())
     assert m.resident_ids() == []
+
+
+def test_max_resident_models_evicts_lru(monkeypatch):
+    monkeypatch.setattr(ModelManager, "_load_blocking", _fake_load("A"))
+    cfg = [
+        {"id": "a", "path": "/x/a.pth"},
+        {"id": "b", "path": "/x/b.pth"},
+        {"id": "c", "path": "/x/c.pth"},
+    ]
+    m = ModelManager(cfg, default_id="a", max_resident_models=2)
+    _run(m.load("a"))
+    _run(m.load("b"))   # a+b = 2 of 2
+    assert m.resident_ids() == ["a", "b"]
+    _run(m.load("c"))   # would be 3 > 2 -> evict non-default LRU (b)
+    assert m.resident_ids() == ["a", "c"], m.resident_ids()
+
+
+def test_max_resident_models_refuses_when_no_room(monkeypatch):
+    monkeypatch.setattr(ModelManager, "_load_blocking", _fake_load("A"))
+    cfg = [
+        {"id": "a", "path": "/x/a.pth"},
+        {"id": "b", "path": "/x/b.pth"},
+    ]
+    # Cap of 1; the default (a) is always loadable/pinned, so b cannot fit.
+    m = ModelManager(cfg, default_id="a", max_resident_models=1)
+    _run(m.load("a"))
+    with pytest.raises(ModelCapacityError):
+        _run(m.load("b"))
+    assert m.resident_ids() == ["a"]
