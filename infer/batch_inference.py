@@ -8,6 +8,7 @@ import json
 import random
 
 from infer import inference_deps
+from infer.async_forward import cuda_guard
 from infer.inference_utils import sample_logits_batch_cuda
 
 # ---------------------------------------------------------------------------
@@ -184,7 +185,11 @@ class BatchInferenceMixin:
         state = None
         try:
             batch_size = len(prompts)
-            state, out = self._batch_prefill(prompts, prefix_cache_manager, cancel_token)
+            # Prefill + decode touch CUDA and run on Starlette's threadpool (NOT
+            # through the Mod A seam), so serialise them against the worker /
+            # embed path via the process-wide CUDA lock.
+            with cuda_guard():
+                state, out = self._batch_prefill(prompts, prefix_cache_manager, cancel_token)
 
             torch = inference_deps.get_torch()
             finish_reasons = [None] * batch_size
@@ -195,9 +200,10 @@ class BatchInferenceMixin:
             while active_indices and max_length > 0:
                 self._raise_if_cancelled(cancel_token)
                 n_active = len(active_indices)
-                new_tokens_tensor = sampler.sample(out)
-                out = self.model.forward_batch(new_tokens_tensor, state).float()
-                new_tokens = new_tokens_tensor.tolist()
+                with cuda_guard():
+                    new_tokens_tensor = sampler.sample(out)
+                    out = self.model.forward_batch(new_tokens_tensor, state).float()
+                    new_tokens = new_tokens_tensor.tolist()
                 max_length -= 1
 
                 newly_finished_positions = []
@@ -213,12 +219,16 @@ class BatchInferenceMixin:
                 if newly_finished_positions:
                     still_active = [p for p in range(n_active) if p not in set(newly_finished_positions)]
                     if still_active:
-                        idx_t = torch.tensor(still_active, device=out.device, dtype=torch.long)
-                        out = out[idx_t]
-                        sampler.compact(idx_t)
-                        state[0] = state[0][:, :, idx_t]
-                        state[1] = state[1][:, idx_t]
-                        state[2] = state[2][idx_t]
+                        # Compaction reindexes CUDA tensors (out/state) and calls
+                        # sampler.compact (CUDA gathers) on the threadpool thread,
+                        # so it must hold the process-wide CUDA lock too.
+                        with cuda_guard():
+                            idx_t = torch.tensor(still_active, device=out.device, dtype=torch.long)
+                            out = out[idx_t]
+                            sampler.compact(idx_t)
+                            state[0] = state[0][:, :, idx_t]
+                            state[1] = state[1][:, idx_t]
+                            state[2] = state[2][idx_t]
                         active_indices = [active_indices[p] for p in still_active]
                     else:
                         active_indices = []
@@ -511,7 +521,10 @@ class BatchInferenceMixin:
             encoded_prompts = [self.tokenizer.encode(p) for p in prompts]
 
             tokens = encoded_prompts[0]
-            out = self._forward_tokens_chunked(tokens, state, cancel_token=cancel_token)
+            # Blocking state/generate core runs on Starlette's threadpool, not the
+            # Mod A seam: serialise its CUDA work against other threads.
+            with cuda_guard():
+                out = self._forward_tokens_chunked(tokens, state, cancel_token=cancel_token)
             sample_rand_states = inference_deps.get_sample().setup_rand(random.randint(0, 2**63 - 1), 1)
             penalties = inference_deps.get_torch().zeros(1, out.size(-1), device=out.device)
 
@@ -523,17 +536,18 @@ class BatchInferenceMixin:
                 if out.dim() == 1:
                     out = out.unsqueeze(0)
 
-                new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
-                    out,
-                    penalties,
-                    sample_rand_states,
-                    alpha_presence,
-                    alpha_frequency,
-                    alpha_decay,
-                    temperature,
-                    top_k,
-                    top_p,
-                ).tolist()
+                with cuda_guard():
+                    new_tokens = inference_deps.get_sample().batch_sampling_repetition_temperature_topk_topp(
+                        out,
+                        penalties,
+                        sample_rand_states,
+                        alpha_presence,
+                        alpha_frequency,
+                        alpha_decay,
+                        temperature,
+                        top_k,
+                        top_p,
+                    ).tolist()
 
                 tok = new_tokens[0]
 
@@ -545,7 +559,8 @@ class BatchInferenceMixin:
                     finish_reason = "stop"
                     break
 
-                out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
+                with cuda_guard():
+                    out = self._forward_tokens_chunked([tok], state, cancel_token=cancel_token)
             generated_text += self._flush_stop_state(stop_state, final=True)
             # Returns (texts, finish_reasons) to match batch_generate's (V1)
             # per-item shape, since /state/ and /multi_state/ callers were

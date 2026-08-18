@@ -8,7 +8,7 @@ from collections import deque
 from settings import settings
 
 from infer import inference_deps
-from infer.async_forward import GpuAsyncExecutor
+from infer.async_forward import GpuAsyncExecutor, cuda_guard
 from infer.batch_inference import BatchInferenceMixin
 from infer.big_batch import BigBatchMixin
 from infer.cancellation import InferenceCancelled, PrefillBszLimitExceeded
@@ -74,9 +74,12 @@ class InferenceEngine(
         infer/async_forward.GpuAsyncExecutor for the same boundary.
         """
         executor = self._gpu_executor
-        if executor.enabled:
-            return await executor.offload(fn, *args, **kwargs)
-        return fn(*args, **kwargs)
+        # Always route through the executor so every streamed GPU unit runs under
+        # the process-wide CUDA lock: enabled -> on the single worker thread;
+        # disabled (default) -> inline on this event-loop thread, still holding
+        # the lock so it serializes against the blocking cores/embed on other
+        # threads. Never call fn directly here or the unit would bypass the lock.
+        return await executor.offload(fn, *args, **kwargs)
 
     # Interval for the single low-frequency background GPU cache cleanup that
     # replaces the per-request torch.cuda.empty_cache() calls removed in item 1.
@@ -158,7 +161,10 @@ class InferenceEngine(
 
                     is_turn = self._prefill_queue and self._prefill_queue[0] == ticket
                     if is_turn and hasattr(self.model, "refresh_max_prefill_bsz"):
-                        current_limit = self.model.refresh_max_prefill_bsz()
+                        # refresh issues CUDA empty_cache/mem_get_info: hold the
+                        # process-wide CUDA lock so it never races a worker forward.
+                        with cuda_guard():
+                            current_limit = self.model.refresh_max_prefill_bsz()
                     else:
                         current_limit = getattr(self.model, "max_prefill_bsz", request_bsz)
                     current_limit = min(int(current_limit), max_prefill_bsz_limit)
@@ -271,11 +277,11 @@ class InferenceEngine(
 
         async with condition:
             self._prefill_reserved_bsz = max(0, self._prefill_reserved_bsz - request_bsz)
-            current_limit = (
-                self.model.refresh_max_prefill_bsz()
-                if hasattr(self.model, "refresh_max_prefill_bsz")
-                else request_bsz
-            )
+            if hasattr(self.model, "refresh_max_prefill_bsz"):
+                with cuda_guard():
+                    current_limit = self.model.refresh_max_prefill_bsz()
+            else:
+                current_limit = request_bsz
             max_prefill_bsz_limit = int(
                 getattr(
                     self.model,
