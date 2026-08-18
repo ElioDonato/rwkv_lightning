@@ -52,7 +52,7 @@ cd "$REPO_DIR" || exit 1
 # RWKV_MODEL_PATH is not set. Append optional overrides only when configured.
 set -- app.py --model-path "${RWKV_MODEL_PATH:-}"
 [ -n "${RWKV_INFERENCE_ENGINE:-}" ] && set -- "$@" --inference-engine "$RWKV_INFERENCE_ENGINE"
-[ -n "${RWKV_PORT:-}" ] && set -- "$@" --port "$RWKV_PORT"
+set -- "$@" --port "${RWKV_PORT:-8083}"
 
 # Auth is read automatically by settings.py from the RWKV_API_PASSWORD env var;
 # do not pass --password here, and never commit a password value.
