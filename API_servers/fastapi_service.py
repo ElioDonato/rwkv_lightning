@@ -21,6 +21,7 @@ from API_servers.router import (
 from infer import inference_deps
 from infer.embed_aggregator import EmbedAggregator
 from infer.fuse_aggregator import ChatFuseAggregator
+from infer.dynamic_batch import DynamicBatchDecoder
 from settings import settings
 
 
@@ -54,6 +55,17 @@ def create_app(engine, password=None):
         app.state.chat_fuse_aggregator = fuse
         fuse.start()
 
+        # Opt-in dynamic decode batching for /openai/v1/chat/completions
+        # (RWKV_DYNAMIC_BATCH, default-off -- Phase 4 sub-step 2). Attached to
+        # app.state so openai_routes can route concurrent chat requests through
+        # it (ANY request -- per-row-sampled multi-row shared decode under the
+        # opt-in; the route uses the original single_infer path when disabled,
+        # byte-identical to today). start() is a no-op while disabled; stopped
+        # (pending rows ended + permit capacity released) on shutdown.
+        dyn = DynamicBatchDecoder(engine)
+        app.state.chat_dynamic_decoder = dyn
+        dyn.start()
+
         # Single low-frequency background GPU cache cleanup (item 1): replaces
         # the per-request torch.cuda.empty_cache() calls removed from the :8081
         # decode hot path. Runs InferenceEngine.run_periodic_gpu_cleanup at a
@@ -71,6 +83,7 @@ def create_app(engine, password=None):
                 cleanup_task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
                     await cleanup_task
+            await dyn.stop()
             await fuse.stop()
             await aggregator.stop()
 
