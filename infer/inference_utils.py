@@ -6,6 +6,14 @@ import torch
 from infer import inference_deps
 from infer.cancellation import InferenceCancelled
 
+# NOTE (CUDA-graph decode support, removed as dead code in Phase 1C): the
+# static-buffer + torch.cuda.CUDAGraph skeleton (previously _init_cuda_graph_state)
+# was deleted; if it is ever revived, a batch-layout forward under graph capture
+# diverges from eager because the batched seq WKV kernel
+# (kernel_forward_w0_fp16_dither_seq) is launched WITHOUT an explicit CUDA
+# stream, unlike cuda_forward_one / cuda_spmv_forward which pass
+# at::cuda::getCurrentCUDAStream(). See IMPL_PLAN_GPU_THROUGHPUT.md Phase 5.
+
 
 @torch.jit.script
 def sample_logits_batch_cuda(logits, temperature: float, top_p: float, k: int):
@@ -96,65 +104,6 @@ class InferenceUtilsMixin:
         pending_tokens.clear()
         return decoded
 
-    # NOTE (2026-07-24): this helper is currently dead code -- grep confirms
-    # no caller anywhere in the live code paths (it is a
-    # leftover from the graph_generate/graph_infer_stream endpoints that
-    # were removed in commit 34cc6eb "Use str as stop_tokens"). Do not wire
-    # this back up without further work: a standalone repro
-    # (torch.cuda.CUDAGraph() around model.forward_batch /
-    # forward_seq_batch_tensor) showed the replayed graph's logits diverge
-    # sharply (max abs diff ~15-26 on ~4-13 magnitude logits, vs. an exact
-    # 0.0 eager-vs-eager control) from an eager reference run with identical
-    # inputs and starting state. Root cause: cuda_forward_seq's kernel
-    # launch (kernel_forward_w0_fp16_dither_seq<<<...>>>) does not pass an
-    # explicit CUDA stream (unlike cuda_forward_one and cuda_spmv_forward,
-    # both of which use at::cuda::getCurrentCUDAStream()), so under graph
-    # capture that kernel executes outside the captured stream and the WKV
-    # state never actually advances on replay. Note: the single-sequence
-    # forward_one (cuda_forward_one) decode path does NOT have this problem
-    # -- it was independently re-verified to be numerically fine under
-    # graph capture (diff indistinguishable from forward_one's own
-    # eager-mode noise floor, which is nonzero for an
-    # unrelated reason: CMix's SPMV_OP/cuda_spmv_forward kernel uses
-    # atomicAdd and isn't bit-deterministic run-to-run). This is consistent
-    # with, and strengthens, the stream-argument theory: the one kernel
-    # launch without an explicit stream is the one that diverges; the ones
-    # with an explicit stream do not. Fix (untested): pass an explicit
-    # capture-aware stream (at::cuda::getCurrentCUDAStream()) into
-    # kernel_forward_w0_fp16_dither_seq's launch in
-    # infer/rwkv_batch/cuda/rwkv7_state_fwd_fp16.cu, matching
-    # cuda_forward_one/cuda_spmv_forward, then re-verify graph-vs-eager
-    # numerical parity before relying on this in production.
-    def _init_cuda_graph_state(self, token, state, out):
-        x_emb = self.model.z["emb.weight"][token]
-
-        static_input = inference_deps.get_torch().empty_like(x_emb, device="cuda")
-        static_state = [None, None, None]
-        static_state[0] = inference_deps.get_torch().empty_like(state[0], device="cuda")
-        static_state[1] = inference_deps.get_torch().empty_like(state[1], device="cuda")
-        static_state[2] = inference_deps.get_torch().empty_like(state[2], device="cuda")
-        static_output = inference_deps.get_torch().empty_like(out, device="cuda")
-
-        static_output = self.model.forward(static_input, static_state)
-
-        g = inference_deps.get_torch().cuda.CUDAGraph()
-        with inference_deps.get_torch().cuda.graph(g):
-            static_output = self.model.forward(static_input, static_state)
-
-        static_input.copy_(x_emb)
-        static_state[0].copy_(state[0])
-        static_state[1].copy_(state[1])
-        static_state[2].copy_(state[2])
-        static_output.copy_(out)
-
-        return static_input, static_state, static_output, g
-
-    @staticmethod
-    def _cleanup_cuda_state(state):
-        del state
-        gc.collect()
-        inference_deps.get_torch().cuda.empty_cache()
-
     @staticmethod
     def _cleanup_cuda_memory():
         gc.collect()
@@ -165,34 +114,6 @@ class InferenceUtilsMixin:
         except Exception:
             pass
         inference_deps.get_torch().cuda.empty_cache()
-
-    @staticmethod
-    def _torch_top_k_top_p(logits, top_k, top_p):
-        if top_k > 0:
-            top_k = min(top_k, logits.size(-1))
-            indices_to_remove = (
-                logits < inference_deps.get_torch().topk(logits, top_k, dim=-1)[0][..., -1, None]
-            )
-            logits = logits.masked_fill(indices_to_remove, -float("Inf"))
-
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = inference_deps.get_torch().sort(logits, descending=True, dim=-1)
-            cumulative_probs = inference_deps.get_torch().cumsum(
-                inference_deps.get_torch().softmax(sorted_logits, dim=-1), dim=-1
-            )
-
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., :1] = False
-
-            indices_to_remove = sorted_indices_to_remove.scatter(
-                dim=-1, index=sorted_indices, src=sorted_indices_to_remove
-            )
-            logits = logits.masked_fill(indices_to_remove, -float("Inf"))
-
-        probabilities = inference_deps.get_torch().softmax(logits, dim=-1)
-        sampled_tokens = inference_deps.get_torch().multinomial(probabilities, 1).squeeze(-1)
-
-        return sampled_tokens
 
     def _forward_tokens_chunked(self, tokens, state, cancel_token=None):
         if not isinstance(tokens, list):

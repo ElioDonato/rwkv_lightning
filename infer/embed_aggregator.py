@@ -230,6 +230,18 @@ class EmbedAggregator:
 
     # -- scheduler internals ------------------------------------------------
 
+    def _raw_bsz_cap(self) -> int:
+        """The single source of the batching-cap value as an int: the explicit
+        ``max_bsz`` override when set, else the model's live
+        ``max_prefill_bsz`` (read from ``getattr(..., 0) or 0``). May be <= 0 to
+        mean "no cap" -- both callers decide how to collapse that themselves.
+        This is the one place the raw value is resolved, so ``_cap()`` (which
+        maps <= 0 to the hard ceiling) and ``_no_cap_mode()`` (which only asks
+        whether it is absent) can never drift on which source lives where."""
+        if self._max_bsz is not None:
+            return int(self._max_bsz)
+        return int(getattr(self._model, "max_prefill_bsz", 0) or 0)
+
     def _cap(self):
         """Batching cap: the model's max_prefill_bsz when > 0, else a sane hard
         ceiling (``settings.embed_hard_ceiling``). Always returns int >= 1, so
@@ -238,10 +250,7 @@ class EmbedAggregator:
         ONE un-isolated embed_texts call. An explicit ``max_bsz`` override
         (tests) wins unconditionally, and an override <= 0 means "no cap" too,
         so it maps to the hard ceiling just like the model's 0."""
-        if self._max_bsz is not None:
-            cap = int(self._max_bsz)
-        else:
-            cap = int(getattr(self._model, "max_prefill_bsz", 0) or 0)
+        cap = self._raw_bsz_cap()
         # ANY cap <= 0 -- the model's "no cap" OR an explicit override <= 0 --
         # collapses to the hard ceiling. _cap() must ALWAYS yield a positive
         # int: a None/<=0 cap would hand _fill_batch / the window drain an
@@ -259,9 +268,7 @@ class EmbedAggregator:
         lone job's own texts itself to keep every shared-batch call within the
         aggregation ceiling; capped mode already has embed_texts' own
         ``max_prefill_bsz`` sub-batching to lean on."""
-        if self._max_bsz is not None:
-            return int(self._max_bsz) <= 0
-        return int(getattr(self._model, "max_prefill_bsz", 0) or 0) <= 0
+        return self._raw_bsz_cap() <= 0
 
     def _fill_batch(self, batch, cap):
         """Pop pending jobs into ``batch`` (FIFO) up to the total-text cap.
