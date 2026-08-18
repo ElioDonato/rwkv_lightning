@@ -107,9 +107,12 @@ class EngineSlot:
 
 
 class ModelManager:
-    def __init__(self, models_config, default_id=None, max_resident_bytes=0):
+    def __init__(self, models_config, default_id=None, max_resident_bytes=0,
+                 embed_id=None):
         """``models_config``: list of model dicts. ``max_resident_bytes``: hard
-        VRAM budget (0 = no enforced budget)."""
+        VRAM budget (0 = no enforced budget). ``embed_id``: optional model id
+        that the embedding endpoints use by default (when a request has no
+        explicit ``model``); falls back to the default model when None."""
         self._by_id = {}
         for cfg in models_config:
             cfg = dict(cfg)
@@ -128,6 +131,9 @@ class ModelManager:
             self._default_id = default_id
         else:
             self._default_id = ids[0]  # first declared model is the default
+        if embed_id is not None and embed_id not in self._by_id:
+            raise ValueError(f"unknown embed model id {embed_id!r}")
+        self._embed_id = embed_id
         for m in self._by_id.values():
             m.is_default = m.id == self._default_id
 
@@ -138,6 +144,18 @@ class ModelManager:
 
     @property
     def default_id(self):
+        return self._default_id
+
+    @property
+    def embed_id(self):
+        return self._embed_id
+
+    def endpoint_default(self, role=None):
+        """Model id used when a request of ``role`` has no explicit ``model``:
+        'embed' -> the designated embed model (else default); any other/none ->
+        the default model."""
+        if role == "embed" and self._embed_id:
+            return self._embed_id
         return self._default_id
 
     def ids(self):

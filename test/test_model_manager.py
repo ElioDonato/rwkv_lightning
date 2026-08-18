@@ -50,6 +50,27 @@ def test_default_falls_back_to_first():
     assert m.default_id == "a"
 
 
+def test_embed_model_endpoint_default():
+    # Embed model designated -> embed endpoints resolve to it.
+    m = ModelManager(_configs(), default_id="a", embed_id="b")
+    assert m.embed_id == "b"
+    assert m.endpoint_default("embed") == "b"
+    # Other roles (chat/None) still use the default model.
+    assert m.endpoint_default(None) == "a"
+    assert m.endpoint_default("chat") == "a"
+
+
+def test_embed_model_unset_falls_back_to_default():
+    m = ModelManager(_configs(), default_id="a")
+    assert m.embed_id is None
+    assert m.endpoint_default("embed") == "a"  # no embed model -> default
+
+
+def test_unknown_embed_id_rejected():
+    with pytest.raises(ValueError):
+        ModelManager(_configs(), embed_id="nope")
+
+
 def test_duplicate_and_unknown_ids():
     with pytest.raises(ValueError):
         ModelManager([{"id": "a", "path": "x"}, {"id": "a", "path": "y"}])

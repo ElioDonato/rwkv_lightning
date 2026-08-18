@@ -20,14 +20,21 @@ from state_manager.state_pool import shutdown_state_manager
 
 
 def _load_models_config(path):
+    """Return (configs_list, meta) where meta may carry optional ``default_model``
+    / ``embed_model`` ids from the JSON's top-level object."""
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
+    meta = {}
     if isinstance(data, dict):
+        meta = {
+            k: data.get(k)
+            for k in ("default_model", "embed_model")
+        }
         data = data.get("models", [])
     if not isinstance(data, list) or not data:
         raise SystemExit(f"--models-config {path}: must be a non-empty list of "
                          "model objects {id?, path, engine?}")
-    return data
+    return data, meta
 
 
 def parse_args():
@@ -54,6 +61,13 @@ def parse_args():
              "(default: the first declared model)",
     )
     parser.add_argument(
+        "--embed-model",
+        type=str,
+        default=os.getenv("RWKV_EMBED_MODEL"),
+        help="model id the embedding endpoints use by default "
+             "(default: the default model)",
+    )
+    parser.add_argument(
         "--inference-engine",
         "--backend",
         dest="inference_engine",
@@ -75,7 +89,7 @@ def parse_args():
     )
     args = parser.parse_args()
     if args.models_config:
-        configs = _load_models_config(args.models_config)
+        configs, meta = _load_models_config(args.models_config)
     else:
         if not args.model_path:
             parser.error(
@@ -83,14 +97,18 @@ def parse_args():
                 "RWKV_MODEL_PATH env var)"
             )
         configs = [{"path": args.model_path, "engine": args.inference_engine}]
-    return args, configs
+        meta = {}
+    return args, configs, meta
 
 
 def main():
-    args_cli, configs = parse_args()
+    args_cli, configs, meta = parse_args()
+    default_id = args_cli.default_model or meta.get("default_model")
+    embed_id = args_cli.embed_model or meta.get("embed_model")
     manager = ModelManager(
         configs,
-        default_id=args_cli.default_model,
+        default_id=default_id,
+        embed_id=embed_id,
         max_resident_bytes=int(os.getenv("RWKV_MAX_RESIDENT_BYTES", "0") or 0),
     )
     # Load the default model at startup (same behavior as the old single-model

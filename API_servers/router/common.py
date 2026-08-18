@@ -128,13 +128,14 @@ class _DefaultSlotShim:
         self.ensure_wired = lambda: None
 
 
-async def resolve_slot(request, model_field=None):
+async def resolve_slot(request, model_field=None, role=None):
     """Resolve the :class:`EngineSlot` that should serve a request.
 
     ``request.app.state.model_manager`` (when present) picks a slot by the
     request's ``model`` field; omitted / empty / unknown model ids map to the
-    default slot and never raise. If no manager is installed, returns a shim
-    over the historical ``app.state`` engine + aggregators. Calls
+    default slot (or the role-specific default, e.g. ``role="embed"`` -> the
+    designated embed model) and never raise. If no manager is installed, returns
+    a shim over the historical ``app.state`` engine + aggregators. Calls
     ``slot.ensure_wired()`` on the running loop (idempotent) so the per-model
     decode aggregators exist before the route drives decode."""
     manager = getattr(request.app.state, "model_manager", None)
@@ -142,6 +143,8 @@ async def resolve_slot(request, model_field=None):
         return _DefaultSlotShim(request.app.state)
     if model_field and model_field in manager.ids():
         slot = await manager.get(model_field)
+    elif role:
+        slot = await manager.get(manager.endpoint_default(role))
     else:
         slot = await manager.get()
     slot.ensure_wired()

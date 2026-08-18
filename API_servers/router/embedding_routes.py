@@ -51,7 +51,7 @@ async def _embed_hander(request: Request, openai_shape: bool):
     except ValueError as exc:
         return json_response(400, {"error": str(exc)})
 
-    slot = await resolve_slot(request, body.get("model"))
+    slot = await resolve_slot(request, body.get("model"), role="embed")
     engine = slot.engine
 
     model_name = engine.args.MODEL_NAME.split("/")[-1]

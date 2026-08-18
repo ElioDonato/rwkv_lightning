@@ -29,12 +29,18 @@ class _FakeSlot:
 
 
 class _FakeManager:
-    def __init__(self, default_id="small"):
+    def __init__(self, default_id="small", embed_id=None):
         self.default_id = default_id
+        self._embed_id = embed_id
         self._slots = {"small": _FakeSlot("small"), "big": _FakeSlot("big")}
 
     def ids(self):
         return list(self._slots)
+
+    def endpoint_default(self, role=None):
+        if role == "embed" and self._embed_id:
+            return self._embed_id
+        return self.default_id
 
     async def get(self, model_id=None):
         if not model_id:
@@ -75,6 +81,23 @@ def test_non_default_default_model():
     r = _make_request(m)
     assert _run(resolve_slot(r)).id == "big"
     assert _run(resolve_slot(r, "unknown")).id == "big"
+
+
+def test_role_embed_uses_embed_model_when_omitted():
+    m = _FakeManager(default_id="small", embed_id="big")
+    r = _make_request(m)
+    # Embed role, no explicit model -> the designated embed model.
+    assert _run(resolve_slot(r, None, role="embed")).id == "big"
+    # An explicit model still overrides the role default.
+    assert _run(resolve_slot(r, "small", role="embed")).id == "small"
+    # Non-embed role -> default model.
+    assert _run(resolve_slot(r, None, role="chat")).id == "small"
+
+
+def test_role_embed_without_embed_model_uses_default():
+    m = _FakeManager(default_id="small")
+    r = _make_request(m)
+    assert _run(resolve_slot(r, None, role="embed")).id == "small"
 
 
 def test_resolve_slot_wires_the_slot():
