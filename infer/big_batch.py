@@ -3,13 +3,19 @@ import json
 
 from infer import inference_deps
 
+# Single-sourced default for the big_batch gumbel-temp sampler. The fused
+# big_batch path only uses `temperature` (it ignores top_k/top_p/alpha); the
+# per-route top_k/top_p/alpha defaults for the non-gumbel V1/V2 samplers live
+# in batch_inference.py.
+_DEFAULT_TEMPERATURE = 1.0
+
 
 class BigBatchMixin:
     async def big_batch_stream(
         self,
         prompts,
         max_length=512,
-        temperature=1.0,
+        temperature=_DEFAULT_TEMPERATURE,
         stop_tokens=("\nUser:",),
         chunk_size=32,
         cancel_token=None,
@@ -33,8 +39,6 @@ class BigBatchMixin:
         encoded_prompts = None
         out = None
         finished = None
-        generated_tokens = None
-        token_buffers = None
         new_tokens_tensor = None
         new_tokens = None
 
@@ -275,10 +279,6 @@ class BigBatchMixin:
                 del encoded_prompts
             if finished is not None:
                 del finished
-            if generated_tokens is not None:
-                del generated_tokens
-            if token_buffers is not None:
-                del token_buffers
             if new_tokens is not None:
                 del new_tokens
             # Per-request cleanup removed (item 1): rely on CUDA's allocator

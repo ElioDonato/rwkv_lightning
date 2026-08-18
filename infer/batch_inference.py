@@ -10,6 +10,28 @@ import random
 from infer import inference_deps
 from infer.inference_utils import sample_logits_batch_cuda
 
+# ---------------------------------------------------------------------------
+# Single-sourced sampler defaults. Each decode route keeps its OWN historical
+# per-route values below as an explicit named constant; V1 and V2 share the
+# temperature/alpha_presence/alpha_frequency defaults. Every signature default
+# is expressed in terms of these constants so a value change needs one edit,
+# and callers may still override any of them per-call as before. The fuse chat
+# gate (top_k=20 / top_p=0.6) is configured in settings.py (fuse_sampler_*),
+# not here.
+_DEFAULT_TEMPERATURE = 1.0
+_DEFAULT_ALPHA_PRESENCE = 1.0
+_DEFAULT_ALPHA_FREQUENCY = 0.1
+
+# V1 top-p / repetition-penalty sampling (batch_generate / batch_infer_stream /
+# state + single_infer / single_infer_stream variants).
+_DEFAULT_V1_TOP_K = 50
+_DEFAULT_V1_TOP_P = 0.6
+_DEFAULT_V1_ALPHA_DECAY = 0.996
+
+# V2 occurrence-count sampling (batch_generate_v2 / batch_infer_stream_v2).
+_DEFAULT_V2_TOP_K = 500
+_DEFAULT_V2_TOP_P = 0.5
+_DEFAULT_V2_ALPHA_DECAY = 0.99
 
 # ---------------------------------------------------------------------------
 # Sampler abstractions: encapsulate init / sample / compact for V1 and V2.
@@ -352,12 +374,12 @@ class BatchInferenceMixin:
         self,
         prompts,
         max_length=512,
-        temperature=1.0,
-        top_k=500,
-        top_p=0.5,
-        alpha_presence=1.0,
-        alpha_frequency=0.1,
-        alpha_decay=0.99,
+        temperature=_DEFAULT_TEMPERATURE,
+        top_k=_DEFAULT_V2_TOP_K,
+        top_p=_DEFAULT_V2_TOP_P,
+        alpha_presence=_DEFAULT_ALPHA_PRESENCE,
+        alpha_frequency=_DEFAULT_ALPHA_FREQUENCY,
+        alpha_decay=_DEFAULT_V2_ALPHA_DECAY,
         stop_tokens=("\nUser:",),
         cancel_token=None,
         prefix_cache_manager=None,
@@ -378,12 +400,12 @@ class BatchInferenceMixin:
         self,
         prompts,
         max_length=512,
-        temperature=1.0,
-        top_k=500,
-        top_p=0.5,
-        alpha_presence=1.0,
-        alpha_frequency=0.1,
-        alpha_decay=0.99,
+        temperature=_DEFAULT_TEMPERATURE,
+        top_k=_DEFAULT_V2_TOP_K,
+        top_p=_DEFAULT_V2_TOP_P,
+        alpha_presence=_DEFAULT_ALPHA_PRESENCE,
+        alpha_frequency=_DEFAULT_ALPHA_FREQUENCY,
+        alpha_decay=_DEFAULT_V2_ALPHA_DECAY,
         stop_tokens=("\nUser:",),
         chunk_size=32,
         cancel_token=None,
@@ -415,12 +437,12 @@ class BatchInferenceMixin:
         self,
         prompts,
         max_length=512,
-        temperature=1.0,
-        top_k=50,
-        top_p=0.6,
-        alpha_presence=1.0,
-        alpha_frequency=0.1,
-        alpha_decay=0.996,
+        temperature=_DEFAULT_TEMPERATURE,
+        top_k=_DEFAULT_V1_TOP_K,
+        top_p=_DEFAULT_V1_TOP_P,
+        alpha_presence=_DEFAULT_ALPHA_PRESENCE,
+        alpha_frequency=_DEFAULT_ALPHA_FREQUENCY,
+        alpha_decay=_DEFAULT_V1_ALPHA_DECAY,
         stop_tokens=("\nUser:",),
         cancel_token=None,
         prefix_cache_manager=None,
@@ -439,12 +461,12 @@ class BatchInferenceMixin:
         self,
         prompts,
         max_length=512,
-        temperature=1.0,
-        top_k=50,
-        top_p=0.6,
-        alpha_presence=1.0,
-        alpha_frequency=0.1,
-        alpha_decay=0.996,
+        temperature=_DEFAULT_TEMPERATURE,
+        top_k=_DEFAULT_V1_TOP_K,
+        top_p=_DEFAULT_V1_TOP_P,
+        alpha_presence=_DEFAULT_ALPHA_PRESENCE,
+        alpha_frequency=_DEFAULT_ALPHA_FREQUENCY,
+        alpha_decay=_DEFAULT_V1_ALPHA_DECAY,
         stop_tokens=("\nUser:",),
         chunk_size=32,
         cancel_token=None,
@@ -476,12 +498,12 @@ class BatchInferenceMixin:
         prompts,
         state,
         max_length=512,
-        temperature=1.0,
-        top_k=50,
-        top_p=0.6,
-        alpha_presence=1.0,
-        alpha_frequency=0.1,
-        alpha_decay=0.996,
+        temperature=_DEFAULT_TEMPERATURE,
+        top_k=_DEFAULT_V1_TOP_K,
+        top_p=_DEFAULT_V1_TOP_P,
+        alpha_presence=_DEFAULT_ALPHA_PRESENCE,
+        alpha_frequency=_DEFAULT_ALPHA_FREQUENCY,
+        alpha_decay=_DEFAULT_V1_ALPHA_DECAY,
         stop_tokens=("\nUser:",),
         cancel_token=None,
     ):
@@ -540,12 +562,12 @@ class BatchInferenceMixin:
         prompts,
         state,
         max_length=512,
-        temperature=1.0,
-        top_k=50,
-        top_p=0.6,
-        alpha_presence=1.0,
-        alpha_frequency=0.1,
-        alpha_decay=0.996,
+        temperature=_DEFAULT_TEMPERATURE,
+        top_k=_DEFAULT_V1_TOP_K,
+        top_p=_DEFAULT_V1_TOP_P,
+        alpha_presence=_DEFAULT_ALPHA_PRESENCE,
+        alpha_frequency=_DEFAULT_ALPHA_FREQUENCY,
+        alpha_decay=_DEFAULT_V1_ALPHA_DECAY,
         stop_tokens=("\nUser:",),
         chunk_size=32,
         session_id=None,
@@ -662,12 +684,12 @@ class BatchInferenceMixin:
         self,
         prompt,
         max_length=512,
-        temperature=1.0,
-        top_k=50,
-        top_p=0.6,
-        alpha_presence=1.0,
-        alpha_frequency=0.1,
-        alpha_decay=0.996,
+        temperature=_DEFAULT_TEMPERATURE,
+        top_k=_DEFAULT_V1_TOP_K,
+        top_p=_DEFAULT_V1_TOP_P,
+        alpha_presence=_DEFAULT_ALPHA_PRESENCE,
+        alpha_frequency=_DEFAULT_ALPHA_FREQUENCY,
+        alpha_decay=_DEFAULT_V1_ALPHA_DECAY,
         stop_tokens=("\nUser:",),
         prefix_cache_manager=None,
         cancel_token=None,
@@ -770,12 +792,12 @@ class BatchInferenceMixin:
         self,
         prompt,
         max_length=512,
-        temperature=1.0,
-        top_k=50,
-        top_p=0.6,
-        alpha_presence=1.0,
-        alpha_frequency=0.1,
-        alpha_decay=0.996,
+        temperature=_DEFAULT_TEMPERATURE,
+        top_k=_DEFAULT_V1_TOP_K,
+        top_p=_DEFAULT_V1_TOP_P,
+        alpha_presence=_DEFAULT_ALPHA_PRESENCE,
+        alpha_frequency=_DEFAULT_ALPHA_FREQUENCY,
+        alpha_decay=_DEFAULT_V1_ALPHA_DECAY,
         stop_tokens=("\nUser:",),
         chunk_size=32,
         prefix_cache_manager=None,

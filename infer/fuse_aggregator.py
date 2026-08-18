@@ -414,6 +414,23 @@ class ChatFuseAggregator:
 
     # -- request-facing API -------------------------------------------------
 
+    def _build_inline_stream(self, prompt, max_tokens, temperature, stop_tokens,
+                             chunk_size, top_k, top_p, alpha_presence,
+                             alpha_frequency, alpha_decay, use_prefix_cache,
+                             prefix_cache_manager):
+        """Construct the inline solo ``_InlineFuseStream`` proxy shared by the
+        default-off, scheduler-absent-restart-fallback, and pending-cap-reject
+        paths. All three forward the request's own sampler controls
+        (top_k/top_p/alpha_* and, when requested, its prefix_cache_manager) into
+        ``single_infer_stream`` -- byte-identical to the pre-feature solo route --
+        and acquire their own bsz=1 prefill-admission permit."""
+        return _InlineFuseStream(
+            self._engine, prompt, max_tokens, temperature, stop_tokens, chunk_size,
+            top_k=top_k, top_p=top_p, alpha_presence=alpha_presence,
+            alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
+            use_prefix_cache=use_prefix_cache, prefix_cache_manager=prefix_cache_manager,
+        )
+
     async def submit(self, prompt, max_tokens, temperature, stop_tokens, chunk_size,
                      top_k=settings.fuse_sampler_top_k,
                      top_p=settings.fuse_sampler_top_p,
@@ -446,22 +463,20 @@ class ChatFuseAggregator:
         still respects the shared VRAM budget.
         """
         if not self._enabled:
-            return _InlineFuseStream(
-                self._engine, prompt, max_tokens, temperature, stop_tokens, chunk_size,
-                top_k=top_k, top_p=top_p, alpha_presence=alpha_presence,
-                alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
-                use_prefix_cache=use_prefix_cache, prefix_cache_manager=prefix_cache_manager,
+            return self._build_inline_stream(
+                prompt, max_tokens, temperature, stop_tokens, chunk_size,
+                top_k, top_p, alpha_presence, alpha_frequency, alpha_decay,
+                use_prefix_cache, prefix_cache_manager,
             )
         if self._task is None:
             self.start()
             if self._task is None:
                 # start() was a no-op (e.g. feature became disabled); fall back
                 # to the inline solo stream so this request still completes.
-                return _InlineFuseStream(
-                    self._engine, prompt, max_tokens, temperature, stop_tokens, chunk_size,
-                    top_k=top_k, top_p=top_p, alpha_presence=alpha_presence,
-                    alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
-                    use_prefix_cache=use_prefix_cache, prefix_cache_manager=prefix_cache_manager,
+                return self._build_inline_stream(
+                    prompt, max_tokens, temperature, stop_tokens, chunk_size,
+                    top_k, top_p, alpha_presence, alpha_frequency, alpha_decay,
+                    use_prefix_cache, prefix_cache_manager,
                 )
             if not self._dead_warned:
                 self._dead_warned = True
@@ -477,11 +492,10 @@ class ChatFuseAggregator:
             # and releases its own bsz=1 prefill permit (HIGH-1: this reject
             # fires exactly on the sustained burst when max-prefill-bsz VRAM is
             # most stressed, so before-merge admission must not be skipped).
-            return _InlineFuseStream(
-                self._engine, prompt, max_tokens, temperature, stop_tokens, chunk_size,
-                top_k=top_k, top_p=top_p, alpha_presence=alpha_presence,
-                alpha_frequency=alpha_frequency, alpha_decay=alpha_decay,
-                use_prefix_cache=use_prefix_cache, prefix_cache_manager=prefix_cache_manager,
+            return self._build_inline_stream(
+                prompt, max_tokens, temperature, stop_tokens, chunk_size,
+                top_k, top_p, alpha_presence, alpha_frequency, alpha_decay,
+                use_prefix_cache, prefix_cache_manager,
             )
         loop = asyncio.get_running_loop()
         job = _ChatJob(
@@ -505,11 +519,6 @@ class ChatFuseAggregator:
         if limit > 0 and cap > limit:
             cap = limit
         return max(1, cap)
-
-    def _max_permit_bsz(self):
-        """Upper bound a fused batch could ever need to admit (cap) filtered by
-        the model's absolute prefill limit -- used to split an oversized burst."""
-        return self._cap()
 
     def _pending_cap(self):
         """Upper bound on the pending deque (reject-buffering capacity). Always
