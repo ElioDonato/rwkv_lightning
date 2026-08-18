@@ -141,6 +141,24 @@ class PrefixCacheEntry:
     state_cpu: List[torch.Tensor]
     logits_cpu: Optional[torch.Tensor]
     last_updated: float
+    # Model namespace this entry belongs to ("" = the default model). Kept so a
+    # shared entry index / DB can rebuild per-model tries and stay isolated when
+    # multiple RWKV models run in one process.
+    model: str = ""
+
+
+def _session_key(model, session_id: str) -> str:
+    """Scope a session key by model namespace (""/falsy = identity)."""
+    if not model:
+        return session_id
+    return f"{model}:{session_id}"
+
+
+def _prefix_key(model, raw_state_id: str) -> str:
+    """Scope a prefix state_id by model namespace (""/falsy = identity)."""
+    if not model:
+        return raw_state_id
+    return f"{model}:{raw_state_id}"
 
 
 class StateCacheManager:
@@ -167,7 +185,11 @@ class StateCacheManager:
             bucket: OrderedDict() for bucket in PREFIX_CACHE_BUCKETS
         }
         self.prefix_entry_index: Dict[str, PrefixCacheEntry] = {}
-        self.prefix_trie = _CompressedTrie()
+        # One compressed trie PER model namespace ("" = default model), so a
+        # token prefix of one model can never resolve to another model's state.
+        self.prefix_tries: Dict[str, _CompressedTrie] = {}
+        self.prefix_trie = _CompressedTrie()  # back-compat alias for the default model
+        self.prefix_tries[""] = self.prefix_trie
         
         self.cache_lock = threading.RLock()
         
@@ -287,10 +309,16 @@ class StateCacheManager:
             logger.error(f"[StatePool] Error persisting prefix cache {entry.state_id[:96]}...: {e}")
 
     def _rebuild_prefix_trie(self):
-        trie = _CompressedTrie()
+        """Rebuild one compressed trie per model namespace from the shared
+        entry index, so a token prefix of one model never resolves to another
+        model's recurrent state (airtight even for same-vocab checkpoints)."""
+        models = {e.model for e in self.prefix_entry_index.values()} or {""}
+        self.prefix_tries = {m: _CompressedTrie() for m in models}
+        self.prefix_trie = self.prefix_tries.setdefault("", _CompressedTrie())
         for entry in self.prefix_entry_index.values():
-            trie.insert(entry.prefix_tokens, entry.state_id)
-        self.prefix_trie = trie
+            self.prefix_tries.setdefault(entry.model, _CompressedTrie()).insert(
+                entry.prefix_tokens, entry.state_id
+            )
 
     def _store_prefix_entry_locked(self, entry: PrefixCacheEntry, persist: bool):
         bucket_cache = self.prefix_l2_cache[entry.bucket_len]
@@ -311,7 +339,7 @@ class StateCacheManager:
         if evicted_entry is not None:
             self.io_executor.submit(self._persist_prefix_task, evicted_entry)
 
-    def put_state(self, session_id: str, state: List[torch.Tensor]):
+    def put_state(self, session_id: str, state: List[torch.Tensor], model=None):
         """
         存入状态。
         流程：
@@ -321,6 +349,7 @@ class StateCacheManager:
         """
         if session_id is None:
             return
+        session_id = _session_key(model, session_id)
 
         with self.cache_lock:
             if session_id in self.l1_cache:
@@ -343,10 +372,11 @@ class StateCacheManager:
 
                     self.io_executor.submit(self._persist_task, l2_evicted_id, l2_evicted_state_cpu)
 
-    def get_state(self, session_id: str) -> Optional[List[torch.Tensor]]:
+    def get_state(self, session_id: str, model=None) -> Optional[List[torch.Tensor]]:
 
         if session_id is None:
             return None
+        session_id = _session_key(model, session_id)
 
         with self.cache_lock:
             # Case 1: L1 Hit (VRAM)
@@ -391,9 +421,10 @@ class StateCacheManager:
 
         return None
 
-    def has_state(self, session_id: str) -> bool:
+    def has_state(self, session_id: str, model=None) -> bool:
         if session_id is None:
             return False
+        session_id = _session_key(model, session_id)
 
         with self.cache_lock:
             if session_id in self.l1_cache or session_id in self.l2_cache:
@@ -410,6 +441,7 @@ class StateCacheManager:
         prefix_tokens: List[int] | Tuple[int, ...],
         state: List[torch.Tensor],
         logits: Optional[torch.Tensor] = None,
+        model=None,
     ) -> bool:
         token_tuple = tuple(prefix_tokens)
         bucket_len = len(token_tuple)
@@ -417,7 +449,7 @@ class StateCacheManager:
             return False
 
         entry = PrefixCacheEntry(
-            state_id=_serialize_token_ids(token_tuple),
+            state_id=_prefix_key(model, _serialize_token_ids(token_tuple)),
             bucket_len=bucket_len,
             token_count=bucket_len,
             prefix_tokens=token_tuple,
@@ -425,6 +457,7 @@ class StateCacheManager:
             state_cpu=self._clone_to_cpu_state(state),
             logits_cpu=self._clone_optional_tensor(logits, "cpu"),
             last_updated=time.time(),
+            model=model or "",
         )
         with self.cache_lock:
             self._store_prefix_entry_locked(entry, persist=True)
@@ -434,8 +467,9 @@ class StateCacheManager:
         self,
         prefix_tokens: List[int] | Tuple[int, ...],
         bucket_len: int,
+        model=None,
     ) -> Optional[PrefixCacheEntry]:
-        state_id = _serialize_token_ids(prefix_tokens[:bucket_len])
+        state_id = _prefix_key(model, _serialize_token_ids(prefix_tokens[:bucket_len]))
         hash_column = f"prefix_hash_{bucket_len}"
         hash_value = _hash_token_ids(prefix_tokens[:bucket_len])
 
@@ -470,6 +504,7 @@ class StateCacheManager:
             state_cpu=state_cpu,
             logits_cpu=logits_cpu,
             last_updated=float(row[2]) if row[2] is not None else time.time(),
+            model=model or "",
         )
         self._store_prefix_entry_locked(entry, persist=False)
         return entry
@@ -478,13 +513,15 @@ class StateCacheManager:
         self,
         prompt_tokens: List[int] | Tuple[int, ...],
         device: str = "cuda",
+        model=None,
     ) -> Optional[dict]:
         token_tuple = tuple(prompt_tokens)
         if not token_tuple:
             return None
 
         with self.cache_lock:
-            state_id, matched_len = self.prefix_trie.longest_prefix(token_tuple)
+            trie = self.prefix_tries.get(model or "", self.prefix_trie)
+            state_id, matched_len = trie.longest_prefix(token_tuple)
             if state_id is not None:
                 entry = self.prefix_entry_index.get(state_id)
                 if entry is not None:
@@ -511,7 +548,7 @@ class StateCacheManager:
             if len(token_tuple) < bucket:
                 continue
             with self.cache_lock:
-                entry = self._load_prefix_entry_from_db_locked(token_tuple, bucket)
+                entry = self._load_prefix_entry_from_db_locked(token_tuple, bucket, model)
                 if entry is not None:
                     prompt_prefix_hashes = _build_prefix_hashes(token_tuple)
                     logger.info("[StatePool][PREFIX HIT][DISK] "
@@ -532,9 +569,10 @@ class StateCacheManager:
 
         return None
 
-    def close_session(self, session_id: str):
+    def close_session(self, session_id: str, model=None):
 
         state_to_save = None
+        session_id = _session_key(model, session_id)
         
         with self.cache_lock:
             if session_id in self.l1_cache:
@@ -712,9 +750,10 @@ class StateCacheManager:
             logger.info("No sessions found in any cache level.")
         logger.info("=" * 80)
 
-    def delete_state_from_any_level(self, session_id: str) -> bool:
+    def delete_state_from_any_level(self, session_id: str, model=None) -> bool:
 
         deleted_from_cache = False
+        session_id = _session_key(model, session_id)
 
         with self.cache_lock:
             # 从L1缓存删除
@@ -755,8 +794,60 @@ def remove_session_from_any_level(session_id: str) -> bool:
     manager = get_state_manager()
     return manager.delete_state_from_any_level(session_id)
 
-def get_state_manager() -> StateCacheManager:
-    return StateCacheManager()
+def get_state_manager(model=None) -> StateCacheManager:
+    """Return the process-wide StateCacheManager. When ``model`` (a model
+    namespace from ``model_namespace(slot)``) is provided, return a stateless
+    ``_ModelScopedManager`` that forwards it, so session + prefix state is
+    isolated per model. When ``model`` is falsy/None (the default/single-model
+    case) the bare singleton is returned -- byte-identical to before."""
+    inst = StateCacheManager()
+    if not model:
+        return inst
+    return _ModelScopedManager(inst, model)
+
+
+class _ModelScopedManager:
+    """Stateless view of the shared StateCacheManager restricted to one model
+    namespace. Only the model-scoped methods forward ``model``; everything else
+    delegates to the singleton."""
+
+    _SCOPED = (
+        "put_state", "get_state", "has_state", "close_session",
+        "delete_state_from_any_level", "put_prefix_state", "match_prefix_state",
+    )
+
+    def __init__(self, manager: StateCacheManager, model: str):
+        self._manager = manager
+        self._model = model
+
+    def put_state(self, session_id, state):
+        return self._manager.put_state(session_id, state, self._model)
+
+    def get_state(self, session_id):
+        return self._manager.get_state(session_id, self._model)
+
+    def has_state(self, session_id):
+        return self._manager.has_state(session_id, self._model)
+
+    def close_session(self, session_id):
+        return self._manager.close_session(session_id, self._model)
+
+    def delete_state_from_any_level(self, session_id):
+        return self._manager.delete_state_from_any_level(session_id, self._model)
+
+    def put_prefix_state(self, prefix_tokens, state, logits=None):
+        return self._manager.put_prefix_state(prefix_tokens, state, logits, self._model)
+
+    def match_prefix_state(self, prompt_tokens, device="cuda"):
+        return self._manager.match_prefix_state(prompt_tokens, device, self._model)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._manager, name)
+
+    def __repr__(self):
+        return f"<_ModelScopedManager(model={self._model!r}, manager={self._manager!r})>"
 
 def shutdown_state_manager():
     manager = get_state_manager()

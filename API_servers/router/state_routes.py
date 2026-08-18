@@ -15,6 +15,7 @@ from API_servers.router.common import (
     check_password,
     client_closed_response,
     json_response,
+    model_namespace,
     normalize_state_prompts,
     parse_request_model,
     prefill_bsz_limit_response,
@@ -48,11 +49,11 @@ async def state_chat_completions(request: Request):
     if auth_error is not None:
         return auth_error
 
-    slot = await resolve_slot(request)
+    slot = await resolve_slot(request, body.get("model"))
     engine = slot.engine
 
     prompts = req.contents
-    state_manager = get_state_manager()
+    state_manager = get_state_manager(model_namespace(slot))
 
     # Setup phase: read/create state under lock
     async with session_lock(session_id):
@@ -162,7 +163,7 @@ async def multi_state_chat_completions(request: Request):
     if auth_error is not None:
         return auth_error
 
-    slot = await resolve_slot(request)
+    slot = await resolve_slot(request, body.get("model"))
     engine = slot.engine
 
     if "dialogue_idx" not in body:
@@ -181,7 +182,7 @@ async def multi_state_chat_completions(request: Request):
     except (ValueError, TypeError):
         return json_response(400, {"error": "dialogue_idx must be an integer"})
     state_key = f"{session_index}:{dialogue_idx}"
-    state_manager = get_state_manager()
+    state_manager = get_state_manager(model_namespace(slot))
 
     # Setup phase: read/create state under lock
     async with session_lock(session_index):
@@ -225,7 +226,7 @@ async def multi_state_chat_completions(request: Request):
                     async for chunk in inner_stream:
                         if chunk == "data: [DONE]\n\n" and not stored and not cancel_token.is_cancelled():
                             new_dialogue_idx = allocate_next_dialogue_idx(
-                                app_state, state_manager, session_index
+                                app_state, state_manager, session_index, model_namespace(slot)
                             )
                             new_session_id = f"{session_index}:{new_dialogue_idx}"
                             state_manager.put_state(new_session_id, state)
@@ -241,7 +242,7 @@ async def multi_state_chat_completions(request: Request):
                     await inner_stream.aclose()
                     if not stored and not cancel_token.is_cancelled():
                         new_dialogue_idx = allocate_next_dialogue_idx(
-                            app_state, state_manager, session_index
+                            app_state, state_manager, session_index, model_namespace(slot)
                         )
                         new_session_id = f"{session_index}:{new_dialogue_idx}"
                         state_manager.put_state(new_session_id, state)
@@ -276,7 +277,7 @@ async def multi_state_chat_completions(request: Request):
             del state
             return prefill_bsz_limit_response(exc)
 
-        new_dialogue_idx = allocate_next_dialogue_idx(app_state, state_manager, session_index)
+        new_dialogue_idx = allocate_next_dialogue_idx(app_state, state_manager, session_index, model_namespace(slot))
         new_session_id = f"{session_index}:{new_dialogue_idx}"
         state_manager.put_state(new_session_id, state)
 

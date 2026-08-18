@@ -66,6 +66,7 @@ from API_servers.router.common import (
     check_openai_auth,
     client_closed_response,
     json_response,
+    model_namespace,
     parse_request_model,
     prefill_bsz_limit_response,
     prefill_sse_response,
@@ -185,7 +186,7 @@ async def create_response(request: Request):
         return parse_error
 
     previous_response_id = req.previous_response_id
-    state_manager = get_state_manager()
+    state_manager = get_state_manager(model_namespace(slot))
 
     # Look up the previous turn's state (if any) up front, so a 404 for an
     # unknown/expired previous_response_id is reported before any GPU work

@@ -151,6 +151,23 @@ async def resolve_slot(request, model_field=None, role=None):
     return slot
 
 
+def model_namespace(slot):
+    """Stable per-model namespace for the state/prefix cache isolation: None for
+    the default model (identity -> single-model byte-identical), else
+    'id:size:mtime_ns' so a fine-tuned/state-tuned checkpoint swap auto-
+    invalidates the cache. Handles the _DefaultSlotShim (no is_default/path)."""
+    if getattr(slot, "is_default", True):
+        return None
+    path = getattr(slot, "path", None)
+    if path:
+        try:
+            st = os.stat(path)
+            return f"{slot.id}:{st.st_size}:{st.st_mtime_ns}"
+        except OSError:
+            pass
+    return slot.id
+
+
 def _default_engine(request, engine=None):
     """Resolve the engine for prefill/permit admission. An explicit ``engine``
     (the per-request slot's engine) wins; otherwise the default-slot engine.
@@ -190,17 +207,20 @@ def collect_session_indices(state_manager, session_index: str) -> list[int]:
     return indices
 
 
-def allocate_next_dialogue_idx(app_state, state_manager, session_index: str) -> int:
+def allocate_next_dialogue_idx(app_state, state_manager, session_index: str, model=None) -> int:
+    # Counter space is scoped by model so a second model can't reuse/collide with
+    # the default model's dialogue indices (default/model-less maps to (None, si)).
+    counter_key = (model, session_index)
     with app_state.dialogue_idx_lock:
-        if session_index in app_state.dialogue_idx_counters:
-            next_idx = app_state.dialogue_idx_counters[session_index]
-            app_state.dialogue_idx_counters[session_index] = next_idx + 1
+        if counter_key in app_state.dialogue_idx_counters:
+            next_idx = app_state.dialogue_idx_counters[counter_key]
+            app_state.dialogue_idx_counters[counter_key] = next_idx + 1
             return next_idx
 
         indices = collect_session_indices(state_manager, session_index)
         max_idx = max(indices) if indices else 0
         next_idx = max_idx + 1
-        app_state.dialogue_idx_counters[session_index] = next_idx + 1
+        app_state.dialogue_idx_counters[counter_key] = next_idx + 1
         return next_idx
 
 

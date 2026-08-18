@@ -25,6 +25,7 @@ from API_servers.router.common import (
     extract_bearer_token as common_extract_bearer_token,
     extract_sse_payload,
     json_response,
+    model_namespace,
     prefill_bsz_limit_response,
     prefill_sse_response,
     reserve_prefill_capacity,
@@ -395,7 +396,7 @@ async def openai_chat_completions(request: Request):
         response_id = f"chatcmpl-{os.urandom(12).hex()}"
         created = int(time.time())
         model_name = os.path.basename(f"{engine.args.MODEL_NAME}")
-        prefix_cache_manager = get_state_manager() if req.use_prefix_cache else None
+        prefix_cache_manager = get_state_manager(model_namespace(slot)) if req.use_prefix_cache else None
 
         # Opt-in decode combine-queue (CHAT_FUSE): when enabled, route the
         # request through the ChatFuseAggregator (solo head-fire or fused
@@ -487,7 +488,7 @@ async def openai_chat_completions(request: Request):
             # fuse=OFF). Prefix caching per se is served by the solo path, not
             # the fused path.
             fuse_prefix_cache = body.get("use_prefix_cache", settings.fuse_prefix_cache_default)
-            fuse_prefix_cache_manager = get_state_manager() if fuse_prefix_cache else None
+            fuse_prefix_cache_manager = get_state_manager(model_namespace(slot)) if fuse_prefix_cache else None
             cancel_token = CancellationToken()
             fuse_stream = await fuse.submit(
                 prompt_formatted,
