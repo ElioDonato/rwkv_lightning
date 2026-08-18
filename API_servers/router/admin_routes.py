@@ -47,11 +47,13 @@ async def list_models(request: Request):
     manager, err = _manager_or_404(request)
     if err is not None:
         return err
+    out = []
     for m in manager.known_models():
         slot = manager.get_slot(m["id"])
         m["resident_bytes"] = slot.vram_bytes
         m["last_used"] = round(slot.last_used, 3) if slot.last_used else None
-    return {"models": manager.known_models()}
+        out.append(m)
+    return {"models": out}
 
 
 @router.post("/load")

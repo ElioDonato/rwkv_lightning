@@ -272,6 +272,15 @@ class ModelManager:
         slot.fuse = None
         slot.wired = False
         slot.resident = False
+        # Return the model's freed blocks to the driver so "unload" actually
+        # frees VRAM (nvidia-smi drops). This is a blocking sync -- fine for a
+        # rare management/eviction op, and serialized so it never races an
+        # in-flight decode on the worker thread.
+        import torch
+        if torch.cuda.is_available():
+            from infer.async_forward import cuda_guard
+            with cuda_guard():
+                torch.cuda.empty_cache()
 
     def _load_blocking(self, slot):
         """Synchronous load: construct the engine. Runs on a worker thread."""
