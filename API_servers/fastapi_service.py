@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
 from API_servers.router import (
+    admin_router,
     embedding_router,
     openai_router,
     responses_router,
@@ -100,5 +101,6 @@ def create_app(model_manager, password=None):
     app.include_router(openai_router)
     app.include_router(responses_router)
     app.include_router(embedding_router)
+    app.include_router(admin_router)
 
     return app

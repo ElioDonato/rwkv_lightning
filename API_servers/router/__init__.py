@@ -1,3 +1,4 @@
+from API_servers.router.admin_routes import router as admin_router
 from API_servers.router.embedding_routes import router as embedding_router
 from API_servers.router.openai_routes import router as openai_router
 from API_servers.router.responses_routes import router as responses_router
@@ -6,6 +7,7 @@ from API_servers.router.v1_routes import router as v1_router
 from API_servers.router.v2_routers import router as v2_router
 
 __all__ = [
+    "admin_router",
     "embedding_router",
     "openai_router",
     "responses_router",
