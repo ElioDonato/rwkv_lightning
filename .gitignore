@@ -24,3 +24,6 @@ infer/rwkv_batch/cuda/third_party/cutlass/*
 
 # generated training datasets (not checkpoint state)
 state_tune/data/*
+
+# internal GPU implementation plan (kept local)
+IMPL_PLAN_GPU_THROUGHPUT.md
