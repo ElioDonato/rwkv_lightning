@@ -347,11 +347,29 @@ async def openai_list_models(request: Request):
     if auth_error is not None:
         return auth_error
 
-    model_name = os.path.basename(f"{engine.args.MODEL_NAME}")
-    return {
-        "object": "list",
-        "data": [{"id": model_name, "object": "model", "owned_by": "rwkv_lightning"}],
-    }
+    manager = getattr(request.app.state, "model_manager", None)
+    if manager is not None:
+        # Multi-model: list every declared model (resident or not).
+        data = [
+            {
+                "id": m["id"],
+                "object": "model",
+                "owned_by": "rwkv_lightning",
+                "resident": m["resident"],
+                "default": m["default"],
+            }
+            for m in manager.known_models()
+        ] or [
+            {
+                "id": os.path.basename(f"{engine.args.MODEL_NAME}"),
+                "object": "model",
+                "owned_by": "rwkv_lightning",
+            }
+        ]
+    else:
+        model_name = os.path.basename(f"{engine.args.MODEL_NAME}")
+        data = [{"id": model_name, "object": "model", "owned_by": "rwkv_lightning"}]
+    return {"object": "list", "data": data}
 
 
 @router.post("/openai/v1/chat/completions")

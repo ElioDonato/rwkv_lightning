@@ -25,7 +25,13 @@ from infer.dynamic_batch import DynamicBatchDecoder
 from settings import settings
 
 
-def create_app(engine, password=None):
+def create_app(model_manager, password=None):
+    # Default engine + its per-model aggregators are wired exactly as the old
+    # single-model create_app did, so with one model nothing changes. Phase B
+    # extends per-model wiring to every loaded engine via app.state.model_manager.
+    default = model_manager.get_slot(model_manager.default_id)
+    engine = default.engine
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         logger = logging.getLogger("uvicorn.error")
@@ -44,6 +50,7 @@ def create_app(engine, password=None):
         aggregator = EmbedAggregator(engine.model, engine.tokenizer)
         app.state.embed_aggregator = aggregator
         aggregator.start()
+        default.embed = aggregator
 
         # Opt-in decode combine-queue for /openai/v1/chat/completions
         # (RWKV_FUSE_CHAT_BATCH, default-off -- item 3). Attached to app.state so
@@ -54,6 +61,7 @@ def create_app(engine, password=None):
         fuse = ChatFuseAggregator(engine)
         app.state.chat_fuse_aggregator = fuse
         fuse.start()
+        default.fuse = fuse
 
         # Opt-in dynamic decode batching for /openai/v1/chat/completions
         # (RWKV_DYNAMIC_BATCH, default-off -- Phase 4 sub-step 2). Attached to
@@ -65,6 +73,7 @@ def create_app(engine, password=None):
         dyn = DynamicBatchDecoder(engine)
         app.state.chat_dynamic_decoder = dyn
         dyn.start()
+        default.dynamic = dyn
 
         # Single low-frequency background GPU cache cleanup (item 1): replaces
         # the per-request torch.cuda.empty_cache() calls removed from the :8081
@@ -99,6 +108,7 @@ def create_app(engine, password=None):
     )
 
     app.state.engine = engine
+    app.state.model_manager = model_manager
     app.state.password = password
     app.state.dialogue_idx_lock = Lock()
     app.state.dialogue_idx_counters = {}

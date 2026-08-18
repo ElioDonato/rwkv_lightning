@@ -3,17 +3,31 @@ import logging
 logger = logging.getLogger("app")
 
 import argparse
+import asyncio
 import atexit
+import json
+import os
 import signal
 import sys
 
 import uvicorn
 
 from API_servers.fastapi_service import create_app
-from infer.inference import InferenceEngine
-from model_load.model_loader import INFERENCE_ENGINES, load_model_and_tokenizer
+from model_load.model_loader import INFERENCE_ENGINES
+from model_load.model_manager import ModelManager
 from settings import settings
 from state_manager.state_pool import shutdown_state_manager
+
+
+def _load_models_config(path):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        data = data.get("models", [])
+    if not isinstance(data, list) or not data:
+        raise SystemExit(f"--models-config {path}: must be a non-empty list of "
+                         "model objects {id?, path, engine?}")
+    return data
 
 
 def parse_args():
@@ -22,7 +36,22 @@ def parse_args():
         "--model-path",
         type=str,
         default=settings.model_path,
-        help="RWKV model path (default: RWKV_MODEL_PATH env)",
+        help="RWKV model path (default: RWKV_MODEL_PATH env). Ignored when "
+             "--models-config is set.",
+    )
+    parser.add_argument(
+        "--models-config",
+        type=str,
+        default=os.getenv("RWKV_MODELS_CONFIG"),
+        help="path to a JSON catalog of models (see models.json); enables "
+             "multi-model serving with per-request model dispatch",
+    )
+    parser.add_argument(
+        "--default-model",
+        type=str,
+        default=os.getenv("RWKV_DEFAULT_MODEL"),
+        help="model id to use for requests that omit 'model' "
+             "(default: the first declared model)",
     )
     parser.add_argument(
         "--inference-engine",
@@ -45,20 +74,30 @@ def parse_args():
         help="API password for authentication (default: RWKV_API_PASSWORD env)",
     )
     args = parser.parse_args()
-    if not args.model_path:
-        parser.error(
-            "--model-path is required; pass it or set the RWKV_MODEL_PATH env var"
-        )
-    return args
+    if args.models_config:
+        configs = _load_models_config(args.models_config)
+    else:
+        if not args.model_path:
+            parser.error(
+                "--model-path is required (or pass --models-config / set the "
+                "RWKV_MODEL_PATH env var)"
+            )
+        configs = [{"path": args.model_path, "engine": args.inference_engine}]
+    return args, configs
 
 
 def main():
-    args_cli = parse_args()
-    model, tokenizer, args, rocm_flag = load_model_and_tokenizer(
-        args_cli.model_path, inference_engine=args_cli.inference_engine
+    args_cli, configs = parse_args()
+    manager = ModelManager(
+        configs,
+        default_id=args_cli.default_model,
+        max_resident_bytes=int(os.getenv("RWKV_MAX_RESIDENT_BYTES", "0") or 0),
     )
-    engine = InferenceEngine(model=model, tokenizer=tokenizer, args=args, rocm_flag=rocm_flag)
-    app = create_app(engine, password=args_cli.password)
+    # Load the default model at startup (same behavior as the old single-model
+    # boot). Additional models from the catalog are loaded lazily on request.
+    asyncio.run(manager.load())
+
+    app = create_app(manager, password=args_cli.password)
 
     def cleanup_handler(signum, frame):
         logger.info("\nShutting down server...")

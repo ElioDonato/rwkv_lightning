@@ -1,0 +1,20 @@
+// Multi-model catalog for the serving process (--models-config models.json).
+// Each entry: {"id": <optional, defaults to file basename>, "path", "engine"?}.
+// The first entry is the default for requests that omit "model"; pass
+// --default-model to override. Models are loaded lazily on request; run the
+// management API (POST /admin/models/load|unload) to control residency, and
+// set RWKV_MAX_RESIDENT_BYTES for automatic LRU eviction.
+{
+  "models": [
+    {
+      "id": "small",
+      "path": "models/rwkv7-g1i-2.9b-20260805-ctx16384.pth",
+      "engine": "fp16"
+    },
+    {
+      "id": "big",
+      "path": "models/rwkv7-g1i-7.2b-20260805-ctx16384.pth",
+      "engine": "fp16"
+    }
+  ]
+}
