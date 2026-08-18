@@ -92,6 +92,10 @@ def sample_batch_per_row(
     row_states = sample_rand_states.reshape(B, -1)
     with torch.no_grad():
         for b in range(B):
+            # The CUDA op requires temperature in [0.001, 1000]; a client's
+            # temperature=0 (pure greedy) would otherwise raise and crash the
+            # decode scheduler. Clamp so 0 -> near-greedy instead.
+            temp = min(1000.0, max(0.001, float(temperature[b])))
             row = op(
                 logits[b : b + 1],
                 penalties[b : b + 1],
@@ -99,7 +103,7 @@ def sample_batch_per_row(
                 float(alpha_presence[b]),
                 float(alpha_frequency[b]),
                 float(alpha_decay[b]),
-                float(temperature[b]),
+                temp,
                 int(top_k[b]),
                 float(top_p[b]),
             )
