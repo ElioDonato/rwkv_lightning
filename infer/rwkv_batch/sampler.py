@@ -18,6 +18,95 @@ else:
         verbose=True,
     )
 
+def sample_batch_per_row(
+    logits,
+    penalties,
+    sample_rand_states,
+    temperature,
+    top_k,
+    top_p,
+    alpha_presence,
+    alpha_frequency,
+    alpha_decay,
+):
+    """Sample ONE token per row of a multi-row batched decode, each row with its
+    OWN sampler controls.
+
+    This is the per-row building block behind the shared multi-row decode
+    (big_batch_stream) honoring each row's own temperature / top_k / top_p /
+    repetition-penalty scalars instead of one batch-wide gumbel-temperature
+    sample. It applies the existing ``batch_sampling_repetition_temperature_
+    topk_topp`` op ONCE PER ROW, slicing that row's logits / penalties /
+    rand-state and passing that row's own scalars -- because the underlying op
+    is already per-row on ``penalties`` and ``states`` (only temperature /
+    top_k / top_p were batch-wide scalars), row-by-row application is
+    numerically equal to a single whole-batch call when every row shares the
+    same scalars.
+
+    Parameters
+    ----------
+    logits : torch.Tensor[B, vocab], float32, CUDA
+        Last-step (post-prefill / post-forward) logits for the B active rows.
+    penalties : torch.Tensor[B, vocab], float32, CUDA
+        Per-row repetition-penalty state. MUTATED IN PLACE, row by row, exactly
+        like _V1BatchSampler's handling -- it is the caller's persisted
+        per-row penalty state, carried across decode steps and compacted
+        alongside the batch (so a row's penalty state follows that row).
+    sample_rand_states : torch.Tensor, CUDA
+        Per-row RNG states, as produced by ``sample.setup_rand(seed, B)`` (a
+        flat byte tensor of B contiguous row-blocks). Row ``b`` is the ``b``-th
+        contiguous block; it may also already be shaped ``[B, block]``.
+    temperature / top_k / top_p / alpha_presence / alpha_frequency / alpha_decay :
+        Sequence[B] (list, tuple, or 1-D tensor) of PER-ROW sampler scalars,
+        slot-indexed parallel to the logits rows. Row ``b`` is sampled with
+        ``temperature[b]``, ``top_k[b]``, etc.
+
+    Returns
+    -------
+    torch.Tensor[B, 1] long -- one sampled token id per row, in row order
+    (ready to feed straight into ``forward_batch``, the same fast path the
+    batch-wide gumbel sampler fed).
+
+    MUST be called from a CUDA-guarded / decode-step context (e.g. inside the
+    _gpu_decode_step offload closure routed through ``_offload_gpu`` / under
+    ``cuda_guard``), never from pure event-loop bookkeeping: each per-row call
+    launches a CUDA sampling kernel and the returned tensor must reach
+    ``forward_batch`` on the same thread. Runs under ``torch.no_grad()``
+    (NOT ``inference_mode()`` -- the latter is thread-local and unsafe across
+    the _offload_gpu async/thread boundary) because the sample op must not
+    build an autograd graph.
+    """
+    B = logits.size(0)
+    device = logits.device
+    out = torch.empty((B, 1), dtype=torch.long, device=device)
+    if B == 0:
+        return out
+    # Resolve the op once per call so a caller-side monkeypatch of
+    # sample.batch_sampling_repetition_temperature_topk_topp (the idle used by
+    # the hermetic tests) takes effect for the whole loop.
+    op = sample.batch_sampling_repetition_temperature_topk_topp
+    # rand_states is a flat byte tensor of B * rowsize bytes (one contiguous
+    # RNG struct per row, as setup_rand produces); view as [B, rowsize] so
+    # row `b`'s slice is that row's whole contiguous block -- the same byte
+    # range the whole-batch op reads for row `b` -- never a scalar 1-byte slice.
+    row_states = sample_rand_states.reshape(B, -1)
+    with torch.no_grad():
+        for b in range(B):
+            row = op(
+                logits[b : b + 1],
+                penalties[b : b + 1],
+                row_states[b],
+                float(alpha_presence[b]),
+                float(alpha_frequency[b]),
+                float(alpha_decay[b]),
+                float(temperature[b]),
+                int(top_k[b]),
+                float(top_p[b]),
+            )
+            out[b, 0] = row[0]
+    return out
+
+
 if __name__ == "__main__":
     batch_size = 128
     vocab_size = 131072
