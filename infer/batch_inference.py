@@ -3,7 +3,6 @@ import logging
 logger = logging.getLogger("infer.batch")
 
 import asyncio
-import gc
 import json
 import random
 
@@ -249,9 +248,9 @@ class BatchInferenceMixin:
             # (see InferenceEngine.run_periodic_gpu_cleanup). A per-request
             # torch.cuda.empty_cache() was itself a blocking sync in this hot
             # path, so dropping it is the fix, not a cleanup optimization.
-            # bare gc.collect() (non-CUDA, runs on the anyio threadpool for this
-            # blocking core) is kept to preserve Python-reference cleanup.
-            gc.collect()
+            # No gc.collect() here either: these Python refs aren't in cycles
+            # (refcounting frees them) and a threadpool gc.collect() can stall an
+            # in-flight streaming decode.
 
     # -- Shared streaming decode core (with compaction + SSE) ---------------
 
@@ -570,7 +569,9 @@ class BatchInferenceMixin:
             return [generated_text], [finish_reason]
         finally:
             # Per-request empty_cache removed (item 1), see run_periodic_gpu_cleanup.
-            gc.collect()
+            # No gc.collect() (non-cyclic Python refs; a threadpool collect could
+            # stall in-flight streaming on this host).
+            pass
 
     async def batch_infer_stream_state(
         self,
