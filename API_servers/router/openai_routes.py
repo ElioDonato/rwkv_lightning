@@ -28,6 +28,7 @@ from API_servers.router.common import (
     prefill_bsz_limit_response,
     prefill_sse_response,
     reserve_prefill_capacity,
+    resolve_slot,
     watch_disconnect,
 )
 from API_servers.router.schemas import ChatRequest
@@ -374,13 +375,15 @@ async def openai_list_models(request: Request):
 
 @router.post("/openai/v1/chat/completions")
 async def openai_chat_completions(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
     try:
         body = await request.json()
         auth_error = check_openai_auth(request, body, password)
         if auth_error is not None:
             return auth_error
+
+        slot = await resolve_slot(request, body.get("model"))
+        engine = slot.engine
 
         prompt = extract_openai_prompt(body)
         if not prompt and not (body.get("messages") or []):
@@ -401,7 +404,7 @@ async def openai_chat_completions(request: Request):
         # permit, so these branches do NOT use reserve_prefill_capacity /
         # prefill_sse_response. When disabled, the original path is used
         # unchanged (byte-identical).
-        fuse = getattr(request.app.state, "chat_fuse_aggregator", None)
+        fuse = slot.fuse
         # Opt-in DYNAMIC decode batching (RWKV_DYNAMIC_BATCH, Phase 4 sub-step
         # 2): when enabled it takes precedence and routes EVERY chat request
         # through the DynamicBatchDecoder -- a shared multi-row decode with
@@ -409,7 +412,7 @@ async def openai_chat_completions(request: Request):
         # row keeps its own sampler controls). When disabled this branch is
         # skipped, so behavior is byte-identical to today (the original
         # single_infer path, or the fuse path below when that flag is on).
-        dyn = getattr(request.app.state, "chat_dynamic_decoder", None)
+        dyn = slot.dynamic
         if dyn is not None and dyn.enabled:
             cancel_token = CancellationToken()
             dyn_stream = await dyn.submit(

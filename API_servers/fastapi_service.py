@@ -19,9 +19,6 @@ from API_servers.router import (
     v2_router,
 )
 from infer import inference_deps
-from infer.embed_aggregator import EmbedAggregator
-from infer.fuse_aggregator import ChatFuseAggregator
-from infer.dynamic_batch import DynamicBatchDecoder
 from settings import settings
 
 
@@ -42,38 +39,15 @@ def create_app(model_manager, password=None):
             methods = ",".join(sorted(route.methods - {"HEAD", "OPTIONS"}))
             logger.info("  %-20s %s", methods, route.path)
 
-        # Opt-in embed aggregation worker (RWKV_EMBED_AGGREGATE, default-off).
-        # Attached to app.state so the embedding routes route concurrent
-        # /embedding requests through it (shared GPU batches under the opt-in;
-        # byte-identical inline embed_texts when off). Started here, and
-        # stopped (resolving any still-queued requests) when the app shuts down.
-        aggregator = EmbedAggregator(engine.model, engine.tokenizer)
-        app.state.embed_aggregator = aggregator
-        aggregator.start()
-        default.embed = aggregator
-
-        # Opt-in decode combine-queue for /openai/v1/chat/completions
-        # (RWKV_FUSE_CHAT_BATCH, default-off -- item 3). Attached to app.state so
-        # openai_routes can route concurrent chat requests through it (fused
-        # multi-row big_batch_stream decodes under the opt-in; the route uses the
-        # original single_infer path when disabled). start() is a no-op while
-        # disabled; stopped (any queued rows ended) on shutdown.
-        fuse = ChatFuseAggregator(engine)
-        app.state.chat_fuse_aggregator = fuse
-        fuse.start()
-        default.fuse = fuse
-
-        # Opt-in dynamic decode batching for /openai/v1/chat/completions
-        # (RWKV_DYNAMIC_BATCH, default-off -- Phase 4 sub-step 2). Attached to
-        # app.state so openai_routes can route concurrent chat requests through
-        # it (ANY request -- per-row-sampled multi-row shared decode under the
-        # opt-in; the route uses the original single_infer path when disabled,
-        # byte-identical to today). start() is a no-op while disabled; stopped
-        # (pending rows ended + permit capacity released) on shutdown.
-        dyn = DynamicBatchDecoder(engine)
-        app.state.chat_dynamic_decoder = dyn
-        dyn.start()
-        default.dynamic = dyn
+        # Per-model decode machinery for the default engine, started on the running
+        # loop (builds + starts the embed/fuse/dynamic-batch aggregators on this
+        # slot; idempotent). app.state.* keep the historical names so routes that
+        # still read them fall back to the default; the per-request dispatch
+        # resolves the per-model slot via app.state.model_manager.
+        default.ensure_wired()
+        app.state.embed_aggregator = default.embed
+        app.state.chat_fuse_aggregator = default.fuse
+        app.state.chat_dynamic_decoder = default.dynamic
 
         # Single low-frequency background GPU cache cleanup (item 1): replaces
         # the per-request torch.cuda.empty_cache() calls removed from the :8081

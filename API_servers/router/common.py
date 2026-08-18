@@ -110,6 +110,56 @@ def parse_request_model(model_cls, body: dict):
         return None, json_response(400, {"error": f"invalid request: {exc}"})
 
 
+class _DefaultSlotShim:
+    """EngineSlot stand-in for an app that never installs a ModelManager
+    (defensive fallback for isolated tests / harness apps).
+
+    Routes read only ``.id`` / ``.engine`` / ``.embed`` / ``.fuse`` /
+    ``.dynamic`` and call ``.ensure_wired()``. Delegating those to the
+    historical ``app.state`` fields keeps the old single-engine behavior
+    byte-identical when no manager is present."""
+
+    def __init__(self, app_state):
+        self.id = "default"
+        self.engine = getattr(app_state, "engine", None)
+        self.embed = getattr(app_state, "embed_aggregator", None)
+        self.fuse = getattr(app_state, "chat_fuse_aggregator", None)
+        self.dynamic = getattr(app_state, "chat_dynamic_decoder", None)
+        self.ensure_wired = lambda: None
+
+
+async def resolve_slot(request, model_field=None):
+    """Resolve the :class:`EngineSlot` that should serve a request.
+
+    ``request.app.state.model_manager`` (when present) picks a slot by the
+    request's ``model`` field; omitted / empty / unknown model ids map to the
+    default slot and never raise. If no manager is installed, returns a shim
+    over the historical ``app.state`` engine + aggregators. Calls
+    ``slot.ensure_wired()`` on the running loop (idempotent) so the per-model
+    decode aggregators exist before the route drives decode."""
+    manager = getattr(request.app.state, "model_manager", None)
+    if manager is None:
+        return _DefaultSlotShim(request.app.state)
+    if model_field and model_field in manager.ids():
+        slot = await manager.get(model_field)
+    else:
+        slot = await manager.get()
+    slot.ensure_wired()
+    return slot
+
+
+def _default_engine(request):
+    """Synchronous default-slot engine for the prefill/permit accounting
+    helpers. These track overall capacity and are invoked around decode, where
+    the loop must not (re)start aggregators via ensure_wired(); stateless /
+    model-less requests use the default model anyway. Returns ``app.state``
+    engine when no ModelManager exists (shim path)."""
+    manager = getattr(request.app.state, "model_manager", None)
+    if manager is None:
+        return request.app.state.engine
+    return manager.get_slot(manager.default_id).engine
+
+
 def normalize_state_prompts(prompts: list[str], reuse_existing_state: bool) -> list[str]:
     if not reuse_existing_state:
         return prompts
@@ -203,7 +253,7 @@ async def cleanup_disconnect_watcher(
 async def reserve_prefill_capacity(
     request: Request, request_bsz: int, cancel_token: CancellationToken | None = None
 ):
-    engine = request.app.state.engine
+    engine = _default_engine(request)
     queue_cancel_token = cancel_token or CancellationToken()
     watcher = asyncio.create_task(watch_disconnect(request, queue_cancel_token))
     permit = None
@@ -280,7 +330,7 @@ async def _cleanup_prefill_stream_response(
     finally:
         permit = stream_state.get("permit")
         if permit is not None:
-            await request.app.state.engine.release_prefill_permit(
+            await _default_engine(request).release_prefill_permit(
                 request_bsz=request_bsz,
                 request_label=str(request.url.path),
                 ticket=permit["ticket"],
@@ -316,7 +366,7 @@ def prefill_sse_response(
     request_bsz: int,
     on_permit=None,
 ):
-    engine = request.app.state.engine
+    engine = _default_engine(request)
     stream_state = {
         "permit": None,
         "watcher": None,

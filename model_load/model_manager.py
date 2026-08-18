@@ -72,6 +72,7 @@ class EngineSlot:
         self.dynamic = None
         self.fuse = None
         self.embed = None
+        self.wired = False
 
         self.resident = False
         self.last_used = 0.0
@@ -79,6 +80,26 @@ class EngineSlot:
     @property
     def model_name(self) -> str:
         return self.args.MODEL_NAME if self.args is not None else self.path
+
+    def ensure_wired(self):
+        """Build + start this model's decode aggregators (embed, fuse, dynamic
+        batch). MUST be called on the running event loop (the schedulers spawn
+        asyncio tasks via ``.start()``, which binds to the current loop) --
+        routes call it after ``manager.get()`` resolves the slot. Idempotent;
+        no-op before the engine is resident."""
+        if self.wired or self.engine is None:
+            return
+        from infer.embed_aggregator import EmbedAggregator
+        from infer.fuse_aggregator import ChatFuseAggregator
+        from infer.dynamic_batch import DynamicBatchDecoder
+
+        self.embed = EmbedAggregator(self.engine.model, self.engine.tokenizer)
+        self.embed.start()
+        self.fuse = ChatFuseAggregator(self.engine)
+        self.fuse.start()
+        self.dynamic = DynamicBatchDecoder(self.engine)
+        self.dynamic.start()
+        self.wired = True
 
     def __repr__(self):
         return (f"<EngineSlot {self.id} path={self.path} "
@@ -249,6 +270,7 @@ class ModelManager:
         slot.rocm_flag = False
         slot.dynamic = None
         slot.fuse = None
+        slot.wired = False
         slot.resident = False
 
     def _load_blocking(self, slot):

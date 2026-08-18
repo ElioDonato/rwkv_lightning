@@ -20,6 +20,7 @@ from API_servers.router.common import (
     prefill_bsz_limit_response,
     prefill_sse_response,
     reserve_prefill_capacity,
+    resolve_slot,
     run_sync_with_disconnect_watch,
     session_lock,
 )
@@ -31,7 +32,6 @@ router = APIRouter()
 
 @router.post("/state/chat/completions")
 async def state_chat_completions(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
     req, parse_error = parse_request_model(ChatRequest, body)
@@ -47,6 +47,9 @@ async def state_chat_completions(request: Request):
     auth_error = check_password(req.password, password)
     if auth_error is not None:
         return auth_error
+
+    slot = await resolve_slot(request)
+    engine = slot.engine
 
     prompts = req.contents
     state_manager = get_state_manager()
@@ -149,7 +152,6 @@ async def state_chat_completions(request: Request):
 @router.post("/multi_state/chat/completions")
 async def multi_state_chat_completions(request: Request):
     app_state = request.app.state
-    engine = app_state.engine
     password = app_state.password
     body = await request.json()
     req, parse_error = parse_request_model(ChatRequest, body)
@@ -159,6 +161,9 @@ async def multi_state_chat_completions(request: Request):
     auth_error = check_password(req.password, password)
     if auth_error is not None:
         return auth_error
+
+    slot = await resolve_slot(request)
+    engine = slot.engine
 
     if "dialogue_idx" not in body:
         return json_response(400, {"error": "Missing dialogue_idx parameter"})

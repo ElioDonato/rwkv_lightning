@@ -70,6 +70,7 @@ from API_servers.router.common import (
     prefill_bsz_limit_response,
     prefill_sse_response,
     reserve_prefill_capacity,
+    resolve_slot,
     run_sync_with_disconnect_watch,
     session_lock,
 )
@@ -165,7 +166,6 @@ def _build_response_payload(response_id, created_at, model_name, msg_id, text, u
 
 @router.post("/v1/responses")
 async def create_response(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
 
     try:
@@ -176,6 +176,9 @@ async def create_response(request: Request):
     auth_error = check_openai_auth(request, body, password)
     if auth_error is not None:
         return auth_error
+
+    slot = await resolve_slot(request, body.get("model"))
+    engine = slot.engine
 
     req, parse_error = parse_request_model(ResponsesRequest, body)
     if parse_error is not None:

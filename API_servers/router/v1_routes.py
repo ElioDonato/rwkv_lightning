@@ -16,6 +16,7 @@ from API_servers.router.common import (
     prefill_bsz_limit_response,
     prefill_sse_response,
     reserve_prefill_capacity,
+    resolve_slot,
     run_sync_with_disconnect_watch,
 )
 from API_servers.router.openai_routes import format_openai_prompt
@@ -44,7 +45,8 @@ def create_translation_prompt(source_lang, target_lang, text):
 
 @router.get("/v1/models")
 async def list_models(request: Request):
-    engine = request.app.state.engine
+    slot = await resolve_slot(request)
+    engine = slot.engine
     model_name = engine.args.MODEL_NAME.split("/")[-1]
     return {
         "object": "list",
@@ -54,7 +56,6 @@ async def list_models(request: Request):
 
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
     req, parse_error = parse_request_model(ChatRequest, body)
@@ -64,6 +65,9 @@ async def chat_completions(request: Request):
     auth_error = check_password(req.password, password)
     if auth_error is not None:
         return auth_error
+
+    slot = await resolve_slot(request, body.get("model"))
+    engine = slot.engine
 
     prefix_cache_manager = get_state_manager() if req.use_prefix_cache else None
 
@@ -128,7 +132,6 @@ async def chat_completions(request: Request):
 
 @router.post("/translate/v1/batch-translate")
 async def batch_translate(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
     req, parse_error = parse_request_model(TranslateRequest, body)
@@ -138,6 +141,9 @@ async def batch_translate(request: Request):
     auth_error = check_password(req.password, password)
     if auth_error:
         return auth_error
+
+    slot = await resolve_slot(request, body.get("model"))
+    engine = slot.engine
 
     prompts = [
         create_translation_prompt(req.source_lang, req.target_lang, text)
@@ -186,7 +192,6 @@ async def batch_translate(request: Request):
 
 @router.post("/FIM/v1/batch-FIM")
 async def fim_completions(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
     req, parse_error = parse_request_model(ChatRequest, body)
@@ -196,6 +201,9 @@ async def fim_completions(request: Request):
     auth_error = check_password(req.password, password)
     if auth_error is not None:
         return auth_error
+
+    slot = await resolve_slot(request, body.get("model"))
+    engine = slot.engine
 
     prompts = []
     for prefix, suffix in zip(req.prefix, req.suffix):
@@ -260,7 +268,6 @@ async def fim_completions(request: Request):
 
 @router.post("/big_batch/completions")
 async def big_batch_completions(request: Request):
-    engine = request.app.state.engine
     password = request.app.state.password
     body = await request.json()
     req, parse_error = parse_request_model(ChatRequest, body)
@@ -270,6 +277,9 @@ async def big_batch_completions(request: Request):
     auth_error = check_password(req.password, password)
     if auth_error is not None:
         return auth_error
+
+    slot = await resolve_slot(request, body.get("model"))
+    engine = slot.engine
 
     if req.chats:
         prompts = [format_openai_prompt(chat, req.enable_think) for chat in req.chats]
