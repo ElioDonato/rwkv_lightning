@@ -28,7 +28,8 @@ def _load_models_config(path):
     if isinstance(data, dict):
         meta = {
             k: data.get(k)
-            for k in ("default_model", "embed_model")
+            for k in ("default_model", "embed_model",
+                      "max_resident_bytes", "max_resident_models")
         }
         data = data.get("models", [])
     if not isinstance(data, list) or not data:
@@ -105,11 +106,20 @@ def main():
     args_cli, configs, meta = parse_args()
     default_id = args_cli.default_model or meta.get("default_model")
     embed_id = args_cli.embed_model or meta.get("embed_model")
+    # Concurrency caps for the simultaneously-resident models (model footprint,
+    # not the CUDA allocator cache). Precedence: env > models.json > unlimited.
+    max_resident_bytes = int(
+        os.getenv("RWKV_MAX_RESIDENT_BYTES") or meta.get("max_resident_bytes") or 0
+    )
+    max_resident_models = int(
+        os.getenv("RWKV_MAX_RESIDENT_MODELS") or meta.get("max_resident_models") or 0
+    )
     manager = ModelManager(
         configs,
         default_id=default_id,
         embed_id=embed_id,
-        max_resident_bytes=int(os.getenv("RWKV_MAX_RESIDENT_BYTES", "0") or 0),
+        max_resident_bytes=max_resident_bytes,
+        max_resident_models=max_resident_models,
     )
     # Load the default model at startup (same behavior as the old single-model
     # boot). Additional models from the catalog are loaded lazily on request.

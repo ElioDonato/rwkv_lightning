@@ -30,6 +30,12 @@ from pathlib import Path
 logger = logging.getLogger("model.manager")
 
 
+class ModelCapacityError(Exception):
+    """Raised when a model load cannot satisfy the configured concurrency caps
+    (max_resident_models / max_resident_bytes) even after evicting the
+    least-recently-used non-default models."""
+
+
 def _slug(path: str) -> str:
     """Default model id = file/leaf basename without extension."""
     return Path(path).stem
@@ -113,11 +119,14 @@ class EngineSlot:
 
 class ModelManager:
     def __init__(self, models_config, default_id=None, max_resident_bytes=0,
-                 embed_id=None):
-        """``models_config``: list of model dicts. ``max_resident_bytes``: hard
-        VRAM budget (0 = no enforced budget). ``embed_id``: optional model id
-        that the embedding endpoints use by default (when a request has no
-        explicit ``model``); falls back to the default model when None."""
+                 embed_id=None, max_resident_models=0):
+        """``models_config``: list of model dicts. Concurrency caps (0 = unlimited):
+        ``max_resident_bytes``: max resident VRAM footprint for the concurrently
+        loaded models (the models' weight+decode footprint, not the CUDA
+        allocator cache); ``max_resident_models``: max simultaneously resident
+        model count. ``embed_id``: optional model id that the embedding endpoints
+        use by default (when a request has no explicit ``model``); falls back to
+        the default model when None."""
         self._by_id = {}
         for cfg in models_config:
             cfg = dict(cfg)
@@ -143,6 +152,7 @@ class ModelManager:
             m.is_default = m.id == self._default_id
 
         self._max_resident_bytes = int(max_resident_bytes or 0)
+        self._max_resident_models = int(max_resident_models or 0)
         self._lock = asyncio.Lock()  # serializes load/unload bookkeeping
 
     # -- catalog -------------------------------------------------------------
@@ -217,10 +227,20 @@ class ModelManager:
             if slot.resident:
                 slot.last_used = asyncio.get_event_loop().time()
                 return slot
-            # Make room under the budget before loading the new model.
-            if self._max_resident_bytes:
-                needed = slot.vram_bytes
-                await self._evict_for(needed)
+            # The default model always loads (it backs un-issued 'model' requests
+            # and the server boots on it); concurrency caps apply to ADDITIONAL
+            # models. Without a cap the old unlimited behavior is unchanged.
+            if not slot.is_default and (
+                self._max_resident_bytes or self._max_resident_models
+            ):
+                if not await self._make_room(slot):
+                    raise ModelCapacityError(
+                        f"cannot load model {slot.id!r}: would exceed the "
+                        f"configured concurrency caps (max_resident_bytes="
+                        f"{self._max_resident_bytes}, max_resident_models="
+                        f"{self._max_resident_models}, resident="
+                        f"{len(self.resident_ids())})"
+                    )
             await asyncio.to_thread(self._load_blocking, slot)
             slot.last_used = asyncio.get_event_loop().time()
             slot.resident = True
@@ -246,29 +266,48 @@ class ModelManager:
 
     # -- internals -----------------------------------------------------------
 
-    async def _evict_for(self, needed_bytes):
-        """Unload the LRU resident models (not the one being loaded) until the
-        current resident bytes + needed fit the budget. No-op if insufficient
-        headroom is impossible (budget smaller than the model itself)."""
-        if self.resident_bytes + needed_bytes <= self._max_resident_bytes:
-            return
-        to_evict = sorted(
+    async def _make_room(self, slot):
+        """Evict the least-recently-used non-default resident models until the
+        new ``slot`` fits under BOTH configured caps (max_resident_bytes and
+        max_resident_models). Returns True if it fits (or there are no caps),
+        False if it can't (a hard cap would be exceeded even after evicting
+        everything non-default)."""
+        if not self._max_resident_bytes and not self._max_resident_models:
+            return True
+        evictable = sorted(
             (s for s in self._by_id.values()
              if s.resident and s.cfg["id"] != self._default_id),
             key=lambda s: s.last_used,
         )
-        for slot in to_evict:
-            if self.resident_bytes + needed_bytes <= self._max_resident_bytes:
+
+        def fits():
+            if self._max_resident_bytes and \
+                    self.resident_bytes + slot.vram_bytes > self._max_resident_bytes:
+                return False
+            if self._max_resident_models and \
+                    len(self.resident_ids()) + 1 > self._max_resident_models:
+                return False
+            return True
+
+        for candidate in evictable:
+            if fits():
                 break
-            await self._unload_slot(slot)
-        if self.resident_bytes + needed_bytes > self._max_resident_bytes:
+            await self._unload_slot(candidate)
+        if not fits():
             logger.warning(
-                "[ModelManager] cannot fit %dMiB within budget %dMiB "
-                "(only %dMiB resident to evict); model may fail to allocate",
-                needed_bytes // (1024*1024),
-                self._max_resident_bytes // (1024*1024),
-                (self.resident_bytes - needed_bytes) // (1024*1024),
+                "[ModelManager] cannot make room under caps for %s "
+                "(bytes %dMiB/%d, models %d/%d, resident=%s); refusing load",
+                slot.id,
+                (self.resident_bytes + slot.vram_bytes) // (1024*1024)
+                if self._max_resident_bytes else 0,
+                self._max_resident_bytes // (1024*1024)
+                if self._max_resident_bytes else 0,
+                len(self.resident_ids()) + 1,
+                self._max_resident_models,
+                self.resident_ids(),
             )
+            return False
+        return True
 
     async def _unload_slot(self, slot):
         if not slot.resident:

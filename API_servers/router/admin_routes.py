@@ -14,6 +14,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from API_servers.router.common import check_openai_auth
+from model_load.model_manager import ModelCapacityError
 
 router = APIRouter(prefix="/admin/models", tags=["admin"])
 
@@ -76,6 +77,9 @@ async def load_model(request: Request):
         )
     try:
         slot = await manager.load(mid)
+    except ModelCapacityError as exc:
+        # Hard concurrency/VRAM cap reached -> informative 409 (not a 500).
+        return JSONResponse(status_code=409, content={"error": str(exc)})
     except Exception as exc:  # e.g. VRAM allocation failure
         return JSONResponse(status_code=500, content={"error": str(exc)})
     return {
