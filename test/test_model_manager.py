@@ -6,6 +6,7 @@ for a fake that just marks the slot resident (no torch/model load involved), so
 it runs in any plain venv without a GPU or checkpoint.
 """
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,7 +18,7 @@ def _fake_load(marker_engine):
         class _FakeEngine:
             def __init__(self):
                 self.marker = marker_engine
-
+                self.model = SimpleNamespace(co_resident_reserved_bytes=0)
         slot.engine = _FakeEngine()
     return _load
 
@@ -164,3 +165,22 @@ def test_max_resident_models_refuses_when_no_room(monkeypatch):
     with pytest.raises(ModelCapacityError):
         _run(m.load("b"))
     assert m.resident_ids() == ["a"]
+
+
+def test_co_resident_vram_reservations_update(monkeypatch):
+    monkeypatch.setattr(ModelManager, "_load_blocking", _fake_load("A"))
+    cfg = [
+        {"id": "a", "path": "/x/a.pth", "vram_bytes": 1000},
+        {"id": "b", "path": "/x/b.pth", "vram_bytes": 2000},
+    ]
+    m = ModelManager(cfg, default_id="a")
+    # single-model: no co-resident -> reservation 0
+    _run(m.load("a"))
+    assert m.get_slot("a").engine.model.co_resident_reserved_bytes == 0
+    # load b: each reserves the OTHER model's weight footprint
+    _run(m.load("b"))
+    assert m.get_slot("a").engine.model.co_resident_reserved_bytes == 2000
+    assert m.get_slot("b").engine.model.co_resident_reserved_bytes == 1000
+    # unload b: a's reservation drops back to 0
+    _run(m.unload("b"))
+    assert m.get_slot("a").engine.model.co_resident_reserved_bytes == 0

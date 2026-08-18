@@ -252,7 +252,13 @@ class RWKV_x070(MyModule):
 
         bytes_per_bsz = state_bytes_per_bsz + token_bytes_per_bsz + logits_bytes_per_bsz + prefill_workspace_bytes_per_bsz
         reserve_bytes = max(512 * 1024 * 1024, free_bytes // 10)
-        usable_bytes = max(0, free_bytes - reserve_bytes)
+        # In multi-model mode the ModelManager pins each co-resident model's
+        # WEIGHT footprint to model.co_resident_reserved_bytes, so every engine
+        # budgets headroom for the other residents' weights in addition to its
+        # own (free mem already excludes them -- subtracting again is conservative
+        # and prevents combined over-admission / OOM). Zero / unset -> single model.
+        co_reserved = getattr(self, "co_resident_reserved_bytes", 0) or 0
+        usable_bytes = max(0, free_bytes - reserve_bytes - co_reserved)
 
         self.prefill_free_vram_bytes = int(free_bytes)
         self.prefill_total_vram_bytes = int(total_bytes)

@@ -244,6 +244,7 @@ class ModelManager:
             await asyncio.to_thread(self._load_blocking, slot)
             slot.last_used = asyncio.get_event_loop().time()
             slot.resident = True
+            self._update_co_resident_reservations()
             logger.info("[ModelManager] loaded %s engine=%s vram~%dMiB "
                         "resident=%s", slot.id, slot.inference_engine,
                         slot.vram_bytes // (1024*1024), self.resident_ids())
@@ -265,6 +266,22 @@ class ModelManager:
         await self.unload_all()
 
     # -- internals -----------------------------------------------------------
+
+    def _update_co_resident_reservations(self):
+        """After any load/unload, pin each resident engine's
+        ``model.co_resident_reserved_bytes`` to the WEIGHT footprint of the other
+        co-resident models. `refresh_max_prefill_bsz` subtracts this so each
+        engine budgets headroom for co-residents and combined admission can't
+        over-subscribe the GPU (prevents cross-model OOM)."""
+        resident = [s for s in self._by_id.values()
+                    if s.resident and s.engine is not None]
+        for slot in resident:
+            others = sum(s2.vram_bytes for s2 in resident if s2 is not slot)
+            try:
+                slot.engine.model.co_resident_reserved_bytes = int(others)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("[ModelManager] set co-resident reservation for "
+                               "%s failed: %s", slot.id, exc)
 
     async def _make_room(self, slot):
         """Evict the least-recently-used non-default resident models until the
@@ -336,6 +353,9 @@ class ModelManager:
         slot.fuse = None
         slot.wired = False
         slot.resident = False
+        # Remaining co-resident engines must now reserve headroom for one model
+        # fewer -- update them before returning.
+        self._update_co_resident_reservations()
         # Return the model's freed blocks to the driver so "unload" actually
         # frees VRAM (nvidia-smi drops). This is a blocking sync -- fine for a
         # rare management/eviction op, and serialized so it never races an
