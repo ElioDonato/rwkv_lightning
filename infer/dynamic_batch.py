@@ -79,6 +79,7 @@ from collections import deque
 from settings import settings
 
 from infer import inference_deps
+from infer.cuda_graph_decode import CudaGraphForward
 from infer.fuse_aggregator import _InlineFuseStream
 
 logger = logging.getLogger("infer.dynamic_batch")
@@ -260,6 +261,18 @@ class DynamicBatchDecoder:
         self._task = None
         self._next_request_id = 0
         self._dead_warned = False
+        # Phase 5: opt-in CUDA-graph replay of the decode forward. Only built when
+        # the dynamic decoder itself is enabled; otherwise the seam is None and the
+        # decode step calls the raw forward_batch, byte-identical to pre-Phase-5.
+        # It is lazy (captures on its first forward call) so the first decode step
+        # pays a one-time warm+capture cost, then every later token replays the
+        # graph instead of re-launching the kernel set. max_bsz defaults to the
+        # fuse/dynamic setting ceiling via CudaGraphForward's own resolution.
+        self._cgf = (
+            CudaGraphForward(engine.model, enabled=True, max_bsz=self._max_bsz)
+            if self._enabled
+            else None
+        )
 
     # -- properties ---------------------------------------------------------
 
@@ -505,9 +518,16 @@ class DynamicBatchDecoder:
                     running.row_alpha_frequency,
                     running.row_alpha_decay,
                 )
-                new_out = engine.model.forward_batch(
-                    new_tokens_t, running.state
-                ).float()
+                if self._cgf is None:
+                    # Default/disabled path: raw forward_batch, byte-identical to
+                    # pre-Phase-5. Graph enabled: replay the captured graph (sample
+                    # stays here, eager, OUTSIDE the graph -- host sync inside a
+                    # captured region is illegal; .tolist() is also outside).
+                    new_out = engine.model.forward_batch(
+                        new_tokens_t, running.state
+                    ).float()
+                else:
+                    new_out = self._cgf.forward(new_tokens_t, running.state)
                 new_tokens = new_tokens_t.tolist()
                 return new_out, new_tokens
 
