@@ -1,6 +1,6 @@
 """
-Server-side DECODE COMBINE-QUEUE for /openai/v1/chat/completions (the :8081
-occupancy lever).
+Server-side DECODE COMBINE-QUEUE for /openai/v1/chat/completions (the chat
+endpoint occupancy lever).
 
 Today every /openai/v1/chat/completions request runs a bsz=1 decode, so N
 concurrent requests re-serialize on the event-loop thread at bsz=1 and the GPU
@@ -21,8 +21,9 @@ Design
   the ORIGINAL ``single_infer_stream`` path (window=0 -> byte-identical latency
   AND output/latency to today for an isolated request -- no added gather latency,
   same repetition-penalty sampler). Only when >=2 jobs are pending at a drain
-  point does the scheduler open the gather window (``RWKV_FUSE_CHAT_WINDOW_MS``)
-  to collect more homogeneous siblings into ONE shared ``big_batch_stream``
+  point does the scheduler open the gather window (sized by the central
+  ``settings`` module) to collect more homogeneous siblings into ONE shared
+  ``big_batch_stream``
   decode.
 * **Homogeneity gate**: ``big_batch_stream`` takes ONE temperature / max_tokens
   / stop_tokens for the batch, so only requests that AGREE on all three
@@ -35,8 +36,8 @@ Design
 * **VRAM cap**: the fused batch acquires ONE prefill-admission permit for its
   full row count (``engine.acquire_prefill_permit(request_bsz=len(batch))``), so
   the shared admission budget caps it, AND a hard cap on fused rows
-  (``RWKV_FUSE_CHAT_MAX_BSZ``, default 8) bounds a huge concurrent burst so it
-  can never OOM a co-resident process. big_batch_stream's per-row compaction
+  (``settings.fuse_chat_max_bsz``, default 8) bounds a huge concurrent burst so
+  it can never OOM a co-resident process. big_batch_stream's per-row compaction
   incremental-release (permit_box) hands freed row capacity back to the shared
   pool as rows finish.
 * **Cancellation**: one row's disconnect marks that row's job cancelled -- the
@@ -84,7 +85,8 @@ traffic fuses; an EXPLICIT ``use_prefix_cache=True`` stays solo-faithful.
 **Fusion requires sustained concurrent arrivals** (>decode-duration
 inter-arrival): a request arriving at an EMPTY queue head-fires solo and sees
 no fusion latency; only when >=2 homogeneous jobs are pending at a drain point
-does the scheduler open the ``RWKV_FUSE_CHAT_WINDOW_MS`` gather window. A
+does the scheduler open the gather window (sized by the central ``settings``
+module). A
 low-traffic endpoint therefore gets little occupancy benefit and only the
 (temperature-only) sampler divergence above for rows that ARE fused. For the
 deletion/extraction workload -- which shares an identical prompt template +
@@ -95,7 +97,7 @@ sampling byte-for-byte must not enable the flag.
 Default-OFF
 -----------
 Matching Mod A (``RWKV_ASYNC_FORWARD``) and Mod B (``RWKV_EMBED_AGGREGATE``)
-precedent. When off (``RWKV_FUSE_CHAT_BATCH`` unset/0, the default) the
+precedent. When off (the central ``settings`` flag, default off) the
 edge route never calls into the aggregator (it uses the original
 single_infer/single_infer_stream path), and ``submit()`` itself is a pure inline
 ``single_infer_stream`` proxy -- no queue, no scheduler, byte-identical latency
@@ -109,46 +111,11 @@ event-loop thread, exactly where the chat endpoint already runs.
 import asyncio
 import json
 import logging
-import os
 from collections import deque
 
+from settings import settings
+
 logger = logging.getLogger("infer.fuse_aggregator")
-
-_FUSE_ENV = "RWKV_FUSE_CHAT_BATCH"
-_FUSE_DEFAULT = "0"
-_WINDOW_MS_ENV = "RWKV_FUSE_CHAT_WINDOW_MS"
-# Conservative: the window only ever delays requests that ALREADY have a
-# sibling pending (the head-fire guard fires a lone request immediately), and it
-# must only cover the few ms it takes a concurrent burst's requests to arrive.
-_WINDOW_MS_DEFAULT = 5
-_MAX_BSZ_ENV = "RWKV_FUSE_CHAT_MAX_BSZ"
-# Hard ceiling on fused rows per shared big_batch_stream call. 8 concurrent
-# chats is already a large occupancy gain over bsz=1 while bounding the VRAM
-# spike of one fused batch against a co-resident :8083.
-_MAX_BSZ_DEFAULT = 8
-
-# Sampler controls the fused big_batch_stream path IGNORES (gumbel temp-only):
-# top_k / top_p / alpha_presence / alpha_frequency / alpha_decay. These are the
-# exact defaults the /openai/v1/chat/completions route applies when the request
-# body omits them (build_internal_chat_request). A job carrying any NON-default
-# on these is marked not-fusable so it never shares a batch (never silently
-# drops a user's distinct sampler setting into ONE shared temp-only decode);
-# see the FULL SAMPLING / PREFIX CONTRACT in the module docstring.
-_FUSE_TOP_K_DEFAULT = 20
-_FUSE_TOP_P_DEFAULT = 0.6
-_FUSE_ALPHA_PRESENCE_DEFAULT = 1.0
-_FUSE_ALPHA_FREQUENCY_DEFAULT = 0.1
-_FUSE_ALPHA_DECAY_DEFAULT = 0.996
-
-_PENDING_CAP_ENV = "RWKV_FUSE_CHAT_PENDING_CAP"
-# Upper bound on the FIFO pending deque. The scheduler drains it every few ms
-# during normal operation (it only ever holds jobs not yet admitted to a batch),
-# so this cap ONLY trips on overload: arrivals landing faster than the
-# decoder's slowest batch takes to drain under a burst. At capacity a new
-# submit is REJECTED (served inline solo through single_infer_stream) rather
-# than buffered unboundedly -- the caller falls back to the solo path, exactly
-# the graceful-degrade the embed aggregator's hard-ceiling cap provides.
-_PENDING_CAP_DEFAULT = 64
 
 # Job-queue terminal sentinel (asyncio.Queue can't hold a bare None that
 # collides with real data, so use a unique object).
@@ -159,54 +126,32 @@ def _fuse_enabled(enabled=None) -> bool:
     """Resolve the opt-in, honoring an explicit override (used by tests)."""
     if enabled is not None:
         return bool(enabled)
-    raw = os.environ.get(_FUSE_ENV, _FUSE_DEFAULT)
-    try:
-        return bool(int(raw))
-    except (TypeError, ValueError):
-        logger.warning(f"[ChatFuse] invalid {_FUSE_ENV}={raw!r}, treating as off")
-        return False
+    return bool(settings.fuse_chat_batch)
 
 
 def _window_seconds(window_ms=None) -> float:
-    """Gather window in seconds (>= 0). Explicit override wins over env."""
+    """Gather window in seconds (>= 0). Explicit override wins over settings."""
     if window_ms is not None:
         return max(0.0, int(window_ms)) / 1000.0
-    raw = os.environ.get(_WINDOW_MS_ENV, str(_WINDOW_MS_DEFAULT))
-    try:
-        return max(0.0, int(raw) / 1000.0)
-    except (TypeError, ValueError):
-        logger.warning(f"[ChatFuse] invalid {_WINDOW_MS_ENV}={raw!r}, "
-                       f"using {_WINDOW_MS_DEFAULT}ms")
-        return _WINDOW_MS_DEFAULT / 1000.0
+    return max(0.0, int(settings.fuse_chat_window_ms)) / 1000.0
 
 
 def _max_bsz_value(max_bsz=None) -> int:
-    """Hard cap on fused rows. Explicit override wins over env; always int>=1."""
+    """Hard cap on fused rows. Explicit override wins over settings; always
+    int>=1."""
     if max_bsz is not None:
         cap = int(max_bsz)
     else:
-        raw = os.environ.get(_MAX_BSZ_ENV, str(_MAX_BSZ_DEFAULT))
-        try:
-            cap = int(raw)
-        except (TypeError, ValueError):
-            logger.warning(f"[ChatFuse] invalid {_MAX_BSZ_ENV}={raw!r}, "
-                           f"using {_MAX_BSZ_DEFAULT}")
-            cap = _MAX_BSZ_DEFAULT
+        cap = int(settings.fuse_chat_max_bsz)
     return max(1, cap)
 
 
 def _pending_cap_value(pending_cap=None) -> int:
     """Pending-deque upper bound (reject-buffering capacity). Explicit override
-    wins over env; always int>=1 so the queue is never unbounded."""
+    wins over settings; always int>=1 so the queue is never unbounded."""
     if pending_cap is not None:
         return max(1, int(pending_cap))
-    raw = os.environ.get(_PENDING_CAP_ENV, str(_PENDING_CAP_DEFAULT))
-    try:
-        return max(1, int(raw))
-    except (TypeError, ValueError):
-        logger.warning(f"[ChatFuse] invalid {_PENDING_CAP_ENV}={raw!r}, "
-                       f"using {_PENDING_CAP_DEFAULT}")
-        return _PENDING_CAP_DEFAULT
+    return max(1, int(settings.fuse_chat_pending_cap))
 
 
 class _ChatJob:
@@ -253,11 +198,11 @@ class _ChatJob:
         # (they run solo through _run_solo / the temp-only head-fire path).
         self.fusable = (
             not use_prefix_cache
-            and top_k == _FUSE_TOP_K_DEFAULT
-            and top_p == _FUSE_TOP_P_DEFAULT
-            and alpha_presence == _FUSE_ALPHA_PRESENCE_DEFAULT
-            and alpha_frequency == _FUSE_ALPHA_FREQUENCY_DEFAULT
-            and alpha_decay == _FUSE_ALPHA_DECAY_DEFAULT
+            and top_k == settings.fuse_sampler_top_k
+            and top_p == settings.fuse_sampler_top_p
+            and alpha_presence == settings.fuse_sampler_alpha_presence
+            and alpha_frequency == settings.fuse_sampler_alpha_frequency
+            and alpha_decay == settings.fuse_sampler_alpha_decay
         )
         self.queue = asyncio.Queue()
         self.cancelled = False
@@ -275,10 +220,11 @@ class _InlineFuseStream:
     shared VRAM admission budget when it fires on a sustained burst."""
 
     def __init__(self, engine, prompt, max_tokens, temperature, stop_tokens,
-                 chunk_size, top_k=_FUSE_TOP_K_DEFAULT, top_p=_FUSE_TOP_P_DEFAULT,
-                 alpha_presence=_FUSE_ALPHA_PRESENCE_DEFAULT,
-                 alpha_frequency=_FUSE_ALPHA_FREQUENCY_DEFAULT,
-                 alpha_decay=_FUSE_ALPHA_DECAY_DEFAULT,
+                 chunk_size, top_k=settings.fuse_sampler_top_k,
+                 top_p=settings.fuse_sampler_top_p,
+                 alpha_presence=settings.fuse_sampler_alpha_presence,
+                 alpha_frequency=settings.fuse_sampler_alpha_frequency,
+                 alpha_decay=settings.fuse_sampler_alpha_decay,
                  use_prefix_cache=False, prefix_cache_manager=None):
         self._engine = engine
         self._params = dict(
@@ -383,8 +329,8 @@ class _QueuedFuseStream:
 class ChatFuseAggregator:
     """Bounded admission/combine worker for the chat endpoint.
 
-    Enabled (opt-in via RWKV_FUSE_CHAT_BATCH): concurrent ``submit()`` calls are
-    drained into shared multi-row ``big_batch_stream`` decodes (solo requests
+    Enabled (opt-in via the central ``settings`` flag): concurrent ``submit()``
+    calls are drained into shared multi-row ``big_batch_stream`` decodes (solo requests
     head-fire through ``single_infer_stream``). Disabled (default): ``submit()``
     is a pure inline ``single_infer_stream`` proxy.
 
@@ -439,7 +385,7 @@ class ChatFuseAggregator:
             # and match fuse=OFF. See the FULL SAMPLING / PREFIX CONTRACT docstring.
             self._gumbel_warned = True
             logger.warning(
-                "[ChatFuse] RWKV_FUSE_CHAT_BATCH enabled: FUSED rows are sampled "
+                "[ChatFuse] chat-fuse enabled: FUSED rows are sampled "
                 "with gumbel TEMPERATURE-only sampling (top_k/top_p/alpha/"
                 "repetition-penalty and prefix caching IGNORED for fused rows). "
                 "SOLO requests (head-fire, or non-homogeneous/non-fusable) keep "
@@ -469,11 +415,11 @@ class ChatFuseAggregator:
     # -- request-facing API -------------------------------------------------
 
     async def submit(self, prompt, max_tokens, temperature, stop_tokens, chunk_size,
-                     top_k=_FUSE_TOP_K_DEFAULT,
-                     top_p=_FUSE_TOP_P_DEFAULT,
-                     alpha_presence=_FUSE_ALPHA_PRESENCE_DEFAULT,
-                     alpha_frequency=_FUSE_ALPHA_FREQUENCY_DEFAULT,
-                     alpha_decay=_FUSE_ALPHA_DECAY_DEFAULT,
+                     top_k=settings.fuse_sampler_top_k,
+                     top_p=settings.fuse_sampler_top_p,
+                     alpha_presence=settings.fuse_sampler_alpha_presence,
+                     alpha_frequency=settings.fuse_sampler_alpha_frequency,
+                     alpha_decay=settings.fuse_sampler_alpha_decay,
                      use_prefix_cache=False, prefix_cache_manager=None):
         """Enqueue a chat request and return a fuse stream (async-iterable of SSE
         chunk strings; ``cancel()`` marks the request's row dropped).
@@ -490,7 +436,7 @@ class ChatFuseAggregator:
         ``prefix_cache_manager`` is only used by the SOLO paths (forwarded into
         ``single_infer_stream``); the FUSED path has no prefix-cache wiring.
 
-        When the pending deque is at capacity (``RWKV_FUSE_CHAT_PENDING_CAP``,
+        When the pending deque is at capacity (``settings.fuse_chat_pending_cap``,
         default 64) a new submit is REJECTED: instead of buffering unboundedly
         under a burst it returns an inline solo ``single_infer_stream`` proxy,
         so the caller's request is served immediately by the original solo path

@@ -12,23 +12,44 @@ import uvicorn
 from API_servers.fastapi_service import create_app
 from infer.inference import InferenceEngine
 from model_load.model_loader import INFERENCE_ENGINES, load_model_and_tokenizer
+from settings import settings
 from state_manager.state_pool import shutdown_state_manager
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str, required=True, help="RWKV model path")
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=settings.model_path,
+        help="RWKV model path (default: RWKV_MODEL_PATH env)",
+    )
     parser.add_argument(
         "--inference-engine",
         "--backend",
         dest="inference_engine",
         choices=INFERENCE_ENGINES,
-        default="fp16",
+        default=settings.inference_engine,
         help="model backend: fp16, GemLite packed quantization, or CUTLASS W8A16",
     )
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--password", type=str, default=None, help="API password for authentication")
-    return parser.parse_args()
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=settings.port,
+        help="port to serve on (default: RWKV_PORT env, or 8000)",
+    )
+    parser.add_argument(
+        "--password",
+        type=str,
+        default=settings.api_password,
+        help="API password for authentication (default: RWKV_API_PASSWORD env)",
+    )
+    args = parser.parse_args()
+    if not args.model_path:
+        parser.error(
+            "--model-path is required; pass it or set the RWKV_MODEL_PATH env var"
+        )
+    return args
 
 
 def main():
@@ -53,7 +74,7 @@ def main():
     signal.signal(signal.SIGTERM, cleanup_handler)
     atexit.register(cleanup_at_exit)
 
-    uvicorn.run(app, host="0.0.0.0", port=args_cli.port)
+    uvicorn.run(app, host=settings.host, port=args_cli.port)
 
 
 if __name__ == "__main__":

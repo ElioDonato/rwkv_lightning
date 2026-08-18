@@ -18,3 +18,9 @@ models/
 *.log
 
 infer/rwkv_batch/cuda/third_party/cutlass/*
+
+# local agent worktrees (not project source)
+.qwen-wt/
+
+# generated training datasets (not checkpoint state)
+state_tune/data/*

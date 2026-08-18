@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import os
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from threading import Lock
@@ -22,6 +21,7 @@ from API_servers.router import (
 from infer import inference_deps
 from infer.embed_aggregator import EmbedAggregator
 from infer.fuse_aggregator import ChatFuseAggregator
+from settings import settings
 
 
 def create_app(engine, password=None):
@@ -76,12 +76,11 @@ def create_app(engine, password=None):
 
     app = FastAPI(lifespan=lifespan)
     # RWKV_CORS_ORIGINS: comma-separated allowlist, e.g. "http://localhost:3000,https://app.example.com"
-    # Default "*" preserves prior behavior for trusted-LAN deployments.
-    cors_origins_env = os.environ.get("RWKV_CORS_ORIGINS", "*").strip()
-    cors_origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()] or ["*"]
+    # Default "*" preserves prior behavior for trusted-LAN deployments. Read from the
+    # central settings module (single source of truth for the knob).
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=cors_origins,
+        allow_origins=settings.cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )

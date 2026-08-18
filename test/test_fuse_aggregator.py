@@ -573,7 +573,7 @@ async def test_default_solo_passes_route_top_k_20_not_50():
     agg = ChatFuseAggregator(engine, enabled=True, window_ms=0, max_bsz=8)
     agg.start()
 
-    # Default top_k (submit default = _FUSE_TOP_K_DEFAULT = 20); lone -> solo.
+    # Default top_k (submit default = settings.fuse_sampler_top_k = 20); lone -> solo.
     stream = await agg.submit("d", 32, 1.0, ["\nUser:"], 2)
     await _drain(stream)
 

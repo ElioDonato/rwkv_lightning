@@ -3,8 +3,9 @@ import logging
 logger = logging.getLogger("infer.engine")
 
 import asyncio
-import os
 from collections import deque
+
+from settings import settings
 
 from infer import inference_deps
 from infer.async_forward import GpuAsyncExecutor
@@ -77,19 +78,19 @@ class InferenceEngine(
             return await executor.offload(fn, *args, **kwargs)
         return fn(*args, **kwargs)
 
-    # Env/interval for the single low-frequency background GPU cache cleanup that
+    # Interval for the single low-frequency background GPU cache cleanup that
     # replaces the per-request torch.cuda.empty_cache() calls removed in item 1.
     # The CUDA allocator re-uses freed blocks between requests, so draining the
     # cache this rarely is enough for steady-state workloads while still
-    # sometimes giving VRAM back to a co-resident process (e.g. the :8083
-    # embedding server) instead of holding onto every block forever.
-    _GPU_CLEANUP_INTERVAL_ENV = "RWKV_GPU_CLEANUP_INTERVAL_S"
-    _GPU_CLEANUP_INTERVAL_DEFAULT = 60.0
+    # sometimes giving VRAM back to a co-resident embedding server instead of
+    # holding onto every block forever. The interval comes from the central
+    # settings module (settings.gpu_cleanup_interval_s, env
+    # RWKV_GPU_CLEANUP_INTERVAL_S).
 
     async def run_periodic_gpu_cleanup(self, interval_s=None):
         """ONE low-frequency background task that calls ``_cleanup_cuda_memory``
         (torch.cuda.synchronize + empty_cache) on a fixed cadence, replacing the
-        now-removed per-request empty_cache calls in the >:8081 decode hot path
+        now-removed per-request empty_cache calls in the decode hot path
         (see item 1).
 
         ``_cleanup_cuda_memory`` is routed through the same ``_offload_gpu`` seam
@@ -102,22 +103,15 @@ class InferenceEngine(
         Designed to run as a server-lifespan background task (started in
         fastapi_service.lifespan, cancelled on shutdown). It loops forever, so a
         caller must cancel the asyncio task to stop it. ``interval_s`` defaults to
-        the ``RWKV_GPU_CLEANUP_INTERVAL_S`` env (60s); an explicit value is used
-        by tests.
+        ``settings.gpu_cleanup_interval_s`` (env RWKV_GPU_CLEANUP_INTERVAL_S,
+        60s); an explicit value is used by tests.
         """
         if interval_s is None:
-            try:
-                interval_s = float(
-                    os.environ.get(
-                        self._GPU_CLEANUP_INTERVAL_ENV,
-                        str(self._GPU_CLEANUP_INTERVAL_DEFAULT),
-                    )
-                )
-            except (TypeError, ValueError):
-                interval_s = self._GPU_CLEANUP_INTERVAL_DEFAULT
-            # Guard the env/default path against a misconfigured ~0 interval
+            interval_s = settings.gpu_cleanup_interval_s
+            # Guard the settings/default path against a misconfigured ~0 interval
             # spinning the cleanup hot; an explicit interval_s (as used by
-            # tests) is honored as-is.
+            # tests) is honored as-is. This 0.5s floor is a deliberately
+            # NON-configurable misconfig guard.
             interval_s = max(0.5, interval_s)
 
         while True:

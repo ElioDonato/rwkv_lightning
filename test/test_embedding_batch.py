@@ -39,6 +39,8 @@ try:
 except OSError as exc:
     pytest.skip(f"CUDA environment not configured: {exc}", allow_module_level=True)
 
+from settings import settings
+
 NL, NE, NH, HS = 3, 16, 4, 4
 VOCAB = 32
 
@@ -271,12 +273,13 @@ def test_sub_batching_bounds_forward_passes(monkeypatch):
 def test_unbounded_fallback_caps_sub_batch_size(monkeypatch):
     """CR1: with NO model cap (attribute absent, so getattr falls back), the
     fallback must NOT collapse to one unbounded batch over the whole request.
-    Each sub-batch is capped at _HARD_CEILING_DEFAULT texts (mirrors the
-    embed aggregator) -- the old `or len(non_empty)` put the whole (>=cap)
-    request in a single _embed_batch call, risking one giant VRAM spike."""
+    Each sub-batch is capped at the embed hard ceiling (settings.embed_hard_ceiling,
+    RWKV_EMBED_HARD_CEILING; mirrors the embed aggregator) -- the old
+    `or len(non_empty)` put the whole (>=cap) request in a single _embed_batch
+    call, risking one giant VRAM spike."""
     model = _FakeModel(max_prefill_bsz=0)
     del model.max_prefill_bsz  # attribute absent -> unbounded-fallback branch
-    cap = emb._HARD_CEILING_DEFAULT
+    cap = settings.embed_hard_ceiling
     widths = []
 
     def observing_tmix(layer_id, H, N, x, x_prev, v_first, state, *w):
@@ -289,7 +292,7 @@ def test_unbounded_fallback_caps_sub_batch_size(monkeypatch):
     # Must split into 2 sub-batches (cap then remainder), never one >=cap batch.
     assert len(widths) == 2 * NL
     assert all(w <= cap for w in widths), (
-        "no-cap fallback must cap each sub-batch at _HARD_CEILING_DEFAULT"
+        "no-cap fallback must cap each sub-batch at the embed hard ceiling"
     )
 
 
@@ -300,7 +303,7 @@ def test_unbounded_fallback_single_text_still_uses_exact_single_loop(monkeypatch
     SAME model object -- i.e. same weights -- gives the byte-identical result,
     proving the fallback changes nothing for a lone request)."""
     model = _FakeModel(max_prefill_bsz=0)
-    del model.max_prefill_bsz  # zero/absent cap -> _HARD_CEILING_DEFAULT fallback
+    del model.max_prefill_bsz  # zero/absent cap -> embed hard-ceiling fallback
 
     def blocking_tmix(layer_id, H, N, x, x_prev, v_first, state, *w):
         raise AssertionError("single-text no-cap path must NOT hit _embed_batch")

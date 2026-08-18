@@ -3,17 +3,25 @@ Server-side CONTINUOUS BATCHING for the /embedding and /v1/embeddings endpoints.
 
 Today each concurrent /embedding request calls ``embed_texts`` synchronously
 inline on the event-loop thread, one request at a time, so the GPU sits
-under-occupied (~9-19% on the 2.9b) while N requests serialize. This module is
-the throughput lever: an opt-in, default-OFF admission/aggregation worker that
-collects N concurrent requests into ONE shared ``embed_texts`` call over the
-concatenated texts, splitting the per-text vectors back per-request.
+under-occupied while N requests serialize. This module is the throughput lever:
+an opt-in, default-OFF admission/aggregation worker that collects N concurrent
+requests into ONE shared ``embed_texts`` call over the concatenated texts,
+splitting the per-text vectors back per-request.
+
+All tunable knobs for this feature live in the central ``settings`` module
+(``settings.embed_aggregate``, ``settings.embed_aggregate_window_ms``,
+``settings.embed_hard_ceiling``, backed by the ``RWKV_EMBED_AGGREGATE``,
+``RWKV_EMBED_AGGREGATE_WINDOW_MS``, and ``RWKV_EMBED_HARD_CEILING``
+environment variables respectively) rather than as module-local constants here;
+explicit constructor overrides (used by tests) always win over those.
 
 Design
 ------
 * ``EmbedAggregator`` owns a single scheduler coroutine and a FIFO queue of
   pending embedding requests. Each request enqueues an ``_EmbedJob`` carrying
   its texts and an asyncio future, then awaits the future.
-* The scheduler drains the queue in small timing windows (``RWKV_EMBED_AGGREGATE_WINDOW_MS``):
+* The scheduler drains the queue in small timing windows
+  (``RWKV_EMBED_AGGREGATE_WINDOW_MS`` via ``settings.embed_aggregate_window_ms``):
   it fires EARLY the instant the batching cap is reached, otherwise when the
   window elapses. Requests that don't fit under the cap (a request whose text
   count would exceed the remaining batch budget) stay queued and are admitted
@@ -23,13 +31,13 @@ Design
   ``max_prefill_bsz > 0`` the concatenated batch is capped at exactly that so
   the batch never exceeds the shared VRAM estimate. ``max_prefill_bsz=0`` means
   no model-level cap, so ``embedding.embed_texts`` falls back to its own hard
-  ceiling (``embedding._HARD_CEILING_DEFAULT`` = 64, the constant this module
-  imports -- shared, single-sourced); here it triggers the same hard ceiling on
-  the aggregated batch (``_HARD_CEILING_DEFAULT``) instead of unbounded
-  accumulation, so a whole window burst is never packed into one un-isolated
-  VRAM spike against a co-resident :8081 chat. The cap never rejects a pending
-  HEAD job: one that alone exceeds the cap is still admitted and run. In capped
-  mode ``embed_texts``' own sub-batching keeps an oversized HEAD within its
+  ceiling (``settings.embed_hard_ceiling``, backed by ``RWKV_EMBED_HARD_CEILING``,
+  read from the central settings module); here it triggers the same hard ceiling
+  on the aggregated batch instead of unbounded accumulation, so a whole window
+  burst is never packed into one un-isolated VRAM spike against a co-resident
+  chat server on the same GPU. The cap never rejects a pending HEAD job: one
+  that alone exceeds the cap is still admitted and run. In capped mode
+  ``embed_texts``' own sub-batching keeps an oversized HEAD within its
   model-level budget; in no-cap mode the aggregator sub-chunks the lone job's
   texts itself (see ``_embed_texts_bounded``) -- a redundant-but-consistent
   double bound, since embedding.py already self-caps at the same ceiling -- so
@@ -77,51 +85,27 @@ aggregator object may be created eagerly (it spawns no task while disabled).
 
 import asyncio
 import logging
-import os
 from collections import deque
+
+from settings import settings
 
 logger = logging.getLogger("infer.embed_aggregator")
 
-from infer.embedding import _HARD_CEILING_DEFAULT, embed_texts
-
-_AGGREGATE_ENV = "RWKV_EMBED_AGGREGATE"
-_AGGREGATE_DEFAULT = "0"
-_WINDOW_MS_ENV = "RWKV_EMBED_AGGREGATE_WINDOW_MS"
-# Conservative default: aggregation adds at most this latency to an isolated
-# request (it fires when the window elapses even with a lone request), so keep
-# it small. Under load it only needs to cover the few ms it takes a burst of
-# concurrent requests to arrive; 10ms is enough to gather a burst while costing
-# an isolated request only ~1 forward-twiddle of latency.
-_WINDOW_MS_DEFAULT = 10
+from infer.embedding import embed_texts
 
 
 def _aggregate_enabled(enabled=None) -> bool:
     """Resolve the opt-in, honoring an explicit override (used by tests)."""
     if enabled is not None:
         return bool(enabled)
-    raw = os.environ.get(_AGGREGATE_ENV, _AGGREGATE_DEFAULT)
-    try:
-        return bool(int(raw))
-    except (TypeError, ValueError):
-        logger.warning(
-            f"[EmbedAggregate] invalid {_AGGREGATE_ENV}={raw!r}, treating as off"
-        )
-        return False
+    return bool(settings.embed_aggregate)
 
 
 def _window_seconds(window_ms=None) -> float:
-    """Collect window in seconds (>= 0). Explicit override wins over env."""
+    """Collect window in seconds (>= 0). Explicit override wins over settings."""
     if window_ms is not None:
         return max(0.0, int(window_ms)) / 1000.0
-    raw = os.environ.get(_WINDOW_MS_ENV, str(_WINDOW_MS_DEFAULT))
-    try:
-        return max(0.0, int(raw) / 1000.0)
-    except (TypeError, ValueError):
-        logger.warning(
-            f"[EmbedAggregate] invalid {_WINDOW_MS_ENV}={raw!r}, "
-            f"using {_WINDOW_MS_DEFAULT}ms"
-        )
-        return _WINDOW_MS_DEFAULT / 1000.0
+    return max(0.0, float(settings.embed_aggregate_window_ms)) / 1000.0
 
 
 class _EmbedJob:
@@ -152,8 +136,8 @@ class EmbedAggregator:
     def __init__(self, model, tokenizer, *, enabled=None, window_ms=None, max_bsz=None):
         self._model = model
         self._tokenizer = tokenizer
-        # enabled=None resolves from env at construction so tests pin the mode
-        # deterministically regardless of environment.
+        # enabled=None resolves from settings at construction so tests pin the
+        # mode deterministically regardless of environment.
         self._enabled = _aggregate_enabled(enabled)
         self._window = _window_seconds(window_ms)
         # max_bsz=None resolves from the model's max_prefill_bsz (0 == no cap);
@@ -248,8 +232,8 @@ class EmbedAggregator:
 
     def _cap(self):
         """Batching cap: the model's max_prefill_bsz when > 0, else a sane hard
-        ceiling (``_HARD_CEILING_DEFAULT``). Always returns int >= 1, so the
-        aggregated batch is never VRAM-unbounded even in the model's "no cap"
+        ceiling (``settings.embed_hard_ceiling``). Always returns int >= 1, so
+        the aggregated batch is never VRAM-unbounded even in the model's "no cap"
         (max_prefill_bsz<=0) mode -- a whole window burst never collapses into
         ONE un-isolated embed_texts call. An explicit ``max_bsz`` override
         (tests) wins unconditionally, and an override <= 0 means "no cap" too,
@@ -263,7 +247,7 @@ class EmbedAggregator:
         # int: a None/<=0 cap would hand _fill_batch / the window drain an
         # unbounded aggregate window (never breaks, never bounded).
         if cap <= 0:
-            cap = _HARD_CEILING_DEFAULT
+            cap = settings.embed_hard_ceiling
         return cap
 
     def _no_cap_mode(self) -> bool:
@@ -271,7 +255,7 @@ class EmbedAggregator:
         ``max_prefill_bsz <= 0`` and (if overridden) the override itself is
         ``<= 0``. Here ``embed_texts`` has no model-level ``max_prefill_bsz``
         to sub-batch at (it only self-caps each sub-batch at
-        ``embedding._HARD_CEILING_DEFAULT``), so ``_run_batch`` sub-chunks a
+        ``settings.embed_hard_ceiling``), so ``_run_batch`` sub-chunks a
         lone job's own texts itself to keep every shared-batch call within the
         aggregation ceiling; capped mode already has embed_texts' own
         ``max_prefill_bsz`` sub-batching to lean on."""
@@ -435,14 +419,14 @@ class EmbedAggregator:
         vectors in input order.
 
         In no-cap mode (``_no_cap_mode``) ``embed_texts`` runs on the hard
-        ceiling (embedding.py self-caps each sub-batch at
-        ``_HARD_CEILING_DEFAULT``), so this module's sub-chunking of the
-        aggregated window -- feeding each call at most ``cap`` texts -- is a
-        redundant-but-consistent double bound that keeps the shared-batch VRAM
-        spike within the aggregation ceiling even if embedding.py's constant
-        were ever loosened. In capped mode ``embed_texts`` already sub-batches
-        internally at ``max_prefill_bsz``, so the window is fed whole (ONE
-        call), preserving the existing shared-batch composition exactly.
+        ceiling (embedding.py self-caps each sub-batch at ``settings.embed_hard_ceiling``),
+        so this module's sub-chunking of the aggregated window -- feeding each
+        call at most ``cap`` texts -- is a redundant-but-consistent double bound
+        that keeps the shared-batch VRAM spike within the aggregation ceiling
+        even if embedding.py's ceiling were ever loosened. In capped mode
+        ``embed_texts`` already sub-batches internally at ``max_prefill_bsz``,
+        so the window is fed whole (ONE call), preserving the existing
+        shared-batch composition exactly.
 
         Exactness / split-accounting are unaffected: every sub-slice runs the
         exact same per-text math, so concatenating the per-slice results is
