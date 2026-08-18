@@ -23,11 +23,6 @@ DB_PATH = "rwkv_sessions.db"  # infinite cold state pool HaHa!
 PREFIX_CACHE_BUCKETS = (1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192)
 PREFIX_CACHE_BUCKET_CAPACITY = 16
 PREFIX_HASH_COLUMNS = tuple(f"prefix_hash_{bucket}" for bucket in PREFIX_CACHE_BUCKETS)
-# After this many evictions the prefix trie's stale terminals (from evicted
-# entries, which are NOT deleted from the radix trie) accumulate enough that a
-# bounded full rebuild is worth it. Evictions are the only source of staleness;
-# plain inserts add clean terminals and never trigger a rebuild.
-TRIE_REBUILD_CHURN = 32
 
 
 def _serialize_token_ids(tokens: List[int] | Tuple[int, ...]) -> str:
@@ -195,8 +190,6 @@ class StateCacheManager:
         self.prefix_tries: Dict[str, _CompressedTrie] = {}
         self.prefix_trie = _CompressedTrie()  # back-compat alias for the default model
         self.prefix_tries[""] = self.prefix_trie
-        # Evictions since the last full trie rebuild (see TRIE_REBUILD_CHURN).
-        self._prefix_trie_churn = 0
         
         self.cache_lock = threading.RLock()
         
@@ -329,7 +322,6 @@ class StateCacheManager:
             self.prefix_tries.setdefault(entry.model, _CompressedTrie()).insert(
                 entry.prefix_tokens, entry.state_id
             )
-        self._prefix_trie_churn = 0
 
     def _store_prefix_entry_locked(self, entry: PrefixCacheEntry, persist: bool):
         bucket_cache = self.prefix_l2_cache.setdefault(entry.bucket_len, OrderedDict())
@@ -342,19 +334,17 @@ class StateCacheManager:
         if len(bucket_cache) > PREFIX_CACHE_BUCKET_CAPACITY:
             _, evicted_entry = bucket_cache.popitem(last=False)
             self.prefix_entry_index.pop(evicted_entry.state_id, None)
-            # The evicted terminal is NOT deleted from the radix trie (it has
-            # no delete op) -- its state_id becomes stale. match_prefix_state's
-            # ``entry = prefix_entry_index.get(state_id)`` guard turns a stale
-            # terminal into a harmless no-op miss (the entry was persisted and
-            # is still reachable via the disk fallback), never a wrong value.
-            self._prefix_trie_churn += 1
 
-        # Incremental trie insert: an O(1) amortized child-insert keeps the
-        # shared insert path (both put_prefix_state and the disk-load path call
-        # this) from forcing an O(n) full rebuild on every single insert. A
-        # bounded full rebuild runs only once enough EVICTIONS have left stale
-        # terminals behind (evictions are the sole source of staleness).
-        if self._prefix_trie_churn >= TRIE_REBUILD_CHURN:
+        # Trie update. A plain INSERT is an O(1)-amortized child-insert shared by
+        # both put_prefix_state and the disk-load path, keeping the hot path
+        # incremental instead of an O(n) full rebuild every insert. An EVICTION
+        # forces a full rebuild immediately: the radix trie has no point-delete,
+        # and leaving a stale (evicted) terminal could otherwise SHADOW a shorter
+        # live terminal and change hit/miss on the default-ON prefix path vs the
+        # old always-rebuild behavior -- a byte-identity violation. Rebuilding on
+        # eviction (rare, only on bucket overflow) keeps the trie always exactly
+        # equal to the live index, identical to the pre-A3a behavior.
+        if evicted_entry is not None:
             self._rebuild_prefix_trie()
         else:
             trie = self.prefix_tries.setdefault(entry.model, _CompressedTrie())
@@ -505,10 +495,15 @@ class StateCacheManager:
     @staticmethod
     def _prefix_adaptive_enabled() -> bool:
         """Lazy settings read (same pattern as _prefix_disk_async_enabled) so
-        the state core stays importable without the server settings module."""
+        the state core stays importable without the server settings module.
+        RWKV_TURN_STATE_REUSE is an alias that enables the same adaptive
+        short-prompt / multi-turn prefix reuse on the raw chat paths."""
         try:
             from settings import settings as _settings
-            return bool(getattr(_settings, "prefix_adaptive", False))
+            return bool(
+                getattr(_settings, "prefix_adaptive", False)
+                or getattr(_settings, "turn_state_reuse", False)
+            )
         except Exception:
             return False
 
@@ -730,7 +725,12 @@ class StateCacheManager:
             for bucket_cache in self.prefix_l2_cache.values():
                 while bucket_cache:
                     _, entry = bucket_cache.popitem()
-                    prefix_entries_to_save.append(entry)
+                    # Adaptive (L2-only) entries are never persisted: they have
+                    # no fixed prefix_hash_<bucket> column to be indexed by, and a
+                    # NULL-hash row would be unreachable + later re-appear as
+                    # dead weight under a sweep cap. Only fixed-bucket rows flush.
+                    if entry.bucket_len in PREFIX_CACHE_BUCKETS:
+                        prefix_entries_to_save.append(entry)
             self.prefix_entry_index.clear()
             self._rebuild_prefix_trie()
 
@@ -813,14 +813,24 @@ class StateCacheManager:
                             (int(max_rows),))
                         detail["over_cap_prefix"] = self.db_cursor.rowcount
                 self.db_conn.commit()
-                if detail["expired_sessions"] or detail["expired_prefix"] or detail["over_cap_prefix"]:
-                    # VACUUM must run outside any active transaction.
-                    self.db_cursor.execute("VACUUM")
-                    self.db_conn.commit()
             except Exception as e:
                 logger.error(f"[StatePool] Sweep error: {e}")
                 self.db_conn.rollback()
-        if detail and (detail["expired_sessions"] or detail["expired_prefix"] or detail["over_cap_prefix"]):
+                return detail
+        # VACUUM runs on a DEDICATED short-lived connection, outside db_lock, so a
+        # multi-second VACUUM on a large DB never holds the shared cursor / db_lock
+        # that the request path (session / prefix disk reads on the event loop)
+        # blocks on -- otherwise this "background" sweep would recreate the very
+        # event-loop stall it is meant to remove.
+        if detail["expired_sessions"] or detail["expired_prefix"] or detail["over_cap_prefix"]:
+            try:
+                import sqlite3 as _sq
+                _vac = _sq.connect(DB_PATH)
+                with _vac:
+                    _vac.execute("VACUUM")
+                _vac.close()
+            except Exception as e:
+                logger.error(f"[StatePool] VACUUM failed (skipped; DB still valid): {e}")
             logger.info(f"[StatePool] Sweep removed sessions={detail['expired_sessions']} "
                         f"prefix={detail['expired_prefix']} over_cap={detail['over_cap_prefix']}")
         return detail
@@ -831,6 +841,8 @@ class StateCacheManager:
         must call :meth:`stop_sweeper` at shutdown so the thread joins before
         ``flush_all`` closes the connection. Runs independent of the db_writer
         thread (SQL is serialized against it by ``db_lock``)."""
+        if getattr(self, "_sweep_thread", None) is not None:
+            return self  # idempotent: never leak a second sweeper thread
         self._sweep_stop = threading.Event()
         self._sweep_interval = float(interval_s)
         self._sweep_ttl = float(ttl_s)
@@ -861,8 +873,9 @@ class StateCacheManager:
         if thread is not None:
             # If run_sweep is mid-execution (holding db_lock / running VACUUM)
             # the join blocks until it finishes -- the caller must not hold
-            # db_lock when it calls this (flush_all does not).
-            thread.join(timeout=max(getattr(self, "_sweep_interval", 0.0), 5.0))
+            # db_lock when it calls this (flush_all does not). Give a long
+            # VACUUM time to drain rather than racing the connection close.
+            thread.join(timeout=max(getattr(self, "_sweep_interval", 0.0), 60.0))
             if thread.is_alive():
                 logger.warning("[StatePool] sweeper thread did not exit in time; "
                                "draining after shutdown instead")

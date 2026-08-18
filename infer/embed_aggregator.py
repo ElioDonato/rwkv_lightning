@@ -482,7 +482,10 @@ class EmbedAggregator:
             if value is MISS:
                 miss_idx.append(i)
             else:
-                cached[i] = value
+                # Return a FRESH list on a hit (like CachedTokenizer.encode),
+                # so a downstream caller mutating the returned vector can never
+                # corrupt the shared cache entry.
+                cached[i] = list(value)
         if miss_idx:
             # embed each distinct miss text exactly once, then fan back out
             # (dict.fromkeys dedupes while preserving first-occurrence order).

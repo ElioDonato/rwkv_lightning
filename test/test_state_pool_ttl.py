@@ -70,11 +70,10 @@ def test_incremental_insert_does_not_rebuild_and_resolves():
 
             toks = _entry_tokens(1024, 7)
             st = torch.zeros(2, dtype=torch.float32)
-            assert manager.put_prefix_state(toks, [st]) is True
+            assert manager.put_prefix_state(toks, st) is True
 
-            # no full rebuild triggered by the insert
+            # no full rebuild triggered by a plain insert (incremental path)
             assert rebuilds == []
-            assert manager._prefix_trie_churn == 0
 
             # but the inserted prefix IS resolvable via longest_prefix
             state_id, matched = manager.prefix_trie.longest_prefix(toks)
@@ -89,35 +88,35 @@ def test_incremental_insert_does_not_rebuild_and_resolves():
             state_pool.StateCacheManager._instance = None
 
 
-def test_evicted_terminal_guarded_as_miss():
-    """A3a: after an eviction removes an entry from prefix_entry_index, the
-    (not-deleted) trie terminal must be a no-op miss via the existing
-    prefix_entry_index.get guard -- match_prefix_state returns None rather than
-    a wrong/dangling state."""
+def test_eviction_rebuilds_trie_keeps_identity():
+    """A3a / MF-1: an eviction (bucket overflow) forces a full trie rebuild, so
+    the trie always reflects exactly the live prefix_entry_index -- the evicted
+    entry is no longer resolvable and can never SHADOW a shorter live terminal
+    (which would change cache hit/miss on the default-ON prefix path vs the old
+    always-rebuild behavior, a byte-identity violation)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         _reset_manager(os.path.join(tmpdir, "a3a_evict.db"))
         manager = state_pool.StateCacheManager()
         try:
-            # Fill one 1024 bucket past its capacity so the oldest entry is
-            # evicted (and its terminal left stale in the trie).
+            # Fill one 1024 bucket past its capacity; the least-recently-used
+            # entry (first-inserted, base=1) is the eviction victim.
             st = torch.zeros(2, dtype=torch.float32)
             for i in range(state_pool.PREFIX_CACHE_BUCKET_CAPACITY + 1):
-                manager.put_prefix_state(_entry_tokens(1024, i * 37 + 1), [st])
+                manager.put_prefix_state(_entry_tokens(1024, i * 37 + 1), st)
 
             bucket = manager.prefix_l2_cache[1024]
             assert len(bucket) == state_pool.PREFIX_CACHE_BUCKET_CAPACITY
-            evicted_state_id = None
-            # the trie should contain a stale terminal not in the index
-            for i in range(state_pool.PREFIX_CACHE_BUCKET_CAPACITY + 1):
-                sid, _matched = manager.prefix_trie.longest_prefix(
-                    _entry_tokens(1024, i * 37 + 1)
-                )
-                if sid is not None and sid not in manager.prefix_entry_index:
-                    evicted_state_id = sid
-                    break
-            assert evicted_state_id is not None
-            # the stale terminal resolves to a miss through the guard
-            assert manager.prefix_entry_index.get(evicted_state_id) is None
+
+            evicted_toks = _entry_tokens(1024, 1)  # the evicted (oldest) prefix
+            evicted_sid = state_pool._prefix_key(
+                "", state_pool._serialize_token_ids(evicted_toks))
+            assert evicted_sid not in manager.prefix_entry_index
+
+            # The eviction triggered a rebuild, so the trie no longer resolves
+            # the evicted prefix to a full-length match (no stale terminal, no
+            # shadowing of live entries).
+            sid, matched = manager.prefix_trie.longest_prefix(evicted_toks)
+            assert matched < 1024, "evicted entry must not be resolvable"
         finally:
             manager.io_executor.shutdown(wait=True)
             manager.db_conn.close()

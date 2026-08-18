@@ -249,7 +249,10 @@ class InferenceUtilsMixin:
         ):
             try:
                 from settings import settings as _settings
-                adaptive = bool(getattr(_settings, "prefix_adaptive", False))
+                adaptive = bool(
+                    getattr(_settings, "prefix_adaptive", False)
+                    or getattr(_settings, "turn_state_reuse", False)
+                )
             except Exception:
                 adaptive = False
             if adaptive:
