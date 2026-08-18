@@ -6,6 +6,7 @@ from state_manager.state_pool import get_state_manager
 from API_servers.router.common import (
     check_password,
     client_closed_response,
+    model_namespace,
     parse_request_model,
     prefill_bsz_limit_response,
     prefill_sse_response,
@@ -42,7 +43,7 @@ async def chat_completions_v2(request: Request):
     slot = await resolve_slot(request, body.get("model"))
     engine = slot.engine
 
-    prefix_cache_manager = get_state_manager() if req.use_prefix_cache else None
+    prefix_cache_manager = get_state_manager(model_namespace(slot)) if req.use_prefix_cache else None
 
     if req.stream:
         cancel_token = CancellationToken()

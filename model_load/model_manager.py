@@ -312,8 +312,10 @@ class ModelManager:
     async def _unload_slot(self, slot):
         if not slot.resident:
             return
-        # Stop the per-model decode machinery if it was wired (Phase B).
-        for agg in (slot.dynamic, slot.fuse):
+        # Stop the per-model decode machinery (dynamic, fuse AND the embed
+        # aggregator -- the embed task was previously leaked, keeping the
+        # unloaded model/tokenizer alive and its VRAM unreclaimable).
+        for agg in (slot.dynamic, slot.fuse, slot.embed):
             if agg is not None:
                 try:
                     await agg.stop()
