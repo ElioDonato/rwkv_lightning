@@ -22,8 +22,8 @@ infer/rwkv_batch/cuda/third_party/cutlass/*
 # local agent worktrees (not project source)
 .qwen-wt/
 
-# generated training datasets (not checkpoint state)
-state_tune/data/*
+# local secrets + per-machine env (RWKV_API_PASSWORD for the local test server)
+.env
 
 # internal GPU implementation plan (kept local)
 IMPL_PLAN_GPU_THROUGHPUT.md

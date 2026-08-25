@@ -2,9 +2,7 @@
 
 Guidance for working in this repo (`RWKV-Vibe/rwkv_lightning`, cloned 2026-07-11 at
 commit `dce31345`). This is a FastAPI batch-inference server for RWKV-7 models,
-built on custom JIT-compiled CUDA/HIP kernels ("Albatross" kernels). It backs
-the `lm.small` endpoint in `~/search/backend/config.yaml` (see "Relationship
-to the search project" below).
+built on custom JIT-compiled CUDA/HIP kernels ("Albatross" kernels).
 
 ## Environment setup (already done in this checkout)
 
@@ -178,61 +176,16 @@ Only one server process/model can run at a time on this GPU realistically
 workspace) — stop one (`SIGTERM`, it persists all sessions to
 `rwkv_sessions.db` on shutdown) before starting the other.
 
-## Relationship to the search project (`~/search`)
+## Local serving (this dev machine)
 
-`~/search/backend/config.yaml`'s `lm.small` currently points at a remote
-endpoint (`10.0.0.10:8081`, likely another instance of this same server on
-the "strix halo" box) with:
-- `api_base: http://10.0.0.10:8081/openai/v1` — used by DSPy for
-  **single, non-streaming** requests
-- a `rwkv_inline` batching strategy (`backend/batching.py`) that POSTs
-  batched requests to `http://10.0.0.10:8081/big_batch/completions` and
-  parses an SSE stream of `{"choices":[{"index":..,"delta":{"content":..}}]}`
-  chunks — this exactly matches this server's `/big_batch/completions`
-  contract, confirming it's the same backend software.
-
-  **Per-item `finish_reason` consumption (2026-07-25):** since commit
-  `7e2e315` this server emits a per-item `finish_reason` (`"stop"`/
-  `"length"`) in each item's terminal SSE chunk and compacts finished rows
-  out of the GPU batch. `RWKVInlineBatcher._send_batch` was updated
-  (`~/search` commit `0f756ec`) to resolve each request's future as soon as
-  its own `finish_reason` chunk arrives — rather than buffering the whole
-  stream to `[DONE]` — and to drop the stream once every slot is released.
-  This closes the "zero perceived latency benefit" caveat noted in that
-  commit's message: early-finishing requests are now handed back to callers
-  immediately (measured ~25s earlier on a staggered short/long batch against
-  the live 2.9b service). A `[DONE]`-time fallback still resolves any slot
-  that never received a `finish_reason`, so older servers without the signal
-  keep working.
-
-**Nuance on bug #2 (now fixed, see above) and `lm.small`'s actual traffic:**
-`batching.py::install_hooks()` monkey-patches `httpx.AsyncClient.send`
-globally; while `create_batch_context(config)` is active (true for
-`collect_data.py`, the working extraction pipeline), *any* outgoing call
-to a `/chat/completions`-shaped path on `lm.small`'s host — including
-whatever DSPy/litellm would normally send to `api_base`'s
-`/openai/v1/chat/completions` — gets intercepted client-side and
-redirected into `RWKVInlineBatcher`, which always POSTs to
-`batch.endpoint` (`/big_batch/completions`), batch-of-1 or not. So code
-running inside that context never actually touched the endpoint bug #2
-lived on, regardless of which model is behind it — this was true even
-before the fix, and remains true now. The only code that ever called
-`lm.small` *outside* `create_batch_context` was `local_research_agent/agent.py`,
-which `~/search/CLAUDE.md` already documents as broken/unwired for
-unrelated import-path reasons; now that bug #2 is fixed, there's nothing
-special to do if/when that path gets wired up.
-
-As of 2026-07-11, `lm.small` in `~/search/backend/config.yaml` points at
-`http://127.0.0.1:8081` (2.9b, chosen over 7.2b mainly for the extra VRAM
-headroom for batching — bug #2 turned out not to be model-size-specific,
-so it wasn't the deciding factor in the end), served by the `rwkv-lightning`
-runit service (`/etc/runit/sv/rwkv-lightning`, `sv status rwkv-lightning`
-/ `sv up|down rwkv-lightning`). The `run` script does
+The server runs as the `rwkv-lightning` runit service (`/etc/runit/sv/rwkv-lightning`,
+`sv status rwkv-lightning` / `sv up|down rwkv-lightning`; an embedding instance
+runs as `rwkv-lightning-embed`). The `run` script does
 `exec chpst -u donato:donato service_run.sh` — deliberately not
 `su -l donato -c '...'`, which forks multiple layers and can leave an
 orphaned grandchild still holding the port if the tracked PID gets
 SIGKILLed (this happened once during setup: a `kill -9` on the `su`-tracked
-PID left the actual Python process alive on port 8081, and every
+PID left the actual Python process alive on the port, and every
 subsequent runit restart attempt then failed to bind and got killed and
 respawned in a tight loop, reloading the model each time, until the
 orphan was found and killed manually). With `chpst`, the tracked PID
@@ -256,15 +209,13 @@ different, deliberate decision, not the default flow described here.
 
 ## `/big_batch/completions` now supports templated `chats` (2026-07-13)
 
-See `INVESTIGATION_2026-07-13_small_lm_reliability.md` for the full
-root-cause writeup. Summary: `/big_batch/completions` previously only
+Summary: `/big_batch/completions` previously only
 accepted `contents: list[str]` — raw, untemplated prompt strings, no chat
-formatting applied. `~/search/backend/batching.py::RWKVInlineBatcher`
-(the sole real caller) was sending bare `user`-message text through this
-path with the `system` message silently dropped, which reliably produced
-hallucinated/off-topic output from this instruction-tuned model (0/9 clean
-in testing) — not a concurrency bug, confirmed via serial vs. concurrent
-and raw vs. templated A/B tests.
+formatting applied. The sole caller of the batch endpoint was sending bare
+`user`-message text through this path with the `system` message silently
+dropped, which reliably produced hallucinated/off-topic output from this
+instruction-tuned model (0/9 clean in testing) — not a concurrency bug,
+confirmed via serial vs. concurrent and raw vs. templated A/B tests.
 
 Fix: `ChatRequest.chats: list[dict]` (`API_servers/router/schemas.py`) —
 each item is an OpenAI-style `{"messages": [...], "system": ...}` dict.
@@ -275,9 +226,6 @@ falling back to the legacy raw `req.contents` path otherwise. This makes
 this repo the single source of truth for the chat-template string; a
 future finetune that changes the expected prompt format only requires
 touching `format_openai_prompt()` here, not any client repo.
-`~/search/backend/batching.py::_send_batch` was updated correspondingly to
-send `chats` (full `messages`, system included) instead of an extracted
-`contents` string.
 
 ## Second swarm review round (2026-07-24): dead code, webui auth, DoS fix, CUDA graph investigation
 
